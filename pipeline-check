@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# pipeline-check - verify every project is actually going through the
+# pipeline: versioned, pushed, CI green, and (for services) deployed at
+# HEAD. Designed for hermes cron --no-agent: prints alert lines when
+# something is wrong, stays SILENT when everything is green, and prints
+# a full report with --verbose.
+#
+# Manual use:   pipeline-check [--verbose]
+set -u
+set +o pipefail
+VERBOSE=no
+[ "${1:-}" = "--verbose" ] && VERBOSE=yes
+
+HOME_DIR="${GUARD_HOME:-/home/ev}"
+EXCLUDE=(AIS-catcher-src AdGuardHome)
+# Services with pull-based CD: dir -> systemd unit of the deploy timer
+declare -A SERVICES=(
+    [maritime-dashboard]=maritime-dashboard-deploy
+    [project-hub]=project-hub-deploy
+    [sat-audio]=sat-audio-deploy
+)
+
+alerts=0
+report=""
+alertlines=""
+
+note()  { report+="$1"$'\n'; }          # verbose-only line
+alert() { alertlines+="⚠ $1"$'\n'; alerts=$((alerts+1)); }
+
+is_project_dir() {
+    find "$1" -maxdepth 2 -not -path '*/.git*' -not -path '*/lib/*' \
+         -not -path '*/bin/*' -not -path '*/include/*' -not -path '*/node_modules/*' \
+         \( -name '*.py' -o -name '*.js' -o -name '*.sh' -o -name package.json \
+            -o -name Makefile -o -name '*.cpp' -o -name '*.c' \) -print -quit 2>/dev/null \
+      | grep -q .
+}
+
+excluded() {
+    local name; name=$(basename "$1")
+    for e in "${EXCLUDE[@]}"; do [ "$name" = "$e" ] && return 0; done
+    return 1
+}
+
+check_project() {
+    local dir=$1 name; name=$(basename "$1")
+
+    if [ ! -d "$dir/.git" ]; then
+        is_project_dir "$dir" && alert "$name: code present but NOT a git repo (guard should adopt within 10 min)"
+        return
+    fi
+    git -C "$dir" rev-parse -q --verify HEAD >/dev/null 2>&1 || {
+        note "  $name: repo has no commits yet - skipped"
+        return
+    }
+
+    local origin_url
+    origin_url=$(git -C "$dir" remote get-url origin 2>/dev/null) || {
+        alert "$name: NO GitHub remote - work exists only on this Pi"
+        return
+    }
+
+    git -C "$dir" fetch -q origin 2>/dev/null || note "  $name: fetch failed (offline?)"
+
+    local branch
+    branch=$(git -C "$dir" branch --show-current 2>/dev/null)
+    if [ -n "$branch" ]; then
+        local ahead
+        ahead=$(git -C "$dir" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "?")
+        if [ "$ahead" != "0" ]; then
+            alert "$name: $ahead unpushed commit(s) on $branch (guard pushes every 10 min - persistent here means the guard is stuck)"
+        fi
+        local dirty
+        dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)
+        note "  $name: $branch, $dirty uncommitted path(s) (autosave covers these)"
+    else
+        note "  $name: detached HEAD (deploy rollback window?)"
+    fi
+
+    # CI verdict for the newest commit that has runs
+    local slug
+    slug=$(echo "$origin_url" | sed -n 's#.*github\.com[:/]##; s#\.git$##p')
+    if [ -n "$slug" ]; then
+        local verdict concl sha
+        verdict=$(gh run list -R "$slug" --limit 1 --json conclusion,headSha \
+                    -q '.[0] | "\(.conclusion) \(.headSha[0:8])"' 2>/dev/null)
+        concl=${verdict%% *}; sha=${verdict#* }
+        case "$concl" in
+            success) note "  $name: CI green ($verdict)" ;;
+            null)
+                if [ "$sha" = "null" ]; then
+                    if ls "$dir"/.github/workflows/*.yml >/dev/null 2>&1; then
+                        note "  $name: CI configured but no runs yet"
+                    elif is_project_dir "$dir"; then
+                        alert "$name: has code but no CI workflow - not going through the pipeline"
+                    else
+                        note "  $name: docs-only so far, CI added when code arrives"
+                    fi
+                else
+                    note "  $name: CI in progress ($sha)"
+                fi ;;
+            *) alert "$name: CI $verdict" ;;
+        esac
+    fi
+
+    # Service deploy freshness
+    if [ -n "${SERVICES[$name]:-}" ]; then
+        local timer marker head
+        timer="${SERVICES[$name]}"
+        systemctl is-active --quiet "$timer.timer" || alert "$name: deploy timer $timer.timer NOT active"
+        marker=$(cat "$dir/.deployed_commit" 2>/dev/null || echo "")
+        head=$(git -C "$dir" rev-parse HEAD)
+        if [ "$marker" != "$head" ]; then
+            alert "$name: service runs ${marker:0:8:-}, HEAD is ${head:0:8} (deploy lagging, blocked on dirty tree, or failed health check - see deploy.log)"
+        else
+            note "  $name: deployed at HEAD, healthy"
+        fi
+    fi
+}
+
+for d in "$HOME_DIR"/*/ "$HOME_DIR"/apps/*/; do
+    [ -d "$d" ] || continue
+    b=$(basename "$d"); case "$b" in .*) continue;; esac
+    excluded "$d" && continue
+    [ "$d" = "$HOME_DIR/apps/" ] && continue
+    [ -f "$d/pyvenv.cfg" ] && [ ! -d "$d/.git" ] && continue
+    check_project "$d"
+done
+
+if [ "$VERBOSE" = yes ]; then
+    printf '%s' "$report"
+    printf '%s' "$alertlines"
+    [ $alerts = 0 ] && echo "✓ all projects pipeline-clean"
+elif [ $alerts -gt 0 ]; then
+    printf '%s' "$alertlines"
+    echo "$alerts pipeline issue(s) need attention"
+fi
+exit 0

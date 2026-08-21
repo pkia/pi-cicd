@@ -136,6 +136,8 @@ __pycache__/
 *.pyc
 *.log
 *.fifo
+.deployed_commit
+.deploy_failed
 EOF
     # Anything oversized gets ignored rather than committed.
     find . -type f -size +"$MAX_FILE_BYTES"c -not -path './.git/*' \
@@ -184,6 +186,15 @@ backup_repo() {   # $1 = directory that already has .git
         else
             return   # nothing we can do remotely
         fi
+    fi
+
+    # Every managed repo goes through CI: if a code repo has no workflow,
+    # add the standard one so the pipeline applies to everything.
+    if ! ls .github/workflows/*.yml >/dev/null 2>&1 && is_project_dir "$PWD"; then
+        write_standard_ci
+        git add .github
+        git commit -q -m "ci: standard CI workflow (added by project-guard)" \
+            && log "$name: no CI workflow found - standard workflow added"
     fi
 
     # Committed but unpushed work: push the current branch under its own
