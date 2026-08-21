@@ -186,9 +186,16 @@ backup_repo() {   # $1 = directory that already has .git
         fi
     fi
 
-    # Committed but unpushed work goes to main directly.
-    if ! git push -q origin main 2>>"$LOG"; then
-        log "$name: push of main rejected (diverged from origin?) - needs a human"
+    # Committed but unpushed work: push the current branch under its own
+    # name (projects may use master or feature branches; deploy tooling
+    # deliberately targets main - backup should capture whatever is real).
+    CUR_BRANCH=$(git branch --show-current 2>/dev/null)
+    if [ -n "$CUR_BRANCH" ]; then
+        if ! git push -q origin "$CUR_BRANCH" 2>>"$LOG"; then
+            log "$name: push of $CUR_BRANCH rejected (diverged from origin?) - needs a human"
+        fi
+    else
+        log "$name: detached HEAD (deploy rollback window?) - skipping branch push"
     fi
 
     # Uncommitted work goes to the autosave branch via a private index,
