@@ -16,8 +16,9 @@
 #   - skips autosaving anything that looks like a secret (filename or
 #     content heuristics) and logs a warning instead
 set -u
+set +o pipefail   # pipe states are checked explicitly where they matter
 
-HOME_DIR="/home/ev"
+HOME_DIR="${GUARD_HOME:-/home/ev}"
 LOG_DIR="$HOME_DIR/.local/state"
 LOG="$LOG_DIR/project-guard.log"
 EXCLUDE=(AIS-catcher-src AdGuardHome)
@@ -30,6 +31,29 @@ log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
 GH_OK=no
 gh auth status >/dev/null 2>&1 && GH_OK=yes
+GH_USER=""
+[ "$GH_OK" = yes ] && GH_USER=$(gh api user -q .login 2>/dev/null || echo "")
+
+ensure_repo() {   # in cwd: give this repo an origin, reusing a same-named GitHub repo if one exists
+    local name=$1 url
+    git remote get-url origin >/dev/null 2>&1 && return 0
+    url="https://github.com/$GH_USER/$name.git"
+    if gh repo view "$GH_USER/$name" >/dev/null 2>&1; then
+        git remote add origin "$url"
+        if git push -q -u origin main 2>>"$LOG"; then
+            log "$name: reusing existing GitHub repo $url"
+            return 0
+        fi
+        log "$name: existing repo is not empty/fast-forwardable - needs a human"
+        return 1
+    fi
+    if gh repo create "$name" --private --source . --push >/dev/null 2>>"$LOG"; then
+        log "$name: created private repo $url"
+        return 0
+    fi
+    log "$name: repo creation failed (name taken? quota?)"
+    return 1
+}
 
 is_project_dir() {
     # Contains code files at shallow depth, outside venv/lib trees.
@@ -106,25 +130,41 @@ adopt() {   # $1 = directory without git
     local dir=$1 name; name=$(basename "$1")
     cd "$dir" || return 1
     git init -b main -q
-    {
-        echo "# added by project-guard at adoption"
-        echo "__pycache__/"
-        echo "*.pyc"
-        echo "*.log"
-        echo "*.fifo"
-        # Anything oversized gets ignored rather than committed.
-        find . -maxdepth 3 -type f -size +${MAX_FILE_BYTES}c -not -path './.git/*' \
-            | sed 's|^\./||' | sed 's|^\(.*\)$|/\1'
-    } >> .gitignore 2>/dev/null || cp /dev/null .gitignore
+    cat > .gitignore <<'EOF'
+# added by project-guard at adoption
+__pycache__/
+*.pyc
+*.log
+*.fifo
+EOF
+    # Anything oversized gets ignored rather than committed.
+    find . -type f -size +"$MAX_FILE_BYTES"c -not -path './.git/*' \
+        | sed 's|^\./||' | sed 's|^\(.*\)$|/\1|' >> .gitignore
+    if [ ! -s .gitignore ]; then
+        log "adopt $name FAILED: .gitignore came out empty - aborting before any commit"
+        return 1
+    fi
     write_standard_ci
     git add -A
+
+    # Hard gate: nothing oversized may enter history, whatever the ignore
+    # state. (GitHub rejects >100 MB anyway; this keeps the repo usable.)
+    local big
+    big=$(git ls-files -s | awk '{print $4}' | while read -r f; do
+              [ -f "$f" ] && [ "$(stat -c%s "$f")" -gt 52428800 ] && echo "$f"
+          done)
+    if [ -n "$big" ]; then
+        log "adopt $name FAILED: files over 50MB would be committed:"$'\n'"$big"
+        return 1
+    fi
+
     git commit -q -m "Initial commit (auto-adopted by project-guard)" || return 1
 
     if [ "$GH_OK" = yes ]; then
-        if gh repo create "$name" --private --source . --push >/dev/null 2>>"$LOG"; then
-            log "adopted $name -> private repo $(gh repo view "$name" -q .url 2>/dev/null || echo "(url n/a)")"
+        if ensure_repo "$name"; then
+            log "adopted $name -> $(git remote get-url origin)"
         else
-            log "adopted $name locally, but repo creation FAILED (name taken?) - manual fix needed"
+            log "adopted $name locally, but wiring the GitHub repo FAILED - manual fix needed"
         fi
     else
         log "adopted $name locally (no gh auth - not pushed)"
@@ -137,10 +177,8 @@ backup_repo() {   # $1 = directory that already has .git
 
     if ! git remote get-url origin >/dev/null 2>&1; then
         if [ "$GH_OK" = yes ]; then
-            if gh repo create "$name" --private --source . --push >/dev/null 2>>"$LOG"; then
-                log "$name: created late private repo and pushed"
-            else
-                log "$name: no origin and repo creation failed - not backing up"
+            if ! ensure_repo "$name"; then
+                log "$name: no origin and repo wiring failed - not backing up"
                 return
             fi
         else
