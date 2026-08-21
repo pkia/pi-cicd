@@ -112,7 +112,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pytest ruff
-          [ -f requirements.txt ] && pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Lint (fatal rules only)
         run: ruff check . --select E9,F63,F7,F82
