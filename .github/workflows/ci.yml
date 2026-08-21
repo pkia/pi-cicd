@@ -6,26 +6,37 @@ on:
   pull_request:
 
 jobs:
-  test:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install dependencies
+      - name: Syntax-check all scripts
         run: |
-          pip install pytest ruff
-          [ -f requirements.txt ] && pip install -r requirements.txt
+          fail=0
+          for f in new-project project-guard install.sh templates/deploy.sh; do
+            bash -n "$f" || fail=1
+          done
+          [ $fail = 0 ] || exit 1
 
-      - name: Lint (fatal rules only)
-        run: ruff check . --select E9,F63,F7,F82
-
-      - name: Byte-compile all sources
-        run: python -m compileall -q .
-
-      - name: Tests
+      - name: ShellCheck (non-fatal, advisory)
         run: |
-          if compgen -G "tests/test_*.py" > /dev/null; then pytest -v; else echo "no tests yet"; fi
+          sudo apt-get install -y shellcheck >/dev/null 2>&1 || true
+          command -v shellcheck >/dev/null || { echo "shellcheck unavailable"; exit 0; }
+          shellcheck new-project project-guard install.sh || true
+
+      - name: Mermaid diagrams render (structure sanity)
+        run: |
+          python3 - <<'EOF'
+          import re, sys, pathlib
+          bad = 0
+          for p in pathlib.Path(".").rglob("*.md"):
+              text = p.read_text()
+              blocks = re.findall(r"```mermaid\n(.*?)```", text, re.S)
+              for b in blocks:
+                  first = b.strip().splitlines()[0] if b.strip() else ""
+                  if not re.match(r"(flowchart|sequenceDiagram|graph|classDiagram|stateDiagram|erDiagram|pie|gantt)\b", first):
+                      print(f"{p}: mermaid block does not start with a diagram type: {first!r}")
+                      bad += 1
+          sys.exit(1 if bad else 0)
+          EOF

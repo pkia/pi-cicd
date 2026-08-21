@@ -112,7 +112,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pytest ruff
-          [ -f requirements.txt ] && pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Lint (fatal rules only)
         run: ruff check . --select E9,F63,F7,F82
@@ -136,6 +136,8 @@ __pycache__/
 *.pyc
 *.log
 *.fifo
+.deployed_commit
+.deploy_failed
 EOF
     # Anything oversized gets ignored rather than committed.
     find . -type f -size +"$MAX_FILE_BYTES"c -not -path './.git/*' \
@@ -186,9 +188,25 @@ backup_repo() {   # $1 = directory that already has .git
         fi
     fi
 
-    # Committed but unpushed work goes to main directly.
-    if ! git push -q origin main 2>>"$LOG"; then
-        log "$name: push of main rejected (diverged from origin?) - needs a human"
+    # Every managed repo goes through CI: if a code repo has no workflow,
+    # add the standard one so the pipeline applies to everything.
+    if ! ls .github/workflows/*.yml >/dev/null 2>&1 && is_project_dir "$PWD"; then
+        write_standard_ci
+        git add .github
+        git commit -q -m "ci: standard CI workflow (added by project-guard)" \
+            && log "$name: no CI workflow found - standard workflow added"
+    fi
+
+    # Committed but unpushed work: push the current branch under its own
+    # name (projects may use master or feature branches; deploy tooling
+    # deliberately targets main - backup should capture whatever is real).
+    CUR_BRANCH=$(git branch --show-current 2>/dev/null)
+    if [ -n "$CUR_BRANCH" ]; then
+        if ! git push -q origin "$CUR_BRANCH" 2>>"$LOG"; then
+            log "$name: push of $CUR_BRANCH rejected (diverged from origin?) - needs a human"
+        fi
+    else
+        log "$name: detached HEAD (deploy rollback window?) - skipping branch push"
     fi
 
     # Uncommitted work goes to the autosave branch via a private index,
@@ -231,14 +249,20 @@ backup_repo() {   # $1 = directory that already has .git
 found=0
 for d in "$HOME_DIR"/*/ "$HOME_DIR"/apps/*/; do
     [ -d "$d" ] || continue
-    case "$d" in */.*/|*/.*/ ) : ;; esac
     basename_hidden=$(basename "$d")
     case "$basename_hidden" in .*) continue;; esac
     excluded "$d" && continue
+    # Container directories hold projects, they are not projects themselves
+    # (their children are scanned by the second glob above).
+    [ "$d" = "$HOME_DIR/apps/" ] && continue
     [ -f "$d/pyvenv.cfg" ] && [ ! -d "$d/.git" ] && continue   # bare venv, not a project
     if [ -d "$d/.git" ]; then
         found=1
-        backup_repo "$d"
+        # Repos with no commits yet (e.g. freshly cloned/created by hand)
+        # have no main to push - skip quietly until the first commit exists.
+        if git -C "$d" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+            backup_repo "$d"
+        fi
     elif is_project_dir "$d"; then
         found=1
         log "discovered unversioned project: $d"
