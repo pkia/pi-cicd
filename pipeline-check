@@ -80,14 +80,16 @@ check_project() {
     local slug
     slug=$(echo "$origin_url" | sed -n 's#.*github\.com[:/]##; s#\.git$##p')
     if [ -n "$slug" ]; then
-        local verdict concl sha
-        verdict=$(gh run list -R "$slug" --limit 1 --json conclusion,headSha \
-                    -q '.[0] | "\(.conclusion) \(.headSha[0:8])"' 2>/dev/null)
-        concl=${verdict%% *}; sha=${verdict#* }
+        local verdict concl status sha
+        verdict=$(gh run list -R "$slug" --limit 1 --json conclusion,status,headSha \
+                    -q '.[0] | "\(.conclusion) \(.status) \(.headSha[0:8])"' 2>/dev/null)
+        concl=${verdict%% *}; rest=${verdict#* }; status=${rest%% *}; sha=${rest#* }
         case "$concl" in
             success) note "  $name: CI green ($verdict)" ;;
-            null)
-                if [ "$sha" = "null" ]; then
+            failure|startup_failure|cancelled|timed_out|action_required)
+                     alert "$name: CI $concl on $sha" ;;
+            *)  # null/empty: either pending or no runs at all
+                if [ "$sha" = "null" ] || [ -z "$sha" ]; then
                     if ls "$dir"/.github/workflows/*.yml >/dev/null 2>&1; then
                         note "  $name: CI configured but no runs yet"
                     elif is_project_dir "$dir"; then
@@ -96,21 +98,21 @@ check_project() {
                         note "  $name: docs-only so far, CI added when code arrives"
                     fi
                 else
-                    note "  $name: CI in progress ($sha)"
+                    note "  $name: CI $status ($sha)"
                 fi ;;
-            *) alert "$name: CI $verdict" ;;
         esac
     fi
 
     # Service deploy freshness
     if [ -n "${SERVICES[$name]:-}" ]; then
-        local timer marker head
+        local timer marker head m8
         timer="${SERVICES[$name]}"
         systemctl is-active --quiet "$timer.timer" || alert "$name: deploy timer $timer.timer NOT active"
         marker=$(cat "$dir/.deployed_commit" 2>/dev/null || echo "")
         head=$(git -C "$dir" rev-parse HEAD)
+        m8=${marker:0:8}; [ -z "$m8" ] && m8="nothing-yet"
         if [ "$marker" != "$head" ]; then
-            alert "$name: service runs ${marker:0:8:-}, HEAD is ${head:0:8} (deploy lagging, blocked on dirty tree, or failed health check - see deploy.log)"
+            alert "$name: service runs $m8, HEAD is ${head:0:8} (deploy lagging, blocked on dirty tree, or failed health check - see deploy.log)"
         else
             note "  $name: deployed at HEAD, healthy"
         fi
