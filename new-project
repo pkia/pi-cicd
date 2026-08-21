@@ -118,7 +118,7 @@ CI runs on every push and pull request: ruff fatal-rule lint,
 byte-compilation and the pytest suite (Python 3.11 + 3.13).
 EOF
 
-cp /home/ev/pi-tooling/templates/ci-flask.yml .github/workflows/ci.yml
+cp /home/ev/pi-cicd/templates/ci-flask.yml .github/workflows/ci.yml
 
 git init -b main -q
 git config user.name "$GH_USER"
@@ -137,7 +137,7 @@ if [ -n "$PORT" ]; then
     venv/bin/pip install -q flask pytest
 
     sed -e "s/__NAME__/$NAME/g" -e "s/__PORT__/$PORT/g" \
-        /home/ev/pi-tooling/templates/deploy.sh > deploy/deploy.sh
+        /home/ev/pi-cicd/templates/deploy.sh > deploy/deploy.sh
     chmod +x deploy/deploy.sh
 
     cat > "deploy/$NAME.service" <<EOF
@@ -157,7 +157,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    sed "s/__NAME__/$NAME/g" /home/ev/pi-tooling/templates/deploy.timer > "deploy/$NAME-deploy.timer"
+    sed "s/__NAME__/$NAME/g" /home/ev/pi-cicd/templates/deploy.timer > "deploy/$NAME-deploy.timer"
     cat > "deploy/$NAME-deploy.service" <<EOF
 [Unit]
 Description=$NAME pull-based deploy job
