@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# new-project NAME [--public] [--port N]
+#
+# Scaffolds a Flask project with the full pipeline from the first commit:
+# git repo, pytest suite, GitHub Actions CI, and - with --port - a systemd
+# service plus the same pull-based CD (auto-restart + health check +
+# rollback) that maritime-dashboard and project-hub use.
+#
+# The GitHub repo is private by default; publish when the work is ready:
+#   gh repo edit NAME --visibility public
+set -euo pipefail
+
+usage() { echo "usage: new-project NAME [--public] [--port N]"; exit 1; }
+
+[ $# -ge 1 ] || usage
+NAME=$1; shift
+PUBLIC=no; PORT=""
+while [ $# -gt 0 ]; do
+    case $1 in
+        --public) PUBLIC=yes ;;
+        --port)   PORT=$2; shift ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+DEST="$HOME/$NAME"
+GH_USER=$(gh api user -q .login 2>/dev/null) || { echo "run: gh auth login"; exit 1; }
+[ -e "$DEST" ] && { echo "$DEST already exists"; exit 1; }
+
+echo "== scaffolding $NAME =="
+mkdir -p "$DEST"/{tests,templates,static,.github/workflows}
+cd "$DEST"
+
+cat > app.py <<EOF
+#!/usr/bin/env python3
+"""$NAME."""
+from flask import Flask, jsonify, render_template
+
+app = Flask(__name__)
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({"ok": True, "service": "$NAME"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=${PORT:-5000}, threaded=True)
+EOF
+
+cat > templates/index.html <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>$NAME</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>$NAME</h1>
+</body>
+</html>
+EOF
+
+echo "body { font-family: system-ui, sans-serif; margin: 2rem; }" > static/style.css
+echo "flask>=3.1" > requirements.txt
+
+cat > pyproject.toml <<'EOF'
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+EOF
+
+cat > tests/test_app.py <<'EOF'
+import app
+
+client = app.app.test_client()
+
+
+def test_index_serves_page():
+    r = client.get("/")
+    assert r.status_code == 200
+
+
+def test_api_status():
+    assert client.get("/api/status").get_json()["ok"] is True
+EOF
+
+cat > .gitignore <<EOF
+venv/
+__pycache__/
+*.pyc
+*.log
+.deployed_commit
+.deploy_failed
+EOF
+
+cat > README.md <<EOF
+# $NAME
+
+![CI](https://github.com/$GH_USER/$NAME/actions/workflows/ci.yml/badge.svg)
+
+TODO - describe the project.
+
+## CI/CD
+
+CI runs on every push and pull request: ruff fatal-rule lint,
+byte-compilation and the pytest suite (Python 3.11 + 3.13).
+EOF
+
+cp /home/ev/pi-tooling/templates/ci-flask.yml .github/workflows/ci.yml
+
+git init -b main -q
+git config user.name "$GH_USER"
+git config user.email "$GH_USER@users.noreply.github.com"
+git add -A
+git commit -q -m "Initial scaffold: Flask app, tests, CI"
+
+VIS=--private; [ "$PUBLIC" = yes ] && VIS=--public
+echo "== creating GitHub repo ($VIS) =="
+gh repo create "$NAME" $VIS --source . --push
+
+if [ -n "$PORT" ]; then
+    echo "== wiring CD for :$PORT =="
+    mkdir -p deploy
+    python3 -m venv venv
+    venv/bin/pip install -q flask pytest
+
+    sed -e "s/__NAME__/$NAME/g" -e "s/__PORT__/$PORT/g" \
+        /home/ev/pi-tooling/templates/deploy.sh > deploy/deploy.sh
+    chmod +x deploy/deploy.sh
+
+    cat > "deploy/$NAME.service" <<EOF
+[Unit]
+Description=$NAME Web App
+After=network.target
+
+[Service]
+Type=simple
+User=ev
+WorkingDirectory=$DEST
+ExecStart=$DEST/venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sed "s/__NAME__/$NAME/g" /home/ev/pi-tooling/templates/deploy.timer > "deploy/$NAME-deploy.timer"
+    cat > "deploy/$NAME-deploy.service" <<EOF
+[Unit]
+Description=$NAME pull-based deploy job
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+WorkingDirectory=$DEST
+ExecStart=$DEST/deploy/deploy.sh
+EOF
+
+    git add -A
+    git commit -q -m "CD: pull-based deploy with health check and rollback"
+    git push -q
+
+    sudo cp "deploy/$NAME.service" "deploy/$NAME-deploy.service" "deploy/$NAME-deploy.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now "$NAME.service" "$NAME-deploy.timer"
+    sleep 2
+    curl -sf -m 5 "http://127.0.0.1:$PORT/" >/dev/null \
+        && echo "service live on :$PORT" \
+        || echo "WARNING: service not answering on :$PORT yet - check: systemctl status $NAME"
+fi
+
+echo
+echo "done: $DEST  ->  $(gh repo view "$NAME" -q .url)"
+[ -n "$PORT" ] || echo "(no --port: CI only; add deploy wiring later if it becomes a service)"

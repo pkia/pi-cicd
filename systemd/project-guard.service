@@ -1,0 +1,9 @@
+[Unit]
+Description=Project guard - adopt and back up all projects
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+ExecStart=/home/ev/.local/bin/project-guard

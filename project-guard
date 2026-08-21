@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# project-guard - "no work is lost" automation for the Pi.
+#
+# Runs every 10 minutes via systemd (project-guard.timer) and:
+#   1. finds project directories under $HOME and $HOME/apps that contain
+#      code but no git repo, and adopts them: git init, .gitignore (with
+#      oversized files excluded), standard CI workflow, initial commit,
+#      private GitHub repo, push.
+#   2. for every managed git repo: pushes unpushed commits on main, and
+#      snapshots any uncommitted changes to an 'autosave' branch and
+#      pushes that too - so even work-in-progress survives a dead SD card.
+#
+# Safety rules:
+#   - never pulls, merges or resets anything (deploy is a separate concern)
+#   - never touches excluded directories (upstream sources, binary dists)
+#   - skips autosaving anything that looks like a secret (filename or
+#     content heuristics) and logs a warning instead
+set -u
+
+HOME_DIR="/home/ev"
+LOG_DIR="$HOME_DIR/.local/state"
+LOG="$LOG_DIR/project-guard.log"
+EXCLUDE=(AIS-catcher-src AdGuardHome)
+MAX_FILE_BYTES=20971520          # 20 MB - larger files get gitignored
+SECRET_NAME_RE='(^|/)([^/]*key[^/]*\.(txt|json|pem)|[^/]*secret[^/]*|[^/]*token[^/]*|.*\.env|.*\.pem|.*\.p12|id_rsa.*|id_ed25519.*|[^/]*credential[^/]*)$'
+SECRET_CONTENT_RE='(ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+
+mkdir -p "$LOG_DIR"
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+GH_OK=no
+gh auth status >/dev/null 2>&1 && GH_OK=yes
+
+is_project_dir() {
+    # Contains code files at shallow depth, outside venv/lib trees.
+    find "$1" -maxdepth 2 -not -path '*/.git*' -not -path '*/lib/*' \
+         -not -path '*/bin/*' -not -path '*/include/*' -not -path '*/node_modules/*' \
+         \( -name '*.py' -o -name '*.js' -o -name '*.sh' -o -name package.json \
+            -o -name Makefile -o -name '*.cpp' -o -name '*.c' \) -print -quit 2>/dev/null \
+      | grep -q .
+}
+
+excluded() {
+    local name; name=$(basename "$1")
+    for e in "${EXCLUDE[@]}"; do [ "$name" = "$e" ] && return 0; done
+    return 1
+}
+
+looks_secret() {
+    # $@: paths from git status --porcelain
+    local p
+    for p in "$@"; do
+        p=${p%% ->*}
+        if echo "$p" | grep -qiE "$SECRET_NAME_RE"; then
+            log "  suspect filename: $p"
+            return 0
+        fi
+        if [ -f "$p" ] && [ "$(stat -c%s "$p" 2>/dev/null || echo 999999999)" -lt 262144 ]; then
+            if grep -qE "$SECRET_CONTENT_RE" "$p" 2>/dev/null; then
+                log "  suspect content in: $p"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+write_standard_ci() {
+    mkdir -p .github/workflows
+    cat > .github/workflows/ci.yml <<'EOF'
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install pytest ruff
+          [ -f requirements.txt ] && pip install -r requirements.txt
+
+      - name: Lint (fatal rules only)
+        run: ruff check . --select E9,F63,F7,F82
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q .
+
+      - name: Tests
+        run: |
+          if compgen -G "tests/test_*.py" > /dev/null; then pytest -v; else echo "no tests yet"; fi
+EOF
+}
+
+adopt() {   # $1 = directory without git
+    local dir=$1 name; name=$(basename "$1")
+    cd "$dir" || return 1
+    git init -b main -q
+    {
+        echo "# added by project-guard at adoption"
+        echo "__pycache__/"
+        echo "*.pyc"
+        echo "*.log"
+        echo "*.fifo"
+        # Anything oversized gets ignored rather than committed.
+        find . -maxdepth 3 -type f -size +${MAX_FILE_BYTES}c -not -path './.git/*' \
+            | sed 's|^\./||' | sed 's|^\(.*\)$|/\1'
+    } >> .gitignore 2>/dev/null || cp /dev/null .gitignore
+    write_standard_ci
+    git add -A
+    git commit -q -m "Initial commit (auto-adopted by project-guard)" || return 1
+
+    if [ "$GH_OK" = yes ]; then
+        if gh repo create "$name" --private --source . --push >/dev/null 2>>"$LOG"; then
+            log "adopted $name -> private repo $(gh repo view "$name" -q .url 2>/dev/null || echo "(url n/a)")"
+        else
+            log "adopted $name locally, but repo creation FAILED (name taken?) - manual fix needed"
+        fi
+    else
+        log "adopted $name locally (no gh auth - not pushed)"
+    fi
+}
+
+backup_repo() {   # $1 = directory that already has .git
+    local dir=$1 name; name=$(basename "$1")
+    cd "$dir" || return 1
+
+    if ! git remote get-url origin >/dev/null 2>&1; then
+        if [ "$GH_OK" = yes ]; then
+            if gh repo create "$name" --private --source . --push >/dev/null 2>>"$LOG"; then
+                log "$name: created late private repo and pushed"
+            else
+                log "$name: no origin and repo creation failed - not backing up"
+                return
+            fi
+        else
+            return   # nothing we can do remotely
+        fi
+    fi
+
+    # Committed but unpushed work goes to main directly.
+    if ! git push -q origin main 2>>"$LOG"; then
+        log "$name: push of main rejected (diverged from origin?) - needs a human"
+    fi
+
+    # Uncommitted work goes to the autosave branch via a private index,
+    # leaving the working tree, the real index and HEAD untouched.
+    local dirty
+    dirty=$(git status --porcelain 2>/dev/null)
+    [ -z "$dirty" ] && return
+
+    local -a paths=()
+    while IFS= read -r line; do paths+=("$(echo "$line" | cut -c4-)"); done <<< "$dirty"
+    if looks_secret "${paths[@]}"; then
+        log "$name: possible secrets in uncommitted work - autosave SKIPPED"
+        return
+    fi
+
+    local tmpidx tree parent commit
+    tmpidx=$(mktemp)
+    GIT_INDEX_FILE=$tmpidx git read-tree HEAD 2>>"$LOG" || { rm -f "$tmpidx"; return; }
+    GIT_INDEX_FILE=$tmpidx git add -A 2>>"$LOG"
+    tree=$(GIT_INDEX_FILE=$tmpidx git write-tree 2>>"$LOG") || { rm -f "$tmpidx"; return; }
+    rm -f "$tmpidx"
+    [ "$tree" = "$(git rev-parse HEAD^{tree})" ] && return   # only ignored files changed
+
+    if git rev-parse -q --verify refs/heads/autosave >/dev/null; then
+        parent=refs/heads/autosave
+    else
+        parent=HEAD
+    fi
+    commit=$(git commit-tree "$tree" -p "$parent" \
+        -m "autosave $(date '+%F %T') - working tree snapshot" 2>>"$LOG") || return
+    git update-ref refs/heads/autosave "$commit"
+    if git push -q origin refs/heads/autosave 2>>"$LOG"; then
+        log "$name: autosaved ${#paths[@]} changed path(s) -> autosave@${commit:0:12}"
+    else
+        log "$name: autosave committed locally but push failed"
+    fi
+}
+
+# --- scan ---
+found=0
+for d in "$HOME_DIR"/*/ "$HOME_DIR"/apps/*/; do
+    [ -d "$d" ] || continue
+    case "$d" in */.*/|*/.*/ ) : ;; esac
+    basename_hidden=$(basename "$d")
+    case "$basename_hidden" in .*) continue;; esac
+    excluded "$d" && continue
+    [ -f "$d/pyvenv.cfg" ] && [ ! -d "$d/.git" ] && continue   # bare venv, not a project
+    if [ -d "$d/.git" ]; then
+        found=1
+        backup_repo "$d"
+    elif is_project_dir "$d"; then
+        found=1
+        log "discovered unversioned project: $d"
+        adopt "$d"
+    fi
+done
+[ "$found" = 0 ] && log "no project directories found (unexpected)"
+exit 0
