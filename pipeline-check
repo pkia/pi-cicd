@@ -19,6 +19,7 @@ declare -A SERVICES=(
     [project-hub]=project-hub-deploy
     [sat-audio]=sat-audio-deploy
     [book-app]=book-app-deploy
+    [shelfmate]=shelfmate-deploy
 )
 
 alerts=0
