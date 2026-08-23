@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""loop-heartbeat — dead-man's switch for the scheduled loop.
+
+Poll-based monitor: resolves the watched hermes cron jobs, reads their
+durable execution history (`hermes cron runs`), and alerts when a job
+
+  * missed a scheduled fire (silence)         — nothing ran when due
+  * failed N times in a row (streak)          — ran, but kept erroring
+  * is stuck "running" for hours (zombie)     — died without a terminal state
+  * vanished from the scheduler (renamed/deleted)
+
+plus optional systemd service (down?) and timer (stale trigger?) checks.
+
+Why poll instead of a ping at the end of each job: the loop's guardrail
+forbids editing the hermes cron jobs themselves, and a job that dies
+mid-run never reaches its success path anyway. Reading the durable
+history catches every failure mode from outside.
+
+Alerts go through `hermes send` (no LLM, no agent loop) and are deduped
+in a small JSON state file: an alert fires immediately, re-fires at most
+every RENOTIFY_MIN while the condition persists, and fires one recovery
+notice when it clears. Silent (exit 0, one ✓ line) when everything is
+green — pipeline-check convention.
+
+Config: /etc/loop-heartbeat.conf (KEY=VALUE, '#' comments):
+  WATCH_JOBS   comma-separated hermes cron job Names (see `hermes cron list`)
+  SERVICES     comma-separated systemd services that must be active
+  TIMERS       comma-separated name:interval_minutes pairs; the timer's
+               last trigger must not be older than ~1.5x the interval
+  SEND_TARGET  hermes send target, e.g. 'whatsapp:<jid>@lid'.
+               Empty/missing -> alerts are printed to stdout/journal only.
+
+Manual:   loop-heartbeat [--config FILE] [--state FILE] [--dry-run] [-v]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DEFAULT_WATCH_JOBS = [
+    "Daily devlog post",
+    "X content writer",
+    "Radar implementer — self-improvement loop",
+]
+DEFAULT_CONFIG = "/etc/loop-heartbeat.conf"
+DEFAULT_STATE = os.path.expanduser("~/.local/state/loop-heartbeat/state.json")
+GRACE_MIN = 30          # slack between "due" and "missed"
+STREAK_THRESHOLD = 2    # consecutive failed/unknown runs that page
+ZOMBIE_HOURS = 6        # a 'running' entry older than this is a zombie
+RENOTIFY_MIN = 360      # re-alert interval while a condition persists
+HISTORY_LIMIT = 40      # runs entries examined per job
+CRON_SEARCH_CAP_MIN = 60 * 24 * 30  # give up looking for a cron match after
+
+RE_JOB = None  # set below (kept near parser for readability)
+
+
+# ---------------------------------------------------------------- config
+
+def parse_env_file(path):
+    """KEY=VALUE lines -> dict (str). Missing file -> {}."""
+    cfg = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg[key.strip()] = value.strip()
+    return cfg
+
+
+def load_config(path):
+    raw = parse_env_file(path)
+    cfg = {
+        "watch_jobs": [j.strip() for j in raw.get("WATCH_JOBS", "").split(",") if j.strip()]
+        or list(DEFAULT_WATCH_JOBS),
+        "services": [s.strip() for s in raw.get("SERVICES", "").split(",") if s.strip()],
+        "timers": {},
+        "send_target": raw.get("SEND_TARGET", ""),
+        "grace_min": int(raw.get("GRACE_MIN", GRACE_MIN)),
+        "streak_threshold": int(raw.get("STREAK_THRESHOLD", STREAK_THRESHOLD)),
+        "zombie_hours": float(raw.get("ZOMBIE_HOURS", ZOMBIE_HOURS)),
+        "renotify_min": int(raw.get("RENOTIFY_MIN", RENOTIFY_MIN)),
+    }
+    for pair in raw.get("TIMERS", "").split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        name, sep, mins = pair.partition(":")
+        if sep and mins.strip().isdigit():
+            cfg["timers"][name.strip()] = int(mins.strip())
+    return cfg
+
+
+# ------------------------------------------------------- hermes cron CLI
+
+def run_cmd(argv, timeout=60):
+    """Return (rc, stdout). Never raises; rc 124 == could not run."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"note: {' '.join(argv[:3])} failed: {exc}", file=sys.stderr)
+        return 124, ""
+    return p.returncode, p.stdout
+
+
+def parse_cron_list(text):
+    """'hermes cron list' output -> {name: (id, state)}; state 'active'|other."""
+    jobs = {}
+    job_id = state = None
+    for line in text.splitlines():
+        s = line.strip()
+        if " [" in s and s.endswith(("active]", "paused]", "deleted]")):
+            head = s.split()[0]
+            if len(head) == 12 and head.isalnum():
+                job_id, state = head, s.split("[", 1)[1].rstrip("]")
+                continue
+        if s.startswith("Name:") and job_id:
+            name = s.split("Name:", 1)[1].strip()
+            jobs[name] = (job_id, state)
+            job_id = state = None
+    return jobs
+
+
+def parse_runs(text):
+    """'hermes cron runs' output -> [{id,status,ts}] newest-first (as printed).
+
+    Entry lines:  <32hex>  <status>  job=<id12>  source=<x>  <iso-ts>
+    Continuation lines (error notes) are indented and ignored here.
+    """
+    import re
+
+    entries = []
+    pat = re.compile(
+        r"^([0-9a-f]{32})\s+(completed|failed|running|unknown)\s+"
+        r"job=([0-9a-f]{12})\s+source=\S+\s+(\S+)$"
+    )
+    for line in text.splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.fromisoformat(m.group(4)).astimezone().replace(tzinfo=None)
+        except ValueError:
+            continue
+        entries.append({"id": m.group(1), "status": m.group(2), "ts": ts})
+    return entries
+
+
+# ------------------------------------------------------------ schedules
+
+def parse_schedule(spec):
+    """'every 30m' -> ('interval', minutes); 5-field cron -> ('cron', fields);
+    anything unparseable -> None (silence check is skipped for the job)."""
+    spec = spec.strip()
+    if spec.startswith("every "):
+        body = spec[len("every "):]
+        for suffix, mult in (("d", 1440), ("h", 60), ("m", 1)):
+            if body.endswith(suffix) and body[: -len(suffix)].isdigit():
+                return ("interval", int(body[: -len(suffix)]) * mult)
+        return None
+    fields = spec.split()
+    if len(fields) != 5:
+        return None
+    parsed = []
+    for field in fields:
+        if field == "*":
+            parsed.append(None)  # unrestricted
+            continue
+        values = []
+        for part in field.split(","):
+            if not part.isdigit():
+                return None  # ranges/steps unsupported -> unknown schedule
+            values.append(int(part))
+        parsed.append(values or None)
+    minute, hour, dom, mon, dow = parsed
+    if minute is not None and not all(0 <= v <= 59 for v in minute):
+        return None
+    if hour is not None and not all(0 <= v <= 23 for v in hour):
+        return None
+    if mon is not None and not all(1 <= v <= 12 for v in mon):
+        return None
+    if dow is not None and not all(0 <= v <= 7 for v in dow):
+        return None
+    return ("cron", parsed)
+
+
+def _cron_dt_matches(fields, dt):
+    minute, hour, dom, mon, dow = fields
+    if minute is not None and dt.minute not in minute:
+        return False
+    if hour is not None and dt.hour not in hour:
+        return False
+    if dom is not None and dt.day not in dom:
+        return False
+    if mon is not None and dt.month not in mon:
+        return False
+    if dow is not None:
+        # cron: 0 or 7 = Sunday; python weekday(): Mon=0..Sun=6
+        py_dows = {(d + 6) % 7 for d in dow}
+        if dt.weekday() not in py_dows:
+            return False
+    return True
+
+
+def last_expected_fire(schedule, now):
+    """Latest minute <= now matching the schedule (cap: search window above).
+
+    interval schedules have no absolute anchor -> returns None (silence for
+    those is judged relative to the last run instead).
+    """
+    kind, val = schedule
+    if kind != "cron":
+        return None
+    t = now.replace(second=0, microsecond=0)
+    for _ in range(CRON_SEARCH_CAP_MIN):
+        if _cron_dt_matches(val, t):
+            return t
+        t -= timedelta(minutes=1)
+    return None
+
+
+# ---------------------------------------------------------- job checks
+
+def check_job(name, job_id, state, schedule_spec, now, cfg):
+    """One watched job -> list of alert dicts {key, text}."""
+    alerts = []
+    if state != "active":
+        return []  # paused/deleted jobs legitimately do not run
+    rc, out = run_cmd(["hermes", "cron", "runs", job_id])
+    if rc != 0:
+        return [{"key": f"job:{name}:unreadable",
+                 "text": f"{name}: cannot read run history (hermes cron runs rc={rc})"}]
+    entries = parse_runs(out)[:HISTORY_LIMIT]
+    if not entries:
+        return [{"key": f"job:{name}:no-history",
+                 "text": f"{name}: no run history found — job never ran?"}]
+
+    newest = entries[0]
+    schedule = parse_schedule(schedule_spec)
+    grace = timedelta(minutes=cfg["grace_min"])
+
+    # zombie: a run still 'running' hours later died without terminal state
+    for e in entries:
+        if e["status"] == "running" and now - e["ts"] > timedelta(hours=cfg["zombie_hours"]):
+            alerts.append({"key": f"job:{name}:zombie",
+                           "text": f"{name}: run started {e['ts']} still 'running' "
+                                   f"{(now - e['ts']).total_seconds() / 3600:.1f}h later"})
+            break
+
+    # failure streak: consecutive failed/unknown under the newest entries,
+    # skipping any in-flight 'running' at the head
+    streak = 0
+    for e in entries:
+        if e["status"] == "running":
+            continue
+        if e["status"] in ("failed", "unknown"):
+            streak += 1
+        else:
+            break
+    if streak >= cfg["streak_threshold"]:
+        alerts.append({
+            "key": f"job:{name}:streak",
+            "text": f"{name}: last {streak} run(s) failed or unknown "
+                    f"(most recent {newest['ts']:%Y-%m-%d %H:%M}) — loop is silently dead",
+        })
+
+    # silence: overdue vs schedule (a healthy long run counts as present,
+    # because the entry timestamp is when the run started)
+    last_ts = max(e["ts"] for e in entries)
+    if schedule and schedule[0] == "interval":
+        due = last_ts + timedelta(minutes=schedule[1])
+        if now > due + grace:
+            alerts.append({"key": f"job:{name}:silent",
+                           "text": f"{name}: silent — due {due:%Y-%m-%d %H:%M}, "
+                                   f"nothing since {last_ts:%Y-%m-%d %H:%M}"})
+    elif schedule and schedule[0] == "cron":
+        expected = last_expected_fire(schedule, now)
+        if expected and last_ts < expected - grace:
+            alerts.append({"key": f"job:{name}:silent",
+                           "text": f"{name}: missed fire {expected:%Y-%m-%d %H:%M} — "
+                                   f"last run started {last_ts:%Y-%m-%d %H:%M}"})
+    return alerts
+
+
+# -------------------------------------------------------- systemd checks
+
+def check_service(name):
+    rc, _ = run_cmd(["systemctl", "is-active", "--quiet", name])
+    if rc != 0:
+        return [{"key": f"svc:{name}:down", "text": f"service {name} is not active"}]
+    return []
+
+
+def check_timer(name, interval_min, now):
+    alerts = []
+    rc, _ = run_cmd(["systemctl", "is-active", "--quiet", f"{name}.timer"])
+    if rc != 0:
+        return [{"key": f"timer:{name}:inactive",
+                 "text": f"timer {name}.timer is not active"}]
+    rc, out = run_cmd(["systemctl", "show", f"{name}.timer",
+                       "-p", "LastTriggerUSec", "--value"])
+    last = out.strip().split("\n")[0].strip() if rc == 0 else ""
+    # 'Sun 2026-08-23 04:04:39 IST' -> take the date+time tokens
+    parts = last.split()
+    trigger = None
+    if len(parts) >= 3:
+        try:
+            trigger = datetime.fromisoformat(f"{parts[1]} {parts[2]}")
+        except ValueError:
+            trigger = None
+    if trigger is None:
+        return [{"key": f"timer:{name}:never",
+                 "text": f"timer {name}.timer has no parseable last trigger ({last or 'none'})"}]
+    limit = timedelta(minutes=interval_min * 1.5 + 5)
+    if now - trigger > limit:
+        alerts.append({"key": f"timer:{name}:stale",
+                       "text": f"timer {name}.timer last fired {trigger:%Y-%m-%d %H:%M} "
+                               f"(>{interval_min}m interval) — stuck or failing"})
+    return alerts
+
+
+# -------------------------------------------------------- state & alerting
+
+def load_state(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, state):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+
+
+def deliver(alerts, cfg, state_path, dry_run, now):
+    """Dedupe against state, send new/re-due alerts, notice recoveries."""
+    state = load_state(state_path)
+    active_keys = {a["key"] for a in alerts}
+    sent, suppressed, recovered = [], [], []
+    for a in alerts:
+        rec = state.get(a["key"])
+        if rec is None or now - datetime.fromisoformat(rec["last_sent"]) >= \
+                timedelta(minutes=cfg["renotify_min"]):
+            subject = "⚠ loop-heartbeat"
+            if send(cfg["send_target"], subject, a["text"], dry_run):
+                state[a["key"]] = {"last_sent": now.isoformat(timespec="seconds")}
+                sent.append(a["key"])
+            else:
+                suppressed.append(a["key"])
+        else:
+            suppressed.append(a["key"])
+    for key in [k for k in state if k not in active_keys]:
+        text = f"✓ resolved: {key} — condition cleared at {now:%Y-%m-%d %H:%M}"
+        if send(cfg["send_target"], "✓ loop-heartbeat", text, dry_run):
+            recovered.append(key)
+        del state[key]  # drop even if send failed: the condition is gone
+    if not dry_run and (sent or recovered):
+        save_state(state_path, state)
+    return sent, suppressed, recovered
+
+
+def send(target, subject, body, dry_run):
+    if dry_run:
+        print(f"[dry-run] would send to {target or '<stdout>'}:\n  {subject}\n  {body}\n")
+        return True
+    if not target:
+        print(f"⚠ no SEND_TARGET configured; alert not delivered:\n  {body}\n")
+        return False
+    try:
+        p = subprocess.run(["hermes", "send", "-t", target, "-s", subject, body],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"note: hermes send failed: {exc}", file=sys.stderr)
+        return False
+    if p.returncode != 0:
+        print(f"note: hermes send rc={p.returncode}: "
+              f"{(p.stdout + p.stderr).strip()[:200]}", file=sys.stderr)
+        return False
+    return True
+
+
+# ----------------------------------------------------------------- main
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="dead-man's switch for the scheduled loop")
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--state", default=DEFAULT_STATE)
+    ap.add_argument("--dry-run", action="store_true", help="print sends, change nothing")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    cfg = load_config(args.config)
+    now = datetime.now().replace(microsecond=0)
+    alerts = []
+
+    rc, listing = run_cmd(["hermes", "cron", "list"])
+    jobs = parse_cron_list(listing) if rc == 0 else {}
+    if rc != 0:
+        alerts.append({"key": "loop:hermes-unreachable",
+                       "text": f"hermes cron list failed (rc={rc}) — cannot check any job"})
+    schedules = {}
+    current, sched = None, None
+    for line in listing.splitlines():
+        s = line.strip()
+        if s.startswith("Name:"):
+            current = s.split("Name:", 1)[1].strip()
+        elif s.startswith("Schedule:") and current:
+            schedules[current] = s.split("Schedule:", 1)[1].strip()
+
+    for name in cfg["watch_jobs"]:
+        if name not in jobs:
+            alerts.append({"key": f"job:{name}:missing",
+                           "text": f"{name}: not found in hermes cron list — "
+                                   f"deleted or renamed, the loop is unwatched"})
+            continue
+        job_id, state = jobs[name]
+        alerts.extend(check_job(name, job_id, state, schedules.get(name, ""),
+                                now, cfg))
+    for svc in cfg["services"]:
+        alerts.extend(check_service(svc))
+    for timer, interval in cfg["timers"].items():
+        alerts.extend(check_timer(timer, interval, now))
+
+    sent, suppressed, recovered = deliver(alerts, cfg, args.state, args.dry_run, now)
+    for a in alerts:
+        mark = "⚠" if a["key"] in sent else ("·" if a["key"] in suppressed else "⚠")
+        print(f"{mark} {a['text']}")
+    if not alerts:
+        print(f"✓ loop-heartbeat: all green "
+              f"(jobs={len(cfg['watch_jobs'])} services={len(cfg['services'])} "
+              f"timers={len(cfg['timers'])}) at {now:%Y-%m-%d %H:%M}")
+    elif args.verbose:
+        print(f"sent={len(sent)} suppressed(dedup)={len(suppressed)} recovered={len(recovered)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

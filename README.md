@@ -46,6 +46,7 @@ flowchart TB
 | **`new-project`** | Scaffolds a project with the full pipeline from the first commit: Flask app, pytest suite, CI workflow, badge, GitHub repo, and with `--port` a systemd service plus CD wiring. |
 | **`templates/`** | The pull-based deploy script every service carries: byte-compile and import gates before restart, health check after, automatic rollback to the previously running commit, flap guard, dirty-tree guard. Plus the standard CI workflow. |
 | **`systemd/` units** | Timers driving the guard and per-service deploys. |
+| **`pipeline-check`** | Hourly compliance audit via a Hermes cron job: verifies every project is versioned, pushed, CI-green and (for services) deployed at HEAD. Alerts to messaging when not; silent when all is green. |
 
 ## Why it is built this way
 
@@ -92,6 +93,7 @@ new-project my-app --port 8100   # zero to a running, deployed,
 ```
 project-guard           adoption + autosave backup engine (bash, systemd-driven)
 new-project             project scaffolder with pipeline from birth
+pipeline-check          hourly compliance audit (run via Hermes cron, alerts-only)
 templates/ci-flask.yml     standard CI workflow for adopted/scaffolded projects
 templates/deploy.sh        parameterised pull-based deploy script (__NAME__/__PORT__)
 templates/deploy.timer     matching systemd timer

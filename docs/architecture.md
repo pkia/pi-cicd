@@ -126,6 +126,20 @@ under `$HOME` (and `$HOME/apps/*`):
   merges, rebases or resets. Backup and deploy are separate powers
   held by separate scripts.
 
+### pipeline-check — the compliance layer
+
+Backup (the guard) and delivery (deploy.sh) can both silently stall —
+an expired token, a wedged timer, a repo created outside the system.
+`pipeline-check` closes the loop: an hourly Hermes cron job (no-agent
+mode) that verifies, for every project, that it is versioned, has a
+remote, has no unpushed commits, that CI on its newest commit is green,
+and — for services — that the deploy marker matches HEAD and the deploy
+timer is active. It prints alert lines only when something is wrong and
+stays silent when everything is green, so the only messages that arrive
+on the messaging platform are ones worth reading. Docs-only repos are
+recognized and exempted until code arrives (at which point the guard
+adds CI automatically).
+
 ### new-project — pipeline from birth
 
 Scaffolds a Flask app with tests that pass on any host, the CI

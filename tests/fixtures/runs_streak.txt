@@ -1,0 +1,9 @@
+eb2117de9949477bbcca2e2bbb9bb7dd  running    job=50517c2e700c  source=builtin  2026-08-23T04:00:07.187794+01:00
+f02bd04fa8ec4eb4bfaf678024c4050b  unknown    job=50517c2e700c  source=builtin  2026-08-22T14:00:44.827926+01:00
+    Scheduler restarted after this execution's owner exited before a durable terminal state; whether side effects ran is unknown.
+982699e678854e078c7cdabe0b1f8df3  failed     job=50517c2e700c  source=direct  2026-08-21T14:47:13.572051+01:00
+    RuntimeError: HTTP 429: Usage limit reached for 5 hour. Your limit will reset at 2026-08-22 02:28:43
+a8c7358929c046ce90adaa5a7e0c1ad1  failed     job=50517c2e700c  source=direct  2026-08-21T14:30:01.614403+01:00
+    RuntimeError: HTTP 429: Rate limit reached for requests
+b406f9512006421f8cb0c2a75cbfbdd1  failed     job=50517c2e700c  source=direct  2026-08-21T14:18:43.851968+01:00
+    RuntimeError: Non-streaming API call timed out after 90s with no response (threshold: 90s)
