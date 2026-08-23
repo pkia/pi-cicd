@@ -302,5 +302,7 @@ def test_fixtures_contain_no_phone_numbers():
     for f in FIX.iterdir():
         if f.is_file():
             text = f.read_text()
-            assert "8087473803462" not in text, f"{f.name} leaks the phone number"
+            # fixtures were scrubbed: any real delivery target would show as
+            # whatsapp:<digits>; redacted ones are whatsapp:REDACTED@lid
+            assert re.search(r"whatsapp:\d{7,}", text) is None, f"{f.name} leaks a JID"
             assert re.search(r"\+353\d{8,}", text) is None, f"{f.name} leaks +353 number"
