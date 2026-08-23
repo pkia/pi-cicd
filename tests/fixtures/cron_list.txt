@@ -1,0 +1,112 @@
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Scheduled Jobs                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  db50209537ca [active]
+    Name:      Pi health watchdog
+    Schedule:  every 30m
+    Repeat:    ∞
+    Next run:  2026-08-23T04:29:07.807694+01:00
+    Deliver:   origin
+    Script:    pi_health_watchdog.py
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-23T03:59:07.807694+01:00  ok
+    Execution: completed  eadd7bbf39294bcb901daf6d3b8d731b
+
+  4daccc802319 [active]
+    Name:      Daily devlog post
+    Schedule:  0 1 * * *
+    Repeat:    ∞
+    Next run:  2026-08-24T01:00:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Workdir:   /home/ev/personal-website
+    Last run:  2026-08-23T01:19:48.302622+01:00  ok
+    Execution: completed  22b6b561f1d541739d6f75b2539c047e
+
+  50517c2e700c [active]
+    Name:      Radar implementer — self-improvement loop
+    Schedule:  0 4 * * *
+    Repeat:    ∞
+    Next run:  2026-08-24T04:00:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Workdir:   /home/ev/radar
+    Last run:  2026-08-21T15:33:16.331418+01:00  error: RuntimeError: HTTP 429: Usage limit reached for 5 hour. Your limit will reset at 2026-08-22 02:28:43  (3 failures in a row)
+    Execution: running  eb2117de9949477bbcca2e2bbb9bb7dd
+
+  2d6085f03ea1 [active]
+    Name:      Pipeline compliance check
+    Schedule:  every 60m
+    Repeat:    ∞
+    Next run:  2026-08-23T04:36:23.409391+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Script:    pipeline-check-wrapper.sh
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-23T03:36:23.409391+01:00  ok
+    Execution: completed  3ab4b0b09339490d9e9886b6e4deb774
+
+  ad3e4a6850d0 [active]
+    Name:      Devlog start notice
+    Schedule:  0 1 * * *
+    Repeat:    ∞
+    Next run:  2026-08-24T01:00:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Script:    devlog-start-notice.sh
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-23T01:00:56.869058+01:00  ok
+    Execution: completed  2c40ee51e5674f59820df4b3636bc2ce
+
+  ca56ac01a68a [active]
+    Name:      Radar implementer start notice
+    Schedule:  0 4 * * *
+    Repeat:    ∞
+    Next run:  2026-08-24T04:00:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Script:    radar-start-notice.sh
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-23T04:00:08.066572+01:00  ok
+    Execution: completed  be218a0664a641a19714472a3fd5a54e
+
+  127a36f45b4d [active]
+    Name:      X poster — window 1
+    Schedule:  30 13 * * *
+    Repeat:    ∞
+    Next run:  2026-08-23T13:30:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Script:    twitter-post.sh
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-22T13:30:40.311956+01:00  ok
+    Execution: completed  dd55e96c964548b0872f4b8436e442a6
+
+  4d2ebf82da42 [active]
+    Name:      X poster — window 2
+    Schedule:  30 18 * * *
+    Repeat:    ∞
+    Next run:  2026-08-23T18:30:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Script:    twitter-post.sh
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-22T18:30:47.173403+01:00  ok
+    Execution: completed  e4e1f6aa98714abfb1bc7935de9e110f
+
+  5852734a9336 [active]
+    Name:      X media capture
+    Schedule:  5 13 * * *
+    Repeat:    ∞
+    Next run:  2026-08-23T13:05:00+01:00
+    Deliver:   local
+    Script:    twitter-capture.sh
+    Mode:      no-agent (script stdout delivered directly)
+    Last run:  2026-08-22T13:05:52.913002+01:00  ok
+    Execution: completed  665ce71f517848fdb62f7b03505d9fb0
+
+  0833fdb6b858 [active]
+    Name:      X content writer
+    Schedule:  30 2 * * *
+    Repeat:    ∞
+    Next run:  2026-08-24T02:30:00+01:00
+    Deliver:   whatsapp:REDACTED@lid
+    Workdir:   /home/ev/twitter-launch
+    Last run:  2026-08-23T02:55:24.874928+01:00  ok
+    Execution: completed  095aeb6071494fd2b99e530bb52778ea
+

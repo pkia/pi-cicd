@@ -16,6 +16,8 @@ BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
 ln -sf "$REPO_DIR/project-guard" "$BIN_DIR/project-guard"
 ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
+ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
+chmod +x "$REPO_DIR/loop-heartbeat"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -36,6 +38,19 @@ sudo cp "$REPO_DIR/systemd/project-guard.service" "$REPO_DIR/systemd/project-gua
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now project-guard.timer
 echo "project-guard timer installed and active"
+
+# loop-heartbeat: dead-man's switch for the scheduled loop. Needs
+# /etc/loop-heartbeat.conf (SEND_TARGET etc.) - see the script's docstring.
+# Install is skipped silently when the config is absent.
+if [ -f /etc/loop-heartbeat.conf ]; then
+    sudo cp "$REPO_DIR/systemd/loop-heartbeat.service" \
+            "$REPO_DIR/systemd/loop-heartbeat.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now loop-heartbeat.timer
+    echo "loop-heartbeat timer installed and active"
+else
+    echo "note: /etc/loop-heartbeat.conf not found - loop-heartbeat not installed"
+fi
 
 echo
 echo "done. try:  new-project my-app --port 8100"
