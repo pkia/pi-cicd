@@ -46,6 +46,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -363,7 +365,7 @@ def deliver(alerts, cfg, state_path, dry_run, now):
         if rec is None or now - datetime.fromisoformat(rec["last_sent"]) >= \
                 timedelta(minutes=cfg["renotify_min"]):
             subject = "⚠ loop-heartbeat"
-            if send(cfg["send_target"], subject, a["text"], dry_run):
+            if send(cfg, subject, a["text"], dry_run):
                 state[a["key"]] = {"last_sent": now.isoformat(timespec="seconds")}
                 sent.append(a["key"])
             else:
@@ -372,7 +374,7 @@ def deliver(alerts, cfg, state_path, dry_run, now):
             suppressed.append(a["key"])
     for key in [k for k in state if k not in active_keys]:
         text = f"✓ resolved: {key} — condition cleared at {now:%Y-%m-%d %H:%M}"
-        if send(cfg["send_target"], "✓ loop-heartbeat", text, dry_run):
+        if send(cfg, "✓ loop-heartbeat", text, dry_run):
             recovered.append(key)
         del state[key]  # drop even if send failed: the condition is gone
     if not dry_run and (sent or recovered):
@@ -380,13 +382,34 @@ def deliver(alerts, cfg, state_path, dry_run, now):
     return sent, suppressed, recovered
 
 
-def send(target, subject, body, dry_run):
+def send(cfg, subject, body, dry_run):
+    """Deliver one alert via every configured channel; True if any accepted.
+
+    Channels: SEND_TARGET (hermes send) and ntfy (NTFY_URL + NTFY_TOKEN).
+    """
+    channels = []
+    if cfg.get("send_target"):
+        channels.append("hermes")
+    if cfg.get("ntfy_url") and cfg.get("ntfy_token"):
+        channels.append("ntfy")
     if dry_run:
-        print(f"[dry-run] would send to {target or '<stdout>'}:\n  {subject}\n  {body}\n")
+        print(f"[dry-run] would send via {', '.join(channels) or '<stdout>'}:"
+              f"\n  {subject}\n  {body}\n")
         return True
-    if not target:
-        print(f"⚠ no SEND_TARGET configured; alert not delivered:\n  {body}\n")
-        return False
+    ok = False
+    if "hermes" in channels and send_hermes(cfg["send_target"], subject, body):
+        ok = True
+    if "ntfy" in channels and ntfy_publish(cfg, subject, body):
+        ok = True
+    if not channels:
+        print(f"⚠ no SEND_TARGET/NTFY configured; alert not delivered:\n  {body}\n")
+    elif not ok:
+        print(f"⚠ alert not delivered (all channels failed):\n  {body}\n",
+              file=sys.stderr)
+    return ok
+
+
+def send_hermes(target, subject, body):
     try:
         p = subprocess.run(["hermes", "send", "-t", target, "-s", subject, body],
                            capture_output=True, text=True, timeout=120)
@@ -398,6 +421,31 @@ def send(target, subject, body, dry_run):
               f"{(p.stdout + p.stderr).strip()[:200]}", file=sys.stderr)
         return False
     return True
+
+
+def ntfy_publish(cfg, subject, body):
+    """Publish one alert to the configured ntfy topic; True on success."""
+    tag = "white_check_mark" if subject.startswith("✓") else "warning"
+    return ntfy_post(
+        cfg["ntfy_url"],
+        {"Authorization": f"Bearer {cfg['ntfy_token']}",
+         "Content-Type": "application/json"},
+        {"topic": cfg["ntfy_topic"], "title": subject, "message": body,
+         "tags": [tag]},
+    )
+
+
+def ntfy_post(url, headers, payload, timeout=15):
+    """POST JSON to the ntfy root endpoint; True on any 2xx. Isolated for tests."""
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.getcode() < 300
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"note: ntfy publish failed: {exc}", file=sys.stderr)
+        return False
 
 
 # ----------------------------------------------------------------- main

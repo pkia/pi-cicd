@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""ntfy-notify — publish one notification to the Pi's ntfy backbone.
+
+The single sanctioned way scripts and cron jobs on this machine push a
+message to the owner: one topic per producing job (convention in
+pi-cicd/docs/notifications.md), delivered by the self-hosted ntfy server
+that is reachable over the tailnet.
+
+    ntfy-notify [-t TOPIC] [-T TITLE] [--tag TAG ...] [--priority N]
+                [--config FILE] [--dry-run] MESSAGE
+
+Config: /etc/ntfy-notify.conf (KEY=VALUE, '#'), same shape as
+loop-heartbeat's — the values are provisioned on the host, never
+committed:
+
+    NTFY_URL    base URL, e.g. http://pi.example.ts.net:6839
+    NTFY_TOKEN  access token of the 'publisher' ntfy user
+    NTFY_TOPIC  default topic when -t is not given
+
+Exit 0 on a 2xx publish, non-zero otherwise — callers can treat failure
+as "log it and move on" without breaking their own success path.
+
+Auth model: the server denies all anonymous access (auth-default-access
+deny-all); every publisher authenticates with a token. Subscribing from
+the phone uses the 'subscriber' user, read-only on its topics.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DEFAULT_CONFIG = "/etc/ntfy-notify.conf"
+
+PRIORITIES = {  # ntfy's 5-level scale, so callers can say -p high
+    "min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5,
+}
+
+
+def parse_env_file(path):
+    cfg = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg[key.strip()] = value.strip()
+    return cfg
+
+
+def load_config(path):
+    raw = parse_env_file(path)
+    return {
+        "url": raw.get("NTFY_URL", "").strip().rstrip("/"),
+        "token": raw.get("NTFY_TOKEN", "").strip(),
+        "topic": raw.get("NTFY_TOPIC", "").strip(),
+    }
+
+
+def notify(cfg, topic, title, message, tags, priority, dry_run=False,
+           timeout=15):
+    """POST one JSON message to the ntfy root; True on any 2xx."""
+    if not (cfg.get("url") and cfg.get("token") and topic):
+        print("ntfy-notify: NTFY_URL/NTFY_TOKEN (config) and a topic are "
+              "all required", file=sys.stderr)
+        return False
+    payload = {"topic": topic, "message": message}
+    if title:
+        payload["title"] = title
+    if tags:
+        payload["tags"] = tags
+    if priority is not None:
+        payload["priority"] = priority
+    if dry_run:
+        print(f"[dry-run] would publish to {cfg['url']} topic '{topic}':\n"
+              f"  {json.dumps(payload, ensure_ascii=False)}")
+        return True
+    req = urllib.request.Request(
+        cfg["url"], data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {cfg['token']}",
+                 "Content-Type": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = resp.getcode()
+            return 200 <= code < 300
+    except urllib.error.HTTPError as exc:
+        body = exc.read(200).decode("utf-8", "replace")
+        print(f"ntfy-notify: HTTP {exc.code}: {body}", file=sys.stderr)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"ntfy-notify: {exc}", file=sys.stderr)
+    return False
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="publish one notification to the ntfy backbone")
+    ap.add_argument("message", help="notification body text")
+    ap.add_argument("-t", "--topic", default="",
+                    help="topic to publish to (default: NTFY_TOPIC from config)")
+    ap.add_argument("-T", "--title", default="", help="notification title")
+    ap.add_argument("--tag", action="append", default=[],
+                    help="ntfy tag (repeatable), e.g. --tag rocket")
+    ap.add_argument("-p", "--priority", default=None,
+                    help="min|low|default|high|urgent or 1-5")
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the payload, publish nothing")
+    args = ap.parse_args(argv)
+
+    priority = None
+    if args.priority is not None:
+        p = args.priority.strip().lower()
+        priority = PRIORITIES.get(p, p if p.isdigit() else None)
+        if priority is None:
+            ap.error(f"unknown priority {args.priority!r}")
+
+    cfg = load_config(args.config)
+    topic = args.topic or cfg["topic"]
+    ok = notify(cfg, topic, args.title, args.message, args.tag, priority,
+                dry_run=args.dry_run)
+    if ok and not args.dry_run:
+        print(f"✓ published to {cfg['url']} topic '{topic}'")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
