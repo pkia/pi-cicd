@@ -38,7 +38,7 @@ flowchart TB
     DEPLOY -->|unhealthy? rollback to\nlast running commit| SVC
 ```
 
-## The four components
+## The six components
 
 | Component | What it does |
 |---|---|
@@ -47,6 +47,7 @@ flowchart TB
 | **`templates/`** | The pull-based deploy script every service carries: byte-compile and import gates before restart, health check after, automatic rollback to the previously running commit, flap guard, dirty-tree guard. Plus the standard CI workflow. |
 | **`systemd/` units** | Timers driving the guard and per-service deploys. |
 | **`pipeline-check`** | Hourly compliance audit via a Hermes cron job: verifies every project is versioned, pushed, CI-green and (for services) deployed at HEAD. Alerts to messaging when not; silent when all is green. |
+| **`loop-heartbeat`** | Dead-man's switch for the scheduled loop, every 30 min via systemd. Reads the Hermes cron jobs' durable execution history (`hermes cron runs`) and alerts when a watched job missed its schedule, failed repeatedly, is stuck "running", or vanished — plus optional systemd service/timer staleness checks. Alert dedupe + recovery notices; silent when green. |
 
 ## Why it is built this way
 
@@ -78,6 +79,24 @@ new-project my-app --port 8100   # zero to a running, deployed,
                                  # CI-backed service in about a minute
 ```
 
+### loop-heartbeat (dead-man's switch)
+
+Watches the scheduled loop itself. Configure in `/etc/loop-heartbeat.conf`
+(not in the repo — it carries the alert target):
+
+```ini
+WATCH_JOBS=Daily devlog post, X content writer, Radar implementer — self-improvement loop
+SERVICES=AdGuardHome
+TIMERS=project-guard:10
+SEND_TARGET=whatsapp:<your-jid>@lid      # any `hermes send` target
+```
+
+Then `sudo ./install.sh` (installs the timer when the config exists).
+Manual: `loop-heartbeat --dry-run -v`. Alerts fire once per condition
+(re-alert hourly while it persists, one "resolved" notice when it clears)
+and the check is silent when everything is green — same convention as
+pipeline-check.
+
 ## What it runs in production
 
 - [maritime-dashboard](https://github.com/pkia/maritime-dashboard) —
@@ -94,10 +113,12 @@ new-project my-app --port 8100   # zero to a running, deployed,
 project-guard           adoption + autosave backup engine (bash, systemd-driven)
 new-project             project scaffolder with pipeline from birth
 pipeline-check          hourly compliance audit (run via Hermes cron, alerts-only)
+loop-heartbeat          dead-man's switch for the scheduled loop (systemd timer)
 templates/ci-flask.yml     standard CI workflow for adopted/scaffolded projects
 templates/deploy.sh        parameterised pull-based deploy script (__NAME__/__PORT__)
 templates/deploy.timer     matching systemd timer
-systemd/                guard units
+systemd/                guard + heartbeat units
 docs/architecture.md    design decisions and the incident log
 install.sh              fresh-host installer
+tests/                  loop-heartbeat suite (fixtures from real hermes output)
 ```

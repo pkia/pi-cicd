@@ -8,11 +8,8 @@ production, not a guess.
 import importlib.util
 import json
 import re
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 HERE = Path(__file__).parent
 SCRIPT = HERE.parent / "loop-heartbeat"
@@ -29,9 +26,9 @@ FIX = HERE / "fixtures"
 
 # ------------------------------------------------------------ parsers
 
-def test_parse_cron_list_finds_all_nine_jobs():
+def test_parse_cron_list_finds_all_jobs():
     jobs = lh.parse_cron_list((FIX / "cron_list.txt").read_text())
-    assert len(jobs) == 9
+    assert len(jobs) == 10
     assert jobs["Daily devlog post"] == ("4daccc802319", "active")
     assert jobs["Radar implementer — self-improvement loop"] == ("50517c2e700c", "active")
     assert jobs["Pi health watchdog"] == ("db50209537ca", "active")
@@ -130,8 +127,8 @@ def test_check_job_silent_when_never_ran_after_expected_fire(monkeypatch):
 def test_check_job_green_when_freshly_run(monkeypatch):
     monkeypatch.setattr(lh, "run_cmd", lambda a, timeout=60: (0, (FIX / "runs_healthy_cron.txt").read_text()))
     now = datetime(2026, 8, 23, 4, 0)  # 3h after the 01:19 run; next fire is tomorrow 01:00
-    alerts = ls = lh.check_job("Daily devlog post", "4daccc802319", "active", "0 1 * * *",
-                               now, make_cfg())
+    alerts = lh.check_job("Daily devlog post", "4daccc802319", "active", "0 1 * * *",
+                          now, make_cfg())
     assert alerts == []
 
 
@@ -139,7 +136,7 @@ def test_check_job_interval_silence(monkeypatch):
     # watchdog every 30m: last entry 03:59; now 05:10 -> overdue beyond grace
     text = (FIX / "runs_healthy_interval.txt").read_text()
     monkeypatch.setattr(lh, "run_cmd", lambda a, timeout=60: (0, text))
-    now = datetime(2026, 8,  check := 23, 5, 10)
+    now = datetime(2026, 8, 23, 5, 10)
     alerts = lh.check_job("Pi health watchdog", "db50209537ca", "active", "every 30m",
                           now, make_cfg())
     assert [a["key"] for a in alerts] == ["job:Pi health watchdog:silent"]
@@ -185,22 +182,31 @@ def test_load_config_reads_env_file(tmp_path):
                                  "Radar implementer — self-improvement loop"]
     assert cfg["services"] == ["AdGuardHome"]
     assert cfg["timers"] == {"project-guard": 10}
-    phonenumber_guard = cfg["send_target"]
-    assert phonenumber_guard == "whatsapp:REDACTED@lid"
+    assert cfg["send_target"] == "whatsapp:REDACTED@lid"
     assert cfg["grace_min"] == 15
 
 
 # --------------------------------------------------------- state/dedupe
 
-def test_deliver_dedupes_and_renotifies(tmp_path):
+def test_deliver_dedupes_and_renotifies(tmp_path, monkeypatch):
     state_path = tmp_path / "state.json"
     alert = [{"key": "job:X:streak", "text": "X failing"}]
     cfg = make_cfg(send_target="whatsapp:REDACTED@lid", renotify_min=360)
-    sent, sup, rec = lh.deliver(alert, cfg, state_path, dry_run=True, now=datetime(2026, 8, 23, 4))
+    sends = []
+    monkeypatch.setattr(lh, "send",
+                        lambda target, subject, body, dry: sends.append(body) or True)
+    sent, sup, rec = lh.deliver(alert, cfg, state_path, dry_run=False,
+                                now=datetime(2026, 8, 23, 4))
     assert sent == ["job:X:streak"] and rec == []
-    # second call immediately: suppressed, state file not written in dry-run
-    sent2, sup2, _ = lh.deliver(alert, cfg, state_path, dry_run=True, now=datetime(2026, 6, 23, 5))
+    # immediate second call: same condition, inside the renotify window -> suppressed
+    sent2, sup2, _ = lh.deliver(alert, cfg, state_path, dry_run=False,
+                                now=datetime(2026, 8, 23, 5))
     assert sent2 == [] and sup2 == ["job:X:streak"]
+    # after the renotify window it fires again
+    sent3, _, _ = lh.deliver(alert, cfg, state_path, dry_run=False,
+                             now=datetime(2026, 8, 23, 11))
+    assert sent3 == ["job:X:streak"]
+    assert len(sends) == 2
 
 
 def test_deliver_notices_recovery(tmp_path):
@@ -229,30 +235,21 @@ def test_check_service_down(monkeypatch):
     assert alerts[0]["key"] == "svc:AdGuardHome:down"
 
 
-def test_check_timer_stale(monkeytrigger := None):
+def test_check_timer_stale(monkeypatch):
     # craft LastTriggerUSec output older than 1.5x10m + 5m
-    fake = ["Sun 2026-08-23 03:00:00 IST"]
     orig = lh.run_cmd
     def fake_run(argv, timeout=60):
-        if "LastTriggerUSec" in argv:
-            return (0, "\n".join(fake) + "\n")
-        return (3, "")  # is-active fails? no — timer check calls is-active first
-    # is-active path returns rc 3 -> would be 'inactive' alert; fix: is-active ok
-    def fake_run2(argv, timeout=60):
         if "is-active" in argv:
             return (0, "")
         if "LastTriggerUSec" in argv:
             return (0, "Sun 2026-08-23 03:00:00 IST\n")
         return orig(argv, timeout)
-    lh.run_cmd = fake_run2
-    try:
-        alerts = lh.check_timer("project-guard", 10, datetime(2026, 8, 23, 4, 15))
-        assert [a["key"] for a in alerts] == ["timer:project-guard:stale"]
-    finally:
-        lh.run_cmd = orig
+    monkeypatch.setattr(lh, "run_cmd", fake_run)
+    alerts = lh.check_timer("project-guard", 10, datetime(2026, 8, 23, 4, 15))
+    assert [a["key"] for a in alerts] == ["timer:project-guard:stale"]
 
 
-def test_check_timer_fresh():
+def test_check_timer_fresh(monkeypatch):
     orig = lh.run_cmd
     def fake_run(argv, timeout=60):
         if "is-active" in argv:
@@ -260,12 +257,9 @@ def test_check_timer_fresh():
         if "LastTriggerUSec" in argv:
             return (0, "Sun 2026-08-23 04:04:39 IST\n")
         return orig(argv, timeout)
-    lh.run_cmd = fake_run
-    try:
-        alerts = lh.check_timer("project-guard", 10, datetime(2026, 8, 23, 4, 15))
-        assert alerts == []
-    finally:
-        lh.run_cmd = orig
+    monkeypatch.setattr(lh, "run_cmd", fake_run)
+    alerts = lh.check_timer("project-guard", 10, datetime(2026, 8, 23, 4, 15))
+    assert alerts == []
 
 
 # ------------------------------------------------------------- end2end
@@ -285,7 +279,7 @@ def test_end_to_end_dry_run_green(monkeypatch, tmp_path, capsys):
 
 
 def test_end_to_end_detects_implementer_streak(monkeypatch, tmp_path, capsys):
-    listing = (FIX / "cron_list.txt").silence if False else (FIX / "cron_list.txt").read_text()
+    listing = (FIX / "cron_list.txt").read_text()
     streak = (FIX / "runs_streak.txt").read_text()
     def fake_run(argv, timeout=60):
         if "list" in argv:
@@ -302,20 +296,13 @@ def test_end_to_end_detects_implementer_streak(monkeypatch, tmp_path, capsys):
     assert "silently dead" in out
 
 
-def test_end_to_end_missing_job():
-    conf = _write_conf({})
-    pass  # covered by missing-job alert path in main() via watch list lookup
-
-
-def _write_conf(d):
-    return None
-
-
 # ---------------------------------------------------------- no secrets
 
 def test_fixtures_contain_no_phone_numbers():
     for f in FIX.iterdir():
         if f.is_file():
             text = f.read_text()
-            assert "8087473803462" not in text, f"{f.name} leaks the phone number"
+            # fixtures were scrubbed: any real delivery target would show as
+            # whatsapp:<digits>; redacted ones are whatsapp:REDACTED@lid
+            assert re.search(r"whatsapp:\d{7,}", text) is None, f"{f.name} leaks a JID"
             assert re.search(r"\+353\d{8,}", text) is None, f"{f.name} leaks +353 number"

@@ -19,6 +19,14 @@ jobs:
           done
           [ $fail = 0 ] || exit 1
 
+      - name: Byte-compile loop-heartbeat
+        run: python3 -m compileall -q loop-heartbeat
+
+      - name: Run loop-heartbeat tests
+        run: |
+          pip install pytest
+          python3 -m pytest tests/ -v
+
       - name: ShellCheck (non-fatal, advisory)
         run: |
           sudo apt-get install -y shellcheck >/dev/null 2>&1 || true

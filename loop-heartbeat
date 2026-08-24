@@ -16,7 +16,10 @@ forbids editing the hermes cron jobs themselves, and a job that dies
 mid-run never reaches its success path anyway. Reading the durable
 history catches every failure mode from outside.
 
-Alerts go through `hermes send` (no LLM, no agent loop) and are deduped
+Alerts go through `hermes send` (no LLM, no agent loop) and, when
+configured, are additionally published to the self-hosted ntfy server
+(the notification backbone — see docs/notifications.md). An alert counts
+as delivered when at least one channel accepts it. Alerts are deduped
 in a small JSON state file: an alert fires immediately, re-fires at most
 every RENOTIFY_MIN while the condition persists, and fires one recovery
 notice when it clears. Silent (exit 0, one ✓ line) when everything is
@@ -29,6 +32,10 @@ Config: /etc/loop-heartbeat.conf (KEY=VALUE, '#' comments):
                last trigger must not be older than ~1.5x the interval
   SEND_TARGET  hermes send target, e.g. 'whatsapp:<jid>@lid'.
                Empty/missing -> alerts are printed to stdout/journal only.
+  NTFY_URL     ntfy base URL, e.g. 'http://100.122.94.33:6839' or the
+               tailnet DNS name. Empty/missing -> no ntfy publishing.
+  NTFY_TOPIC   topic to publish to (default: loop-heartbeat)
+  NTFY_TOKEN   access token of an ntfy user with write access to the topic
 
 Manual:   loop-heartbeat [--config FILE] [--state FILE] [--dry-run] [-v]
 """
@@ -85,6 +92,9 @@ def load_config(path):
         "services": [s.strip() for s in raw.get("SERVICES", "").split(",") if s.strip()],
         "timers": {},
         "send_target": raw.get("SEND_TARGET", ""),
+        "ntfy_url": raw.get("NTFY_URL", "").strip().rstrip("/"),
+        "ntfy_topic": raw.get("NTFY_TOPIC", "").strip() or "loop-heartbeat",
+        "ntfy_token": raw.get("NTFY_TOKEN", "").strip(),
         "grace_min": int(raw.get("GRACE_MIN", GRACE_MIN)),
         "streak_threshold": int(raw.get("STREAK_THRESHOLD", STREAK_THRESHOLD)),
         "zombie_hours": float(raw.get("ZOMBIE_HOURS", ZOMBIE_HOURS)),
@@ -392,7 +402,8 @@ def send(target, subject, body, dry_run):
 
 # ----------------------------------------------------------------- main
 
-def main(argv=None):
+def main(argv=None, now=None):
+    """now is injectable for tests; default is the wall clock."""
     ap = argparse.ArgumentParser(description="dead-man's switch for the scheduled loop")
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--state", default=DEFAULT_STATE)
@@ -401,7 +412,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    now = datetime.now().replace(microsecond=0)
+    now = now or datetime.now().replace(microsecond=0)
     alerts = []
 
     rc, listing = run_cmd(["hermes", "cron", "list"])
