@@ -98,6 +98,7 @@ def make_cfg(**over):
         "watch_jobs": [], "services": [], "timers": {},
         "send_target": "", "grace_min": 30, "streak_threshold": 2,
         "zombie_hours": 6, "renotify_min": 360,
+        "ntfy_url": "", "ntfy_topic": "loop-heartbeat", "ntfy_token": "",
     }
     cfg.update(over)
     return cfg
@@ -227,6 +228,148 @@ def test_deliver_writes_state_only_on_success(tmp_path):
     assert not state_path.exists()
 
 
+# --------------------------------------------------------------- ntfy
+
+class Resp:
+    def __init__(self, code):
+        self._code = code
+
+    def getcode(self):
+        return self._code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_send_uses_ntfy_when_configured(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers, payload, timeout=15):
+        calls.append((url, headers, payload))
+        return True
+
+    monkeypatch.setattr(lh, "ntfy_post", fake_post)
+    cfg = make_cfg(send_target="", ntfy_url="http://100.122.94.33:6839",
+                   ntfy_topic="loop-heartbeat", ntfy_token="tk_test")
+    assert lh.send(cfg, "⚠ loop-heartbeat", "X down", dry_run=False) is True
+    url, headers, payload = calls[0]
+    assert url == "http://100.122.94.33:6839"
+    assert headers["Authorization"] == "Bearer tk_test"
+    assert payload["topic"] == "loop-heartbeat"
+    assert payload["title"] == "⚠ loop-heartbeat"
+    assert payload["message"] == "X down"
+    assert payload["tags"] == ["warning"]
+
+
+def test_send_recovery_notice_uses_check_mark_tag(monkeypatch):
+    calls = []
+    monkeypatch.setattr(lh, "ntfy_post",
+                        lambda u, h, p, timeout=15: calls.append(p) or True)
+    cfg = make_cfg(send_target="", ntfy_url="http://n:6839",
+                   ntfy_topic="loop-heartbeat", ntfy_token="tk")
+    assert lh.send(cfg, "✓ loop-heartbeat", "resolved", dry_run=False) is True
+    assert calls[0]["tags"] == ["white_check_mark"]
+
+
+def test_send_both_channels_and_ntfy_failure_shortcircuit(monkeypatch, capsys):
+    # hermes ok, ntfy down -> alert still counts as delivered
+    monkeypatch.setattr(lh, "send_hermes", lambda t, s, b: True)
+    monkeypatch.setattr(lh, "ntfy_post", lambda u, h, p, timeout=15: False)
+    cfg = make_cfg(send_target="whatsapp:REDACTED@lid",
+                   ntfy_url="http://n:6839", ntfy_token="tk")
+    assert lh.send(cfg, "⚠ loop-heartbeat", "X down", dry_run=False) is True
+    assert "ntfy publish failed" not in capsys.readouterr().err
+
+
+def test_send_all_channels_failed(monkeypatch, capsys):
+    monkeypatch.setattr(lh, "send_hermes", lambda t, s, b: False)
+    monkeypatch.setattr(lh, "ntfy_post", lambda u, h, p, timeout=15: False)
+    cfg = make_cfg(send_target="whatsapp:REDACTED@lid",
+                   ntfy_url="http://n:6839", ntfy_token="tk")
+    assert lh.send(cfg, "⚠ loop-heartbeat", "X down", dry_run=False) is False
+    assert "not delivered" in capsys.readouterr().err
+
+
+def test_send_dry_run_names_channels(monkeypatch, capsys):
+    monkeypatch.setattr(lh, "ntfy_post",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError(
+                            "dry-run must not POST")))
+    cfg = make_cfg(send_target="", ntfy_url="http://n:6839", ntfy_token="tk")
+    assert lh.send(cfg, "⚠ loop-heartbeat", "X", dry_run=True) is True
+    assert "via ntfy" in capsys.readouterr().out
+
+
+def test_ntfy_post_returns_true_on_2xx(monkeypatch):
+    def fake_urlopen(req, timeout=None):
+        return Resp(200)
+
+    monkeypatch.setattr(lh.urllib.request, "urlopen", fake_urlopen)
+    assert lh.ntfy_post("http://n:6839", {}, {"topic": "t"}) is True
+
+
+def test_ntfy_post_returns_false_on_connection_error(monkeypatch, capsys):
+    def fake_urlopen(req, timeout=None):
+        raise lh.urllib.error.URLError("refused")
+
+    monkeypatch.setattr(lh.urllib.request, "urlopen", fake_urlopen)
+    assert lh.ntfy_post("http://n:6839", {}, {"topic": "t"}) is False
+    assert "refused" in capsys.readouterr().err
+
+
+def test_load_config_reads_ntfy_keys(tmp_path):
+    conf = tmp_path / "lh.conf"
+    conf.write_text(
+        "NTFY_URL=http://100.122.94.33:6839/\n"
+        "NTFY_TOPIC=loop-heartbeat\n"
+        "NTFY_TOKEN=tk_test\n"
+    )
+    cfg = lh.load_config(conf)
+    assert cfg["ntfy_url"] == "http://100.122.94.33:6839"  # trailing / stripped
+    assert cfg["ntfy_topic"] == "loop-heartbeat"
+    assert cfg["ntfy_token"] == "tk_test"
+
+
+def test_load_config_ntfy_defaults(tmp_path):
+    cfg = lh.load_config(tmp_path / "nonexistent.conf")
+    assert cfg["ntfy_url"] == "" and cfg["ntfy_token"] == ""
+    assert cfg["ntfy_topic"] == "loop-heartbeat"
+
+
+def test_end_to_end_dry_run_with_ntfy_configured(monkeypatch, tmp_path, capsys):
+    listing = (FIX / "cron_list.txt").read_text()
+    streak = (FIX / "runs_streak.txt").read_text()
+
+    def fake_run(argv, timeout=60):
+        if "list" in argv:
+            return (0, listing)
+        if "runs" in argv:
+            return (0, streak)
+        return (0, "")
+
+    monkeypatch.setattr(lh, "run_cmd", fake_run)
+    posts = []
+    monkeypatch.setattr(lh, "ntfy_post",
+                        lambda u, h, p, timeout=15: posts.append(p) or True)
+    monkeypatch.setattr(lh, "send_hermes", lambda t, s, b: True)
+    conf = tmp_path / "lh.conf"
+    conf.write_text(
+        "WATCH_JOBS=Radar implementer — self-improvement loop\n"
+        "SEND_TARGET=whatsapp:REDACTED@lid\n"
+        "NTFY_URL=http://100.122.94.33:6839\n"
+        "NTFY_TOKEN=tk_test\n"
+    )
+    rc = lh.main(["--config", str(conf), "--state", str(tmp_path / "s.json")],
+                 now=datetime(2026, 8, 23, 11, 0))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "silently dead" in out
+    assert posts, "alerts must be published to ntfy when configured"
+    assert all(p["topic"] == "loop-heartbeat" for p in posts)
+
+
 # ------------------------------------------------------------- systemd
 
 def test_check_service_down(monkeypatch):
@@ -271,7 +414,8 @@ def test_end_to_end_dry_run_green(monkeypatch, tmp_path, capsys):
                         lambda a, timeout=60: (0, listing if "list" in a else healthy))
     conf = tmp_path / "lh.conf"
     conf.write_text("WATCH_JOBS=Daily devlog post\nSEND_TARGET=\n")
-    rc = lh.main(["--config", str(conf), "--state", str(tmp_path / "s.json"), "--dry-run"])
+    rc = lh.main(["--config", str(conf), "--state", str(tmp_path / "s.json"),
+                 "--dry-run"], now=datetime(2026, 8, 23, 4, 0))
     out = capsys.readouterr().out
     assert rc == 0
     assert "all green" in out
@@ -290,7 +434,8 @@ def test_end_to_end_detects_implementer_streak(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(lh, "run_cmd", fake_run)
     conf = tmp_path / "lh.conf"
     conf.write_text("WATCH_JOBS=Radar implementer — self-improvement loop\nSEND_TARGET=\n")
-    rc = lh.main(["--config", str(conf), "--state", str(tmp_path / "s.json"), "--dry-run"])
+    rc = lh.main(["--config", str(conf), "--state", str(tmp_path / "s.json"),
+                 "--dry-run"], now=datetime(2026, 8, 23, 11, 0))
     out = capsys.readouterr().out
     assert rc == 0
     assert "silently dead" in out
