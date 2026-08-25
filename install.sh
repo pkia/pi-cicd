@@ -18,7 +18,9 @@ ln -sf "$REPO_DIR/project-guard" "$BIN_DIR/project-guard"
 ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
 ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
 ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
-chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify"
+ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
+chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
+         "$REPO_DIR/pi-backup"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -51,6 +53,23 @@ if [ -f /etc/loop-heartbeat.conf ]; then
     echo "loop-heartbeat timer installed and active"
 else
     echo "note: /etc/loop-heartbeat.conf not found - loop-heartbeat not installed"
+fi
+
+# pi-backup: deduplicated borg backups + weekly restore drill. Needs
+# /etc/pi-backup.conf (REPO/PASSPHRASE/BACKUP_PATHS, ntfy keys) and the
+# borgbackup package — see the script's docstring and docs/backups.md.
+# Install is skipped silently when the config is absent.
+if [ -f /etc/pi-backup.conf ]; then
+    sudo cp "$REPO_DIR/systemd/pi-backup.service" \
+            "$REPO_DIR/systemd/pi-backup.timer" \
+            "$REPO_DIR/systemd/pi-backup-drill.service" \
+            "$REPO_DIR/systemd/pi-backup-drill.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now pi-backup.timer
+    sudo systemctl enable --quiet --now pi-backup-drill.timer
+    echo "pi-backup timers installed and active"
+else
+    echo "note: /etc/pi-backup.conf not found - pi-backup not installed"
 fi
 
 echo

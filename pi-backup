@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""pi-backup — deduplicated config backups for the Pi, with a restore drill.
+
+Wraps borg (Debian package, no containers) around the small set of
+host state that git does not already cover: the ntfy server's user db
+and config, the loop's /etc conf files, and the custom systemd units.
+Everything else on this machine lives in a git repo with its own CI.
+
+    pi-backup run                     create archive + prune + notify
+    pi-backup list                    list archives (newest last)
+    pi-backup restore ARCHIVE [PATH]  extract to --dest DIR (default ./restore)
+    pi-backup check                   borg structural + integrity check
+    pi-backup drill                   backup, restore to a temp dir and
+                                      byte-compare against the sources —
+                                      the only honest proof a backup works
+
+Every action publishes its outcome to the ntfy `backups` topic when
+NTFY_URL/NTFY_TOKEN are configured (best-effort, like ntfy-notify).
+Exit 0 on success, 1 on failure.
+
+Config: /etc/pi-backup.conf (KEY=VALUE, '#' comments), root-readable only:
+
+    REPO              borg repository path (e.g. /var/backups/pi-borg,
+                      or a USB mount later — moving is `borg transfer`
+                      or just copying the directory)
+    PASSPHRASE        repo passphrase. Encryption is repokey: the key
+                      lives inside the repo, so passphrase + repo copy
+                      is enough to restore anywhere.
+    BACKUP_PATHS      space-separated absolute paths to archive
+    EXCLUDE           optional space-separated borg --exclude patterns
+    PRUNE_KEEP_DAILY   default 7
+    PRUNE_KEEP_WEEKLY  default 4
+    PRUNE_KEEP_MONTHLY default 6
+    ARCHIVE_PREFIX     default 'pi'
+    DRILL_MAX_FILES   max files the drill byte-compares (default 60;
+                      samples evenly when there are more)
+    NTFY_URL / NTFY_TOKEN / NTFY_TOPIC   ntfy backbone (topic default
+                      'backups'; see docs/notifications.md)
+
+The systemd timer runs `pi-backup run` daily and `pi-backup drill`
+weekly (drill.timer) — a backup that has never been restored is a
+rumour, so the drill is scheduled, not a one-off.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+DEFAULT_CONFIG = "/etc/pi-backup.conf"
+
+
+# ------------------------------------------------------------- config
+
+def parse_env_file(path):
+    cfg = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg[key.strip()] = value.strip()
+    return cfg
+
+
+def load_config(path):
+    raw = parse_env_file(path)
+    return {
+        "repo": raw.get("REPO", "").strip().rstrip("/"),
+        "passphrase": raw.get("PASSPHRASE", "").strip(),
+        "paths": raw.get("BACKUP_PATHS", "").split(),
+        "exclude": raw.get("EXCLUDE", "").split(),
+        "keep_daily": int(raw.get("PRUNE_KEEP_DAILY", 7) or 7),
+        "keep_weekly": int(raw.get("PRUNE_KEEP_WEEKLY", 4) or 4),
+        "keep_monthly": int(raw.get("PRUNE_KEEP_MONTHLY", 6) or 6),
+        "prefix": raw.get("ARCHIVE_PREFIX", "pi").strip() or "pi",
+        "drill_max_files": int(raw.get("DRILL_MAX_FILES", 60) or 60),
+        "ntfy_url": raw.get("NTFY_URL", "").strip().rstrip("/"),
+        "ntfy_token": raw.get("NTFY_TOKEN", "").strip(),
+        "ntfy_topic": raw.get("NTFY_TOPIC", "backups").strip() or "backups",
+    }
+
+
+def validate(cfg):
+    problems = []
+    if not cfg["repo"]:
+        problems.append("REPO not set")
+    if not cfg["passphrase"]:
+        problems.append("PASSPHRASE not set")
+    if not cfg["paths"]:
+        problems.append("BACKUP_PATHS empty")
+    for p in cfg["paths"]:
+        if not p.startswith("/"):
+            problems.append(f"BACKUP_PATHS entry not absolute: {p}")
+    return problems
+
+
+# ------------------------------------------------------------- borg
+
+def run_cmd(argv, cfg, timeout=1800, cwd=None):
+    """Run one borg command with the passphrase in its env only."""
+    env = dict(os.environ)
+    env["BORG_PASSPHRASE"] = cfg["passphrase"]
+    env.setdefault("BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK", "no")
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, env=env, cwd=cwd)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", f"failed to run {argv[0]}: {exc}"
+    return p.returncode, p.stdout, p.stderr
+
+
+def repo_initialized(cfg):
+    """A borg repo is a directory containing a top-level 'config' file."""
+    return (Path(cfg["repo"]) / "config").is_file()
+
+
+def init_repo(cfg):
+    if repo_initialized(cfg):
+        return True, ""
+    Path(cfg["repo"]).mkdir(parents=True, exist_ok=True)
+    code, _, err = run_cmd(
+        ["borg", "init", "--encryption=repokey", cfg["repo"]], cfg)
+    return code == 0, err
+
+
+def archive_name(cfg, now):
+    return f"{cfg['prefix']}-{now.strftime('%Y-%m-%dT%H%M%S')}"
+
+
+def create_archive(cfg, now):
+    """borg create one archive; returns (ok, archive_name, stats_dict)."""
+    name = archive_name(cfg, now)
+    argv = ["borg", "create"]
+    for pat in cfg["exclude"]:
+        argv += ["--exclude", pat]
+    argv.append(f"{cfg['repo']}::{name}")
+    argv += cfg["paths"]
+    code, _, err = run_cmd(argv, cfg)
+    if code != 0:
+        return False, name, {"error": err.strip().splitlines()[-1] if err.strip() else "borg create failed"}
+    stats = archive_stats(cfg, name)
+    return True, name, stats
+
+
+def archive_stats(cfg, name):
+    """Parse `borg info --json` for one archive into a small stats dict.
+
+    borg 1.4 nests per-archive info under "archives"[0] (not "archive").
+    """
+    code, out, _ = run_cmd(
+        ["borg", "info", "--json", f"{cfg['repo']}::{name}"], cfg)
+    if code != 0:
+        return {}
+    try:
+        archives = json.loads(out).get("archives", [])
+        st = archives[0].get("stats", {}) if archives else {}
+    except (ValueError, IndexError):
+        return {}
+    return {
+        "nfiles": st.get("nfiles", 0),
+        "original_size": st.get("original_size", 0),
+        "deduplicated_size": st.get("deduplicated_size", 0),
+    }
+
+
+def prune_args(cfg):
+    return (["borg", "prune",
+             "--keep-daily", str(cfg["keep_daily"]),
+             "--keep-weekly", str(cfg["keep_weekly"]),
+             "--keep-monthly", str(cfg["keep_monthly"]),
+             "--glob-archives", f"{cfg['prefix']}-*",
+             cfg["repo"]])
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+
+
+# ------------------------------------------------------------- drill
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sample_files(files, limit):
+    """All files when few, else an evenly spaced sample of sorted names."""
+    files = sorted(files)
+    if len(files) <= limit:
+        return files
+    step = (len(files) - 1) / (limit - 1)
+    return [files[int(i * step)] for i in range(limit)]
+
+
+def compare_restored(restored_root, limit):
+    """Byte-compare extracted files under restored_root with their
+    sources (path = '/' + relative). Returns (ok, report_dict)."""
+    root = Path(restored_root)
+    files = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
+    checked = sample_files(files, limit)
+    missing, mismatched = [], []
+    for rel in checked:
+        src = Path("/") / rel
+        if not src.is_file():
+            missing.append(rel)
+            continue
+        if file_hash(src) != file_hash(root / rel):
+            mismatched.append(rel)
+    ok = not missing and not mismatched and checked
+    return ok, {
+        "files_archived": len(files),
+        "files_compared": len(checked),
+        "missing": missing,
+        "mismatched": mismatched,
+    }
+
+
+def run_drill(cfg, now):
+    """Create a fresh archive, extract it to a temp dir, compare.
+
+    Returns (ok, lines) — lines are the human report.
+    """
+    ok, name, stats = create_archive(cfg, now)
+    if not ok:
+        return False, [f"drill: backup failed: {stats.get('error', '?')}"]
+    lines = [f"drill: created {name} "
+             f"({stats.get('nfiles', '?')} files)"]
+    with tempfile.TemporaryDirectory(prefix="pi-backup-drill-") as tmp:
+        code, _, err = run_cmd(
+            ["borg", "extract", f"{cfg['repo']}::{name}"], cfg, cwd=tmp)
+        if code != 0:
+            return False, lines + [
+                f"drill: borg extract failed: "
+                f"{err.strip().splitlines()[-1] if err.strip() else '?'}"]
+        ok, report = compare_restored(tmp, cfg["drill_max_files"])
+        lines.append(
+            f"drill: restored {report['files_archived']} files, "
+            f"byte-compared {report['files_compared']}")
+        if report["missing"]:
+            lines.append(f"drill: {len(report['missing'])} restored files "
+                         f"absent at source (first: {report['missing'][0]})")
+        if report["mismatched"]:
+            lines.append(f"drill: {len(report['mismatched'])} files differ "
+                         f"(first: {report['mismatched'][0]})")
+        if not report["files_compared"]:
+            lines.append("drill: nothing extracted — empty archive?")
+        lines.append("drill: PASS — backup restores and matches"
+                     if ok else "drill: FAIL")
+        return ok, lines
+
+
+# ------------------------------------------------------------- notify
+
+def ntfy_post(url, headers, payload, timeout=15):
+    """POST JSON to the ntfy root endpoint; True on any 2xx."""
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", **headers},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (OSError, urllib.error.URLError) as exc:
+        print(f"note: ntfy publish failed: {exc}", file=sys.stderr)
+        return False
+
+
+def notify(cfg, title, message, priority=None, dry_run=False):
+    """Best-effort publish to the backups topic; never fatal."""
+    if not (cfg.get("ntfy_url") and cfg.get("ntfy_token")):
+        return False
+    if dry_run:
+        print(f"[dry-run] ntfy {cfg['ntfy_topic']}: {title} — {message}")
+        return True
+    payload = {"topic": cfg["ntfy_topic"], "title": title,
+               "message": message, "tags": ["floppy_disk"]}
+    if priority is not None:
+        payload["priority"] = priority
+    return ntfy_post(
+        cfg["ntfy_url"],
+        {"Authorization": f"Bearer {cfg['ntfy_token']}"},
+        payload)
+
+
+# ------------------------------------------------------------- actions
+
+def act_run(cfg, now, dry_run=False):
+    ok, err = init_repo(cfg)
+    if not ok:
+        print(f"borg init failed: {err}", file=sys.stderr)
+        return 1
+    ok, name, stats = create_archive(cfg, now)
+    if not ok:
+        notify(cfg, "pi-backup FAILED", stats.get("error", "borg create"),
+               priority=4, dry_run=dry_run)
+        print(f"backup failed: {stats.get('error', '?')}", file=sys.stderr)
+        return 1
+    code, _, err = run_cmd(prune_args(cfg), cfg)
+    if code != 0:
+        notify(cfg, "pi-backup prune failed",
+               err.strip().splitlines()[-1] if err.strip() else "?",
+               priority=4, dry_run=dry_run)
+        print(f"prune failed: {err}", file=sys.stderr)
+        return 1
+    msg = (f"{stats.get('nfiles', '?')} files, "
+           f"{human(stats.get('original_size', 0))} original / "
+           f"{human(stats.get('deduplicated_size', 0))} deduped "
+           f"— archive {name}")
+    notify(cfg, "pi-backup ok", msg, dry_run=dry_run)
+    print(f"✓ {msg}")
+    return 0
+
+
+def act_list(cfg):
+    code, out, err = run_cmd(
+        ["borg", "list", "--short", "--last", "100", cfg["repo"]], cfg)
+    if code != 0:
+        print(err or "borg list failed", file=sys.stderr)
+        return 1
+    print(out, end="")
+    return 0
+
+
+def act_restore(cfg, archive, path, dest):
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    argv = ["borg", "extract", f"{cfg['repo']}::{archive}"]
+    if path:
+        argv.append(path)
+    code, _, err = run_cmd(argv, cfg, cwd=str(dest))
+    if code != 0:
+        print(err or "borg extract failed", file=sys.stderr)
+        return 1
+    print(f"✓ restored {archive}"
+          f"{' (' + path + ')' if path else ''} into {dest}")
+    return 0
+
+
+def act_check(cfg):
+    code, _, err = run_cmd(
+        ["borg", "check", "--info", cfg["repo"]], cfg, timeout=3600)
+    if code != 0:
+        print(err or "borg check failed", file=sys.stderr)
+        return 1
+    print("✓ borg check: repository consistent")
+    return 0
+
+
+def act_drill(cfg, now, dry_run=False):
+    ok, lines = run_drill(cfg, now)
+    for line in lines:
+        print(line)
+    notify(cfg, "pi-backup drill " + ("PASS" if ok else "FAIL"),
+           "; ".join(lines[-2:]), priority=None if ok else 4,
+           dry_run=dry_run)
+    return 0 if ok else 1
+
+
+# ------------------------------------------------------------- main
+
+def main(argv=None, now=None):
+    now = now or datetime.now()
+    ap = argparse.ArgumentParser(
+        prog="pi-backup",
+        description="deduplicated config backups (borg) with restore drills")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"config file (default {DEFAULT_CONFIG})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="suppress ntfy publishes (print instead)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run", help="create archive + prune + notify")
+    sub.add_parser("list", help="list archives")
+    sub.add_parser("check", help="borg integrity check")
+    sub.add_parser("drill", help="backup + restore + byte-compare")
+    rp = sub.add_parser("restore", help="extract ARCHIVE [PATH] to --dest")
+    rp.add_argument("archive")
+    rp.add_argument("path", nargs="?", help="optional path pattern filter")
+    rp.add_argument("--dest", default="./restore")
+    args = ap.parse_args(argv)
+
+    cfg = load_config(args.config)
+    problems = validate(cfg)
+    if problems and args.cmd != "list":
+        print("pi-backup: invalid config: " + "; ".join(problems),
+              file=sys.stderr)
+        return 2
+
+    if args.cmd == "run":
+        return act_run(cfg, now, args.dry_run)
+    if args.cmd == "list":
+        return act_list(cfg)
+    if args.cmd == "restore":
+        return act_restore(cfg, args.archive, args.path, args.dest)
+    if args.cmd == "check":
+        return act_check(cfg)
+    return act_drill(cfg, now, args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

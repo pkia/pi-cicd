@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily pi-backup run (create + prune + notify)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/home/ev/.local/bin/pi-backup run

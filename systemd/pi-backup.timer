@@ -1,0 +1,10 @@
+[Unit]
+Description=Run pi-backup daily at 03:30 (before the 04:00 implementer)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+AccuracySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
