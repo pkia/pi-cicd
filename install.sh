@@ -17,7 +17,8 @@ mkdir -p "$BIN_DIR"
 ln -sf "$REPO_DIR/project-guard" "$BIN_DIR/project-guard"
 ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
 ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
-chmod +x "$REPO_DIR/loop-heartbeat"
+ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
+chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).

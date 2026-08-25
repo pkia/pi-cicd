@@ -48,6 +48,7 @@ flowchart TB
 | **`systemd/` units** | Timers driving the guard and per-service deploys. |
 | **`pipeline-check`** | Hourly compliance audit via a Hermes cron job: verifies every project is versioned, pushed, CI-green and (for services) deployed at HEAD. Alerts to messaging when not; silent when all is green. |
 | **`loop-heartbeat`** | Dead-man's switch for the scheduled loop, every 30 min via systemd. Reads the Hermes cron jobs' durable execution history (`hermes cron runs`) and alerts when a watched job missed its schedule, failed repeatedly, is stuck "running", or vanished — plus optional systemd service/timer staleness checks. Alert dedupe + recovery notices; silent when green. |
+| **`ntfy-notify`** | Publisher helper for the self-hosted ntfy notification backbone: one topic per job, token auth, best-effort delivery. loop-heartbeat publishes its alerts there natively; scripts and future backup jobs use this. See [docs/notifications.md](docs/notifications.md). |
 
 ## Why it is built this way
 
@@ -97,6 +98,28 @@ Manual: `loop-heartbeat --dry-run -v`. Alerts fire once per condition
 and the check is silent when everything is green — same convention as
 pipeline-check.
 
+### ntfy notification backbone
+
+Alerts (and any other job outcome) can additionally be published to the
+self-hosted [ntfy](https://ntfy.sh) server on the Pi — reachable over
+the tailnet from the phone, deny-all auth, one topic per job. Full
+convention, user/token model and runbook:
+[docs/notifications.md](docs/notifications.md).
+
+```ini
+# /etc/loop-heartbeat.conf — optional second channel
+NTFY_URL=http://100.122.94.33:6839
+NTFY_TOPIC=loop-heartbeat
+NTFY_TOKEN=<publisher token>
+```
+
+Scripts publish with the bundled helper (config:
+`/etc/ntfy-notify.conf`, provisioned on the host):
+
+```bash
+ntfy-notify -t radar -T "radar shipped" --tag rocket "idea X landed"
+```
+
 ## What it runs in production
 
 - [maritime-dashboard](https://github.com/pkia/maritime-dashboard) —
@@ -114,11 +137,13 @@ project-guard           adoption + autosave backup engine (bash, systemd-driven)
 new-project             project scaffolder with pipeline from birth
 pipeline-check          hourly compliance audit (run via Hermes cron, alerts-only)
 loop-heartbeat          dead-man's switch for the scheduled loop (systemd timer)
+ntfy-notify             publish to the ntfy backbone (one topic per job)
 templates/ci-flask.yml     standard CI workflow for adopted/scaffolded projects
 templates/deploy.sh        parameterised pull-based deploy script (__NAME__/__PORT__)
 templates/deploy.timer     matching systemd timer
 systemd/                guard + heartbeat units
 docs/architecture.md    design decisions and the incident log
+docs/notifications.md   ntfy backbone: topics, auth model, runbook
 install.sh              fresh-host installer
-tests/                  loop-heartbeat suite (fixtures from real hermes output)
+tests/                  loop-heartbeat + ntfy-notify suites (fixtures from real hermes output)
 ```

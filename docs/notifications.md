@@ -97,6 +97,11 @@ unchanged from before ntfy existed.
     sudo ntfy user list --config /etc/ntfy/server.yml
     sudo ntfy access list --config /etc/ntfy/server.yml
 
+Live end-to-end check (auth posture + publish→subscribe round trip,
+exits non-zero on failure):
+
+    sudo python3 docs/e2e-ntfy-check.py
+
 Rotate/grow:
 
     sudo NTFY_PASSWORD=... ntfy user add --role=user publisher --config ...
