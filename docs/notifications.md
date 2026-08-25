@@ -52,7 +52,7 @@ what you want to hear about:
 |---|---|---|
 | `radar` | the radar implementer (via `ntfy-notify`) | shipped/blocked outcomes of self-improvement runs |
 | `loop-heartbeat` | loop-heartbeat (built in) | dead-man's-switch alerts: silent jobs, failure streaks, zombies, down services, stale timers — plus recovery notices |
-| `backups` | future borgmatic/restic hooks | backup results and heartbeats |
+| `backups` | pi-backup (built in) | daily backup results, prune notices, weekly restore-drill PASS/FAIL, failures at high priority |
 
 Naming rule for new topics: the topic is named after the job that owns
 it, not the content it carries — `x-writer` publishes to `x-writer`,

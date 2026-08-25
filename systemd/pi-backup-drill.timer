@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly pi-backup restore drill, Sundays 05:30
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00
+AccuracySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

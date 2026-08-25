@@ -49,6 +49,7 @@ flowchart TB
 | **`pipeline-check`** | Hourly compliance audit via a Hermes cron job: verifies every project is versioned, pushed, CI-green and (for services) deployed at HEAD. Alerts to messaging when not; silent when all is green. |
 | **`loop-heartbeat`** | Dead-man's switch for the scheduled loop, every 30 min via systemd. Reads the Hermes cron jobs' durable execution history (`hermes cron runs`) and alerts when a watched job missed its schedule, failed repeatedly, is stuck "running", or vanished — plus optional systemd service/timer staleness checks. Alert dedupe + recovery notices; silent when green. |
 | **`ntfy-notify`** | Publisher helper for the self-hosted ntfy notification backbone: one topic per job, token auth, best-effort delivery. loop-heartbeat publishes its alerts there natively; scripts and future backup jobs use this. See [docs/notifications.md](docs/notifications.md). |
+| **`pi-backup`** | Deduplicated, encrypted borg backups of the /etc state git cannot hold (ntfy server, loop configs, units), daily at 03:30, pruned to 7 daily / 4 weekly / 6 monthly. A **weekly restore drill** extracts a fresh archive and byte-compares it against the live sources — PASS/FAIL published to the ntfy `backups` topic. See [docs/backups.md](docs/backups.md). |
 
 ## Why it is built this way
 

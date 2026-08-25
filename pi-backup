@@ -157,14 +157,18 @@ def create_archive(cfg, now):
 
 
 def archive_stats(cfg, name):
-    """Parse `borg info --json` for one archive into a small stats dict."""
+    """Parse `borg info --json` for one archive into a small stats dict.
+
+    borg 1.4 nests per-archive info under "archives"[0] (not "archive").
+    """
     code, out, _ = run_cmd(
         ["borg", "info", "--json", f"{cfg['repo']}::{name}"], cfg)
     if code != 0:
         return {}
     try:
-        st = json.loads(out).get("archive", {}).get("stats", {})
-    except ValueError:
+        archives = json.loads(out).get("archives", [])
+        st = archives[0].get("stats", {}) if archives else {}
+    except (ValueError, IndexError):
         return {}
     return {
         "nfiles": st.get("nfiles", 0),

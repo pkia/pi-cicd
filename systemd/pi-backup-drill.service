@@ -1,0 +1,7 @@
+[Unit]
+Description=Weekly pi-backup restore drill (backup, restore, byte-compare)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/home/ev/.local/bin/pi-backup drill
