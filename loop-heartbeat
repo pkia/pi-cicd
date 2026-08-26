@@ -86,6 +86,23 @@ def parse_env_file(path):
     return cfg
 
 
+def _parse_healthz(spec):
+    """'url=name,url=name' -> [(url, name), ...]. Name defaults to host:port."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        url, _, name = part.partition("=")
+        url = url.strip()
+        if not url:
+            continue
+        if not name.strip():
+            name = url.split("//")[-1].split("/")[0]
+        out.append((url, name.strip()))
+    return out
+
+
 def load_config(path):
     raw = parse_env_file(path)
     cfg = {
@@ -93,6 +110,7 @@ def load_config(path):
         or list(DEFAULT_WATCH_JOBS),
         "services": [s.strip() for s in raw.get("SERVICES", "").split(",") if s.strip()],
         "timers": {},
+        "healthz": _parse_healthz(raw.get("HEALTHZ", "")),
         "send_target": raw.get("SEND_TARGET", ""),
         "ntfy_url": raw.get("NTFY_URL", "").strip().rstrip("/"),
         "ntfy_topic": raw.get("NTFY_TOPIC", "").strip() or "loop-heartbeat",
@@ -305,6 +323,24 @@ def check_job(name, job_id, state, schedule_spec, now, cfg):
 
 # -------------------------------------------------------- systemd checks
 
+def check_healthz(url, name):
+    """HTTP health endpoint check: must return 200 AND (if JSON) healthy:true."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=8) as r:
+            body = r.read(4096).decode("utf-8", "replace")
+            if r.status != 200:
+                raise OSError(f"status {r.status}")
+            if '"healthy"' in body and '"healthy":true' not in body:
+                return [{"key": f"healthz:{name}:unhealthy",
+                         "text": f"{name}: healthz reports unhealthy "
+                                 f"(self-healer gave up or components down)"}]
+    except Exception as exc:
+        return [{"key": f"healthz:{name}:down",
+                 "text": f"{name}: healthz {url} unreachable ({exc})"}]
+    return []
+
+
 def check_service(name):
     rc, _ = run_cmd(["systemctl", "is-active", "--quiet", name])
     if rc != 0:
@@ -490,6 +526,8 @@ def main(argv=None, now=None):
         alerts.extend(check_service(svc))
     for timer, interval in cfg["timers"].items():
         alerts.extend(check_timer(timer, interval, now))
+    for url, name in cfg["healthz"]:
+        alerts.extend(check_healthz(url, name))
 
     sent, suppressed, recovered = deliver(alerts, cfg, args.state, args.dry_run, now)
     for a in alerts:
