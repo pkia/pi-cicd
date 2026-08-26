@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""pi-doctor — daily self-healing audit for every project on the Pi.
+
+Checks each project end-to-end and applies SAFE automatic fixes; anything
+not safely fixable is escalated to the owner (WhatsApp + ntfy) with the
+evidence. Layered with (not replacing) the faster watchers:
+
+  loop-heartbeat  ...  every 30 min: dead-man + service up/down + healthz
+  deploy timers   ...  every 5 min:  code rollout + health gate + rollback
+  pi-doctor       ...  daily:        deep audit + repair + report
+
+Per-project checks:
+  1. service active + not flapping (start/stop churn)
+  2. HTTP healthz/UI reachable (where the project serves one)
+  3. deploy pipeline: running commit == origin/main HEAD (drift = the
+     5-min deploy timer is broken)
+  4. CI on origin/main is green
+  5. git tree clean (no mystery local edits)
+
+Safe fixes applied automatically:
+  F1 service dead/not-found-but-unit-exists -> systemctl reset-failed + start
+  F2 deploy drift (running != HEAD)         -> run deploy.sh once
+  F3 CI failed on main                      -> nothing (report only; a human
+                                               decides revert vs fix-forward)
+
+System checks: disk %, CPU temp, memory, rpi-connect leak, AdGuard DNS,
+failed units, loop-heartbeat/doctor state health.
+
+Output: human report; exit 0 always (never breaks cron). Alerts only on
+actionable findings; all-green runs are silent except --verbose.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta
+
+# --------------------------------------------------------------------------
+# project registry — the source of truth for what "healthy" means here.
+# healthz endpoints (self-healer aware) are checked harder than plain UI.
+# --------------------------------------------------------------------------
+PROJECTS = [
+    # (service, dir, http_url, healthz_url, has_deploy, has_ci)
+    ("cs2-tracker",         "/home/ev/cs2-tracker",         "http://127.0.0.1:8092/", "http://127.0.0.1:8092/healthz", True,  True),
+    ("cs2-dashboard",       "/home/ev/cs2-dashboard",       "http://127.0.0.1:8001/", None,                           True,  True),
+    ("maritime-dashboard",  "/home/ev/maritime-dashboard",  "http://127.0.0.1:8000/", None,                           True,  False),
+    ("kiosk-home",          "/home/ev/kiosk-home",          "http://127.0.0.1:8091/", None,                           True,  True),
+    ("project-hub",         "/home/ev/project-hub",         "http://127.0.0.1:8090/", None,                           True,  True),
+    ("mark-site",           "/home/ev/apps/mark-site",      "http://127.0.0.1:8089/", None,                           True,  False),
+    ("shelfmate",           "/home/ev/apps/shelfmate",      "http://127.00.1:8086/", None,                           True,  True),
+    ("book-app",            "/home/ev/book-app",            None,                    None,                           True,  True, "static"),
+    ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/stream.mp3", None,                True,  False),
+    ("online-ships",        "/home/ev/maritime-dashboard",  None,                    None,                           False, False),
+    ("AdGuardHome",         "/home/ev/apps/AdGuardHome",    "http://127.0.0.1:3001/", None,                          False, False),
+    ("ais-catcher",         "/home/ev",                     None,                    None,                           False, False),
+]
+
+# services that have no systemd unit by design (static hosting etc.)
+NO_UNIT_OK = {"book-app"}
+
+SKIP_HTTP_WHEN = {
+    # AIS shares its SDR with satellite captures; UI probe can collide —
+    # loop-heartbeat's service check covers process health instead.
+    "ais-catcher": lambda: _sat_capture_running(),
+}
+
+STATE_PATH = "/home/ev/pi-cicd/pi-doctor-state.json"
+ALERT_EVERY_H = 6        # re-alert cadence for unfixed findings
+
+
+def _sat_capture_running() -> bool:
+    try:
+        with open("/home/ev/maritime-dashboard/noaa_state.json") as f:
+            return json.load(f).get("capture_in_progress", False)
+    except (OSError, ValueError):
+        return False
+
+
+def run(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 124, str(e)
+
+
+def _dns_resolves(host="example.com") -> bool:
+    """Minimal A-record query against 127.0.0.1:53 (no dig dependency)."""
+    import socket, struct
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(4)
+        q = b"".join(bytes([len(p)]) + p.encode() for p in host.split(".")) + b"\x00"
+        s.sendto(struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + q
+                 + struct.pack(">HH", 1, 1), ("127.0.0.1", 53))
+        data, _ = s.recvfrom(4096)
+        s.close()
+        return len(data) > 12 and (data[3] & 0x0F) == 0 and (data[7] > 0)
+    except (OSError, struct.error):
+        return False
+
+
+def http_json(url, timeout=8):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.read(8192).decode("utf-8", "replace")
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------- projects
+
+def check_project(svc, pdir, ui, healthz, has_deploy, has_ci):
+    findings = []
+    fixes = []
+
+    # 1. service state + flap detection
+    rc, active = run(["systemctl", "is-active", svc])
+    if rc != 0:
+        # F1: unit exists but dead -> try revive
+        if os.path.exists(f"/etc/systemd/system/{svc}.service"):
+            run(["systemctl", "reset-failed", svc])
+            rc2, _ = run(["systemctl", "start", svc], timeout=90)
+            time.sleep(3)
+            rc3, _ = run(["systemctl", "is-active", svc])
+            if rc3 == 0:
+                fixes.append(f"revived dead service {svc}")
+            else:
+                findings.append(f"svc:{svc}:dead — start failed, unit exists")
+        elif svc not in NO_UNIT_OK:
+            findings.append(f"svc:{svc}:nounit — no unit file found")
+    rc, nrst = run(["systemctl", "show", svc, "-p", "NRestarts", "--value"])
+    if rc == 0 and nrst.isdigit() and int(nrst) > 20:
+        findings.append(f"svc:{svc}:flapping — {nrst} restarts, crash-looping")
+
+    # 2. HTTP checks (skip when the project's own context says so)
+    skip = SKIP_HTTP_WHEN.get(svc)
+    if not (skip and skip()):
+        if healthz:
+            st, body = http_json(healthz)
+            if st is None:
+                findings.append(f"http:{svc}:healthz-down ({body})")
+            elif '"healthy"' in body and '"healthy":true' not in body:
+                findings.append(f"http:{svc}:selfhealer-unhealthy")
+        if ui and st_ok(ui) is False:
+            findings.append(f"http:{svc}:ui-down")
+
+    # 3/4/5. repo + CI (skip if no .git — some dirs are shared)
+    gdir = pdir if os.path.isdir(os.path.join(pdir, ".git")) else None
+    if gdir:
+        rc, head = run(["git", "-C", gdir, "rev-parse", "HEAD"])
+        rc, dirty = run(["git", "-C", gdir, "status", "--porcelain"])
+        if dirty:
+            findings.append(f"git:{svc}:dirty-tree — uncommitted local edits")
+        if has_deploy:
+            marker = os.path.join(gdir, ".deployed_commit")
+            running = open(marker).read().strip() if os.path.exists(marker) else ""
+            if running and running != head:
+                # F2: deploy pipeline stalled -> run deploy.sh once
+                dsh = os.path.join(gdir, "deploy", "deploy.sh")
+                if os.path.exists(dsh):
+                    rc, out = run(["bash", dsh], timeout=300)
+                    running2 = open(marker).read().strip() if os.path.exists(marker) else ""
+                    if running2 == run(["git", "-C", gdir, "rev-parse", "HEAD"])[1]:
+                        fixes.append(f"re-ran deploy for {svc} (was drifted)")
+                    else:
+                        findings.append(f"deploy:{svc}:stalled — deploy.sh failed")
+    if has_ci and gdir:
+        rc, remote = run(["git", "-C", gdir, "remote", "get-url", "origin"])
+        if rc == 0 and "pkia" in remote:
+            m = re.search(r"pkia[/:]([\w.-]+?)(?:\.git)?$", remote)
+            if m:
+                repo = m.group(1)
+                rc, out = run(["gh", "run", "list", "-R", f"pkia/{repo}",
+                               "--limit", "1", "--json", "conclusion"], 60)
+                try:
+                    concl = json.loads(out)[0]["conclusion"]
+                    if concl not in ("success", None):
+                        findings.append(f"ci:{repo}:red — last run {concl}")
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    pass
+
+    return findings, fixes
+
+
+def st_ok(url):
+    st, _ = http_json(url)
+    return None if st is None else st == 200
+
+
+# ---------------------------------------------------------------- system
+
+def check_system():
+    findings, fixes = [], []
+
+    st = os.statvfs("/")
+    pct = (1 - st.f_bavail / st.f_blocks) * 100
+    if pct > 90:
+        findings.append(f"sys:disk {pct:.0f}% full")
+    elif pct > 80:
+        # safe fix: clear apt/journal caches
+        before = pct
+        run(["sudo", "-n", "journalctl", "--vacuum-size=200M"])
+        st2 = os.statvfs("/")
+        pct2 = (1 - st2.f_bavail / st2.f_bblocks) * 100 if hasattr(st2, "f_bblocks") else pct
+        if pct2 < before - 0.5:
+            fixes.append(f"journal vacuum freed disk ({before:.0f}% -> {pct2:.0f}%)")
+
+    try:
+        t = int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000
+        if t > 80:
+            findings.append(f"sys:cpu-temp {t:.0f}C")
+    except (OSError, ValueError):
+        pass
+
+    rc, out = run(["free", "-m"])
+    m = re.search(r"Mem:\s+(\d+)\s+(\d+)", out or "")
+    if m and int(m.group(2)) / int(m.group(1)) > 0.95:
+        findings.append(f"sys:mem {m.group(2)}/{m.group(1)}MB used >95%")
+
+    rc, out = run(["systemctl", "--failed", "--no-legend"])
+    if out:
+        for line in out.splitlines():
+            findings.append(f"sys:failed-unit {line.split()[0]}")
+
+    # AdGuard DNS actually resolving (raw UDP query, stdlib only)
+    if not _dns_resolves():
+        run(["systemctl", "restart", "AdGuardHome"], 90)
+        time.sleep(5)
+        if _dns_resolves():
+            fixes.append("restarted AdGuardHome (DNS not resolving)")
+        else:
+            findings.append("sys:adguard-dns down even after restart")
+
+    # rpi-connect leak guard
+    rc, out = run(["pgrep", "-f", "rpi-connectd", "-o"])
+    pid = (out or "").splitlines()[0] if out else ""
+    if pid:
+        rc, rss = run(["ps", "-o", "rss=", "-p", pid])
+        if rss.isdigit() and int(rss) > 2_500_000:
+            run(["systemctl", "restart", "rpiconnect"], 90)
+            fixes.append("restarted rpi-connect (RSS > 2.5GB leak)")
+
+    return findings, fixes
+
+
+# ---------------------------------------------------------------- reporting
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(s):
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f, indent=1)
+    except OSError:
+        pass
+
+
+def send_alert(subject, body):
+    """WhatsApp via hermes send + ntfy backup channel."""
+    run(["hermes", "send", "--to", "whatsapp:8087473803462@lid",
+         "--message", f"{subject}: {body}"], 30)
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://100.122.94.33:6839/loop-heartbeat",
+            data=body.encode(),
+            headers={"Title": subject,
+                     "Authorization": "Bearer " + _ntfy_token()})
+        urllib.request.urlopen(req, timeout=8)
+    except Exception:
+        pass
+
+
+def _ntfy_token():
+    for p in ("/etc/ntfy-notify.conf", "/etc/loop-heartbeat.conf"):
+        try:
+            for line in open(p):
+                if line.startswith("NTFY_TOKEN"):
+                    return line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+    return ""
+
+
+def main():
+    verbose = "--verbose" in sys.argv
+    now = datetime.now()
+    all_findings, all_fixes = [], []
+
+    for entry in PROJECTS:
+        svc, pdir, ui, healthz, has_deploy, has_ci = entry[:6]
+        try:
+            f, x = check_project(svc, pdir, ui, healthz, has_deploy, has_ci)
+            all_findings += f
+            all_fixes += x
+        except Exception as e:
+            all_findings.append(f"doctor:{svc}:check-error {type(e).__name__}: {e}")
+    try:
+        f, x = check_system()
+        all_findings += f
+        all_fixes += x
+    except Exception as e:
+        all_findings.append(f"doctor:system:check-error {type(e).__name__}: {e}")
+
+    report = format_report(all_findings, all_fixes, now)
+    if verbose:
+        print(report)
+
+    if all_findings:
+        state = load_state()
+        new = [f for f in all_findings if _key(f) not in state or
+               (now - datetime.fromisoformat(state[_key(f)])).total_seconds()
+               > ALERT_EVERY_H * 3600]
+        for f in new:
+            state[_key(f)] = now.isoformat(timespec="seconds")
+        save_state(state)
+        if new:
+            send_alert("⚠ pi-doctor", report)
+    elif all_fixes:
+        send_alert("🔧 pi-doctor", "auto-fixed without issue:\n" +
+                   "\n".join(f"- {x}" for x in all_fixes))
+    # all green and nothing fixed -> silent
+
+    return 0
+
+
+def _key(finding):
+    return finding.split(" — ")[0].split(" (")[0].strip()
+
+
+def format_report(findings, fixes, now):
+    lines = [f"pi-doctor daily audit — {now:%Y-%m-%d %H:%M}", ""]
+    if fixes:
+        lines.append("Auto-fixed:")
+        lines += [f"  ✓ {x}" for x in fixes]
+    if findings:
+        lines.append("Needs attention:")
+        lines += [f"  ⚠ {f}" for f in findings]
+    if not fixes and not findings:
+        lines.append("All projects healthy.")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
