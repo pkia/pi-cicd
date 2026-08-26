@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""release-watch — upstream release watcher for the Pi's deployed software.
+
+Stop finding out about upstream releases by accident: poll the GitHub
+releases API (and, optionally, plain pages hashed with sha256) of every
+piece of software this machine actually runs, remember what was last
+seen, and publish ONE digest per run to the ntfy backbone when anything
+moved. First observation of a source is a baseline, not an alert — the
+watcher earns trust before it spends it.
+
+    release-watch [--config FILE] [--state FILE] [--dry-run] [-v]
+    release-watch --list [--state FILE]     just print what is tracked
+
+Sources (all optional, config-driven):
+  WATCH_GITHUB  comma-separated owner/repo slugs — latest non-prerelease
+                release is read from the GitHub releases API
+  WATCH_URLS    comma-separated Name=https://url entries — the page body
+                is hashed; any byte change is an event (use for status
+                pages or download indexes without an API)
+
+GitHub's unauthenticated API allows 60 requests/hour per IP; at two runs
+a day this is nowhere near it. No LLM anywhere — the digest is
+mechanical, like the rest of this repo's tooling.
+
+A source that keeps failing to fetch is itself information: after
+ERROR_STREAK_ALERT consecutive failures it joins the digest as a
+"watch source failing" line (and the streak resets on success).
+
+Digests are published directly to ntfy (same JSON shape and token auth
+as ntfy-notify — see docs/notifications.md) to the topic named after
+this job. Publishing is best-effort: a dead notification path must not
+fail the run. Exit 0 on a normal run (digest or silence), 1 when the
+run itself is broken (no sources configured, every source failed, or
+the state file cannot be written).
+
+Config: /etc/release-watch.conf (KEY=VALUE, '#' comments):
+
+    NTFY_URL    base URL, e.g. http://100.122.94.33:6839
+    NTFY_TOKEN  access token of the 'publisher' ntfy user
+    NTFY_TOPIC  default 'releases'
+    WATCH_GITHUB / WATCH_URLS / TIMEOUT_SECS / ERROR_STREAK_ALERT  as above
+
+State: ~/.local/state/release-watch/state.json — last seen version or
+sha256 per source, plus the consecutive-error counters.
+
+The systemd timer runs this twice a day (10:12 and 22:12, clear of the
+overnight loop schedule).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_CONFIG = "/etc/release-watch.conf"
+DEFAULT_STATE = "~/.local/state/release-watch/state.json"
+DEFAULT_TOPIC = "releases"
+DEFAULT_TIMEOUT = 20
+DEFAULT_STREAK = 3
+
+RE_SLUG = re.compile(r"^[\w.-]+/[\w.-]+$")
+RE_NAME_URL = re.compile(r"^[^=\s]+=https?://\S+$")
+
+
+# ---------------------------------------------------------------- config
+
+def parse_env_file(path):
+    """KEY=VALUE lines -> dict (str). Missing file -> {}."""
+    cfg = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg[key.strip()] = value.strip()
+    return cfg
+
+
+def split_csv(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def load_config(path):
+    """Parse the env-style config into the shape run() expects."""
+    raw = parse_env_file(path)
+
+    github = []
+    for slug in split_csv(raw.get("WATCH_GITHUB", "")):
+        if not RE_SLUG.match(slug):
+            print(f"release-watch: bad WATCH_GITHUB entry {slug!r} "
+                  "(want owner/repo) — skipped", file=sys.stderr)
+            continue
+        github.append(slug)
+
+    pages = []
+    for entry in split_csv(raw.get("WATCH_URLS", "")):
+        if not RE_NAME_URL.match(entry):
+            print(f"release-watch: bad WATCH_URLS entry {entry!r} "
+                  "(want Name=https://url) — skipped", file=sys.stderr)
+            continue
+        name, _, url = entry.partition("=")
+        pages.append((name, url))
+
+    try:
+        streak = int(raw.get("ERROR_STREAK_ALERT", DEFAULT_STREAK) or
+                     DEFAULT_STREAK)
+    except ValueError:
+        streak = DEFAULT_STREAK
+
+    return {
+        "github": github,
+        "pages": pages,
+        "ntfy_url": raw.get("NTFY_URL", "").strip().rstrip("/"),
+        "ntfy_token": raw.get("NTFY_TOKEN", "").strip(),
+        "topic": raw.get("NTFY_TOPIC", DEFAULT_TOPIC).strip() or DEFAULT_TOPIC,
+        "timeout": DEFAULT_TIMEOUT,
+        "streak_alert": max(streak, 1),
+    }
+
+
+# --------------------------------------------------------------- network
+
+def http_get(url, headers=None, timeout=DEFAULT_TIMEOUT):
+    """GET -> (ok, body_text). Any failure -> (False, error message)."""
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return False, str(exc)
+
+
+def fetch_github_latest(slug, timeout):
+    """Latest non-prerelease release of owner/repo -> (version, url, date).
+
+    Returns (None, error, None) on any failure — one flaky source must
+    not take the run down.
+    """
+    ok, body = http_get(
+        f"https://api.github.com/repos/{slug}/releases/latest",
+        headers={"Accept": "application/vnd.github+json",
+                 "User-Agent": "pi-release-watch"},
+        timeout=timeout)
+    if not ok:
+        return None, body, None
+    try:
+        data = json.loads(body)
+        tag = str(data["tag_name"])
+        url = str(data.get("html_url") or
+                  f"https://github.com/{slug}/releases")
+        released = str(data.get("published_at") or "")[:10]
+        return tag, url, released
+    except (KeyError, TypeError, ValueError) as exc:
+        return None, f"unparseable release JSON: {exc}", None
+
+
+def fetch_page_sha(url, timeout):
+    """sha256 of the page body -> (hexdigest, final_url, error)."""
+    ok, body = http_get(url, timeout=timeout)
+    if not ok:
+        return None, None, body
+    return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest(), url, None
+
+
+def ntfy_post(cfg, title, message, tags, timeout):
+    """Publish the digest; True on any 2xx. Never raises."""
+    if not (cfg["ntfy_url"] and cfg["ntfy_token"]):
+        print("release-watch: NTFY_URL/NTFY_TOKEN not configured — "
+              "digest not published", file=sys.stderr)
+        return False
+    payload = {"topic": cfg["topic"], "message": message, "title": title,
+               "tags": tags}
+    req = urllib.request.Request(
+        cfg["ntfy_url"], data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {cfg['ntfy_token']}",
+                 "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.getcode() < 300
+    except urllib.error.HTTPError as exc:
+        print(f"release-watch: ntfy HTTP {exc.code}: "
+              f"{exc.read(200).decode('utf-8', 'replace')}", file=sys.stderr)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"release-watch: ntfy publish failed: {exc}", file=sys.stderr)
+    return False
+
+
+# ----------------------------------------------------------------- state
+
+def load_state(path):
+    """state.json -> {"sources": {...}}. Missing/corrupt -> fresh."""
+    fresh = {"sources": {}}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return fresh
+    except ValueError:
+        print(f"release-watch: state file corrupt, starting fresh",
+              file=sys.stderr)
+        return fresh
+    sources = data.get("sources")
+    return {"sources": sources} if isinstance(sources, dict) else fresh
+
+
+def save_state(path, state):
+    """Write state atomically (tmp + rename). False on failure."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except OSError as exc:
+        print(f"release-watch: cannot write state {path}: {exc}",
+              file=sys.stderr)
+        return False
+
+
+# ------------------------------------------------------------------ core
+
+def check_github(slug, entry, cfg, events, streak_events, verbose):
+    """Compare latest release against state; append events; update entry."""
+    version, url, released = fetch_github_latest(slug, cfg["timeout"])
+    if version is None:
+        return record_error(f"github:{slug}", entry, cfg, streak_events,
+                            f"fetch failed: {url}", verbose)
+    if verbose:
+        print(f"  github {slug}: {version}")
+    old = entry.get("version")
+    if not old:
+        events.append(f"{slug} baselined at {version}"
+                      + (f" (released {released})" if released else ""))
+        if verbose:
+            print(f"  baseline: {slug} = {version}")
+    elif old != version:
+        events.append(f"{slug} {old} → {version}"
+                      + (f" (released {released})" if released else "")
+                      + f"\n{url}")
+        if verbose:
+            print(f"  CHANGE: {slug} {old} -> {version}")
+    entry.update({"version": version, "url": url,
+                  "released": released, "consecutive_errors": 0})
+    return True
+
+
+def check_page(name, url, entry, cfg, events, streak_events, verbose):
+    """Compare page body hash against state; append events; update entry."""
+    sha, final_url, err = fetch_page_sha(url, timeout=cfg["timeout"])
+    if sha is None:
+        return record_error(f"page:{name}", entry, cfg, streak_events,
+                            f"fetch failed: {err}", verbose)
+    if verbose:
+        print(f"  page {name}: {sha[:12]}")
+    old = entry.get("sha256")
+    if not old:
+        events.append(f"{name} page baselined (sha {sha[:12]})")
+        if verbose:
+            print(f"  baseline: {name}")
+    elif old != sha:
+        events.append(f"{name} page changed (sha {old[:12]} → {sha[:12]})"
+                      f"\n{final_url}")
+        if verbose:
+            print(f"  CHANGE: {name}")
+    entry.update({"sha256": sha, "url": final_url,
+                  "consecutive_errors": 0})
+    return True
+
+
+def record_error(key, entry, cfg, streak_events, message, verbose):
+    """Count a failed fetch; escalate to an event at the streak threshold."""
+    streak = int(entry.get("consecutive_errors", 0)) + 1
+    entry["consecutive_errors"] = streak
+    entry["last_error"] = message
+    if verbose:
+        print(f"  error ({streak}): {key}: {message}")
+    if cfg["streak_alert"] and streak == cfg["streak_alert"]:
+        streak_events.append(
+            f"{key} failing {streak} runs in a row ({message})")
+    return False
+
+
+def build_digest(events, streak_events):
+    """Events -> (title, message) for the digest notification."""
+    lines = []
+    if events:
+        lines.append(f"{len(events)} upstream change"
+                     f"{'s' if len(events) != 1 else ''}:")
+        lines.append("")
+        lines.extend(events)
+    if streak_events:
+        if lines:
+            lines.append("")
+        lines.append(f"{len(streak_events)} watch source"
+                     f"{'s' if len(streak_events) != 1 else ''} failing:")
+        lines.extend(f"- {s}" for s in streak_events)
+    n = len(events) + len(streak_events)
+    title = f"release-watch: {n} update" + ("s" if n != 1 else "")
+    return title, "\n".join(lines)
+
+
+def run(cfg, state_path, dry_run=False, verbose=False):
+    """One sweep: fetch every source, diff, maybe publish, persist state."""
+    sources = cfg["github"] + [name for name, _ in cfg["pages"]]
+    if not sources:
+        print("release-watch: no sources configured "
+              "(WATCH_GITHUB / WATCH_URLS)", file=sys.stderr)
+        return 1
+
+    state = load_state(state_path)
+    entries = state["sources"]
+    events, streak_events = [], []
+    ok_count = 0
+
+    for slug in cfg["github"]:
+        entry = entries.setdefault(f"github:{slug}", {})
+        ok_count += check_github(slug, entry, cfg, events, streak_events,
+                                 verbose)
+    for name, url in cfg["pages"]:
+        entry = entries.setdefault(f"page:{name}", {})
+        ok_count += check_page(name, url, entry, cfg, events, streak_events,
+                               verbose)
+
+    if ok_count == 0:
+        print("release-watch: every source failed this run",
+              file=sys.stderr)
+        if not dry_run:
+            save_state(state_path, state)
+        return 1
+
+    published = False
+    if events or streak_events:
+        title, message = build_digest(events, streak_events)
+        if dry_run:
+            print(f"[dry-run] would publish to {cfg['ntfy_url'] or '(ntfy)'} "
+                  f"topic '{cfg['topic']}':\n{message}")
+        else:
+            published = ntfy_post(cfg, title, message,
+                                  ["arrow_up"], cfg["timeout"])
+            print(("✓ published" if published else "✗ could not publish")
+                  + f" {len(events)} change(s), "
+                    f"{len(streak_events)} warning(s) to topic "
+                  f"'{cfg['topic']}'")
+    else:
+        print("✓ all sources unchanged"
+              + (f" ({ok_count}/{len(sources)} reachable)"
+                 if ok_count < len(sources) else ""))
+
+    if dry_run:
+        return 0
+    if not save_state(state_path, state):
+        return 1
+    # a failed publish is degradation, not failure — the next run
+    # re-detects nothing (state moved on), so say it loudly in the journal
+    if (events or streak_events) and not published:
+        print("release-watch: digest was NOT delivered — sources above "
+              "changed and nobody was told; state saved anyway",
+              file=sys.stderr)
+    return 0
+
+
+def print_state(state_path):
+    state = load_state(state_path)
+    sources = state["sources"]
+    if not sources:
+        print(f"(no state at {state_path} — nothing watched yet)")
+        return 0
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"# state at {state_path}  (listed {now})")
+    for key in sorted(sources):
+        e = sources[key]
+        what = e.get("version") or (f"sha {e['sha256'][:12]}"
+                                    if e.get("sha256") else "?")
+        errs = f" [errors: {e['consecutive_errors']}]" \
+            if e.get("consecutive_errors") else ""
+        print(f"  {key}: {what}{errs}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="watch upstream releases, digest changes to ntfy")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"config file (default {DEFAULT_CONFIG})")
+    ap.add_argument("--state", default=DEFAULT_STATE,
+                    help=f"state file (default {DEFAULT_STATE})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the digest, publish and persist nothing")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="per-source detail")
+    ap.add_argument("--list", action="store_true",
+                    help="print tracked sources and exit")
+    args = ap.parse_args(argv)
+
+    state_path = Path(args.state).expanduser()
+    if args.list:
+        return print_state(state_path)
+    return run(load_config(args.config), state_path,
+               dry_run=args.dry_run, verbose=args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -19,8 +19,9 @@ ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
 ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
 ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
 ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
+ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
-         "$REPO_DIR/pi-backup"
+         "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).

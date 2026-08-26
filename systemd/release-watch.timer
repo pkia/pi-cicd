@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch upstream releases twice daily (10:12 / 22:12, clear of the overnight loop)
+
+[Timer]
+OnCalendar=*-*-* 10:12:00
+OnCalendar=*-*-* 22:12:00
+AccuracySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

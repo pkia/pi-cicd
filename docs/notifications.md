@@ -36,7 +36,7 @@ phone authenticate; the creation passwords are thrown away — reset with
 
 | User | Role | Access | Used by |
 |---|---|---|---|
-| `publisher` | user | write-only grant on `radar`, `loop-heartbeat`, `backups` | scripts on the Pi: loop-heartbeat, radar pings, backup jobs |
+| `publisher` | user | write-only grant on `radar`, `loop-heartbeat`, `backups`, `releases` | scripts on the Pi: loop-heartbeat, radar pings, backup jobs, release-watch |
 | `subscriber` | user | read-only grant on those topics | the owner's phone |
 
 Tokens live in `/etc/loop-heartbeat.conf` (NTFY_TOKEN) and
@@ -53,6 +53,7 @@ what you want to hear about:
 | `radar` | the radar implementer (via `ntfy-notify`) | shipped/blocked outcomes of self-improvement runs |
 | `loop-heartbeat` | loop-heartbeat (built in) | dead-man's-switch alerts: silent jobs, failure streaks, zombies, down services, stale timers — plus recovery notices |
 | `backups` | pi-backup (built in) | daily backup results, prune notices, weekly restore-drill PASS/FAIL, failures at high priority |
+| `releases` | release-watch (built in) | upstream release digests for the deployed software (ntfy, AdGuardHome, ais-catcher) and watched status pages — one notification per sweep, only when something moved |
 
 Naming rule for new topics: the topic is named after the job that owns
 it, not the content it carries — `x-writer` publishes to `x-writer`,
@@ -106,6 +107,12 @@ Rotate/grow:
 
     sudo NTFY_PASSWORD=... ntfy user add --role=user publisher --config ...
     sudo ntfy token add publisher --config ...   # mint, then update /etc/*.conf
+
+Grant for the `releases` topic (release-watch — see the script
+docstring; inspect live state with `release-watch --list`):
+
+    sudo ntfy access add publisher releases write --config /etc/ntfy/server.yml
+    sudo ntfy access add subscriber releases read  --config /etc/ntfy/server.yml
 
 The server survives reboots (systemd `WantedBy=multi-user.target`,
 `Restart=on-failure`). Restarting ntfy does not touch any other service;
