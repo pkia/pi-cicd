@@ -341,6 +341,7 @@ def _key(finding):
 
 
 def format_report(findings, fixes, now):
+    now = now or datetime.now()
     lines = [f"pi-doctor daily audit — {now:%Y-%m-%d %H:%M}", ""]
     if fixes:
         lines.append("Auto-fixed:")
