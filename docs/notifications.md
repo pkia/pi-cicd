@@ -111,8 +111,8 @@ Rotate/grow:
 Grant for the `releases` topic (release-watch — see the script
 docstring; inspect live state with `release-watch --list`):
 
-    sudo ntfy access add publisher releases write --config /etc/ntfy/server.yml
-    sudo ntfy access add subscriber releases read  --config /etc/ntfy/server.yml
+    sudo ntfy access publisher releases write-only
+    sudo ntfy access subscriber releases read-only
 
 The server survives reboots (systemd `WantedBy=multi-user.target`,
 `Restart=on-failure`). Restarting ntfy does not touch any other service;

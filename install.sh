@@ -73,5 +73,19 @@ else
     echo "note: /etc/pi-backup.conf not found - pi-backup not installed"
 fi
 
+# release-watch: upstream release digests to the ntfy 'releases' topic.
+# Needs /etc/release-watch.conf (NTFY keys, WATCH_GITHUB/WATCH_URLS) and
+# topic ACLs — see the script's docstring, templates/release-watch.conf.example
+# and docs/notifications.md. Install is skipped silently when absent.
+if [ -f /etc/release-watch.conf ]; then
+    sudo cp "$REPO_DIR/systemd/release-watch.service" \
+            "$REPO_DIR/systemd/release-watch.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now release-watch.timer
+    echo "release-watch timer installed and active"
+else
+    echo "note: /etc/release-watch.conf not found - release-watch not installed"
+fi
+
 echo
 echo "done. try:  new-project my-app --port 8100"

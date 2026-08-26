@@ -1,0 +1,9 @@
+# release-watch — upstream release watcher. Provisioned on the host,
+# never committed (same rule as every other /etc conf here). Values:
+#   binwiederhier/ntfy          = the ntfy server itself (Debian package)
+#   AdguardTeam/AdGuardHome     = DNS filtering (Debian package)
+#   jvde-github/AIS-catcher     = AIS feeding the X bot (built from source)
+NTFY_URL=http://100.122.94.33:6839
+NTFY_TOKEN=REPLACE_WITH_PUBLISHER_TOKEN
+NTFY_TOPIC=releases
+WATCH_GITHUB=binwiederhier/ntfy,AdguardTeam/AdGuardHome,jvde-github/AIS-catcher
