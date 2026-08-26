@@ -1,0 +1,9 @@
+[Unit]
+Description=Upstream release watcher sweep (deployed software + status pages)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+ExecStart=/home/ev/.local/bin/release-watch

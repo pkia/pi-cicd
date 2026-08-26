@@ -19,8 +19,9 @@ ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
 ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
 ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
 ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
+ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
-         "$REPO_DIR/pi-backup"
+         "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -70,6 +71,20 @@ if [ -f /etc/pi-backup.conf ]; then
     echo "pi-backup timers installed and active"
 else
     echo "note: /etc/pi-backup.conf not found - pi-backup not installed"
+fi
+
+# release-watch: upstream release digests to the ntfy 'releases' topic.
+# Needs /etc/release-watch.conf (NTFY keys, WATCH_GITHUB/WATCH_URLS) and
+# topic ACLs — see the script's docstring, templates/release-watch.conf.example
+# and docs/notifications.md. Install is skipped silently when absent.
+if [ -f /etc/release-watch.conf ]; then
+    sudo cp "$REPO_DIR/systemd/release-watch.service" \
+            "$REPO_DIR/systemd/release-watch.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now release-watch.timer
+    echo "release-watch timer installed and active"
+else
+    echo "note: /etc/release-watch.conf not found - release-watch not installed"
 fi
 
 echo

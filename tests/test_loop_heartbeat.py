@@ -451,3 +451,47 @@ def test_fixtures_contain_no_phone_numbers():
             # whatsapp:<digits>; redacted ones are whatsapp:REDACTED@lid
             assert re.search(r"whatsapp:\d{7,}", text) is None, f"{f.name} leaks a JID"
             assert re.search(r"\+353\d{8,}", text) is None, f"{f.name} leaks +353 number"
+
+
+# ----------------------------------------------------------- healthz checks
+
+def test_parse_healthz():
+    _parse_healthz = lh._parse_healthz
+    assert _parse_healthz("") == []
+    assert _parse_healthz("http://x:1/h") == [("http://x:1/h", "x:1")]
+    assert _parse_healthz("http://x:1/h=cs2, http://y:2/=other") == [
+        ("http://x:1/h", "cs2"), ("http://y:2/", "other")]
+
+
+def test_check_healthz_ok():
+    # real local server: the tracker itself is running on this box
+    alerts = lh.check_healthz("http://127.0.0.1:8092/healthz", "cs2-tracker")
+    assert alerts == []
+
+
+def test_check_healthz_down():
+    alerts = lh.check_healthz("http://127.0.0.1:59999/healthz", "nope")
+    assert alerts and alerts[0]["key"] == "healthz:nope:down"
+
+
+def test_check_healthz_unhealthy_flag():
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"healthy":false}')
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        alerts = lh.check_healthz(
+            f"http://127.0.0.1:{srv.server_port}/healthz", "fake")
+        assert alerts and alerts[0]["key"] == "healthz:fake:unhealthy"
+    finally:
+        srv.shutdown()
