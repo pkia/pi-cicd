@@ -52,7 +52,7 @@ PROJECTS = [
     ("kiosk-home",          "/home/ev/kiosk-home",          "http://127.0.0.1:8091/", None,                           True,  True),
     ("project-hub",         "/home/ev/project-hub",         "http://127.0.0.1:8090/", None,                           True,  True),
     ("mark-site",           "/home/ev/apps/mark-site",      "http://127.0.0.1:8089/", None,                           True,  False),
-    ("shelfmate",           "/home/ev/apps/shelfmate",      "http://127.00.1:8086/", None,                           True,  True),
+    ("shelfmate",           "/home/ev/apps/shelfmate",      "http://127.0.0.1:8086/", None,                           True,  True),
     ("book-app",            "/home/ev/book-app",            None,                    None,                           True,  True, "static"),
     ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/stream.mp3", None,                True,  False),
     ("online-ships",        "/home/ev/maritime-dashboard",  None,                    None,                           False, False),
