@@ -86,35 +86,53 @@ def test_revive_dead_service(tmp_path):
 
 
 def test_deploy_drift_triggers_deploy(tmp_path, monkeypatch):
-    # repo with marker != HEAD and a deploy.sh
+    # REAL throwaway git repo; only systemctl is mocked
+    import subprocess as sp
     repo = tmp_path / "r"
-    (repo / "deploy").mkdir(parents=True)
-    (repo / ".git").mkdir()
+    repo.mkdir()
+    sp.run(["git", "init", "-q", str(repo)], check=True)
+    sp.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty",
+            "-m", "x"], env={**os.environ,
+                             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+            check=True)
+    (repo / "deploy").mkdir()
     (repo / "deploy" / "deploy.sh").write_text(
-        "#!/bin/bash\necho newwwwww > " + str(repo / ".deployed_commit") + "\n")
-    (repo / ".deployed_commit").write_text("oldddddd")
-    calls = []
-
-    real_run = doc.run          # deploy.sh must REALLY execute
+        "#!/bin/bash\ngit -C %s rev-parse HEAD > %s/.deployed_commit\n"
+        % (repo, repo))
+    (repo / ".deployed_commit").write_text("0" * 40)   # drifted
+    real_run = doc.run
 
     def fake_run(cmd, timeout=60):
-        calls.append(cmd)
-        if cmd[0] == "bash":
-            return real_run(cmd, timeout=timeout)
-        if cmd[:2] == ["git", "-C", str(repo)] and cmd[3] == "rev-parse":
-            return 0, "newwwwww"
-        if cmd[:2] == ["git", "-C", str(repo)] and cmd[3] == "status":
-            return 0, ""
-        if cmd[:2] == ["git", "-C", str(repo)] and cmd[3] == "remote":
-            return 1, ""
         if cmd[:2] == ["systemctl", "is-active"]:
             return 0, "active"
-        return 0, ""
+        return real_run(cmd, timeout=timeout)   # git + bash run for real
 
     monkeypatch.setattr(doc, "run", fake_run)
     f, x = doc.check_project("r", str(repo), None, None, True, False)
-    assert any("bash" in " ".join(c) for c in calls)
     assert any("re-ran deploy" in s for s in x), (f, x)
+
+
+def test_deploy_healthy_no_drift(tmp_path, monkeypatch):
+    import subprocess as sp
+    repo = tmp_path / "r2"
+    repo.mkdir()
+    sp.run(["git", "init", "-q", str(repo)], check=True)
+    sp.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty",
+            "-m", "x"], env={**os.environ,
+                             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+            check=True)
+    head = sp.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                  capture_output=True, text=True).stdout.strip()
+    (repo / ".deployed_commit").write_text(head)       # in sync
+    monkeypatch.setattr(doc, "run",
+                        lambda cmd, timeout=60: (0, "active")
+                        if cmd[:2] == ["systemctl", "is-active"]
+                        else (0, ""))
+    f, x = doc.check_project("r2", str(repo), None, None, True, False)
+    assert not any("deploy" in s for s in f), f
+    assert x == []
 
 
 # ------------------------------------------------------------ system checks
