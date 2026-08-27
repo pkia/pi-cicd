@@ -149,6 +149,24 @@ venv, the app's systemd unit, the deploy script + timer, starts the
 service, and health-checks it — one command from empty directory to a
 deployed, CI-backed service.
 
+### pi-doctor — the daily deep audit
+
+The fast watchers (deploy timers every 5 min, loop-heartbeat every 30)
+catch a service being down or a rollout being stuck. `pi-doctor`
+(a daily Hermes cron job at 07:00, agent-driven so findings get
+investigated with the owner's standing approval) goes deeper: per
+project it verifies the service is active and not flapping, the UI or
+healthz endpoint answers, the running commit matches origin/main (a
+drift means the deploy timer itself is broken — it re-runs deploy.sh
+as the fix), CI on main is green, and the git tree is clean. It also
+audits the system layer: disk, CPU temp, memory, failed units, and
+the watchers' own state. Fixes it can apply safely (restart a dead
+service, re-run a deploy) are applied automatically; everything else
+is escalated to the owner. Alert state is kept in
+`pi-doctor-state.json` (untracked) so a persistent issue re-alerts
+at most once every few hours instead of daily-spamming. All-green
+runs are silent; `--verbose` prints the full report.
+
 ## Incident log
 
 Real failures from this system's first day of life, and the rules they

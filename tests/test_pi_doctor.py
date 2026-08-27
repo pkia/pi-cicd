@@ -4,6 +4,8 @@ import importlib.machinery
 import json
 import os
 import sys
+
+import pytest
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -24,7 +26,15 @@ FIX = HERE / "fixtures"
 # ------------------------------------------------------------ DNS check
 
 def test_dns_resolves_live():
-    # AdGuard is the live resolver on this box — healthy path
+    # AdGuard is the live resolver on this box — healthy path. Hermetic on
+    # CI (no :53 there): skip rather than assert, so the test exercises
+    # the live path only where a resolver actually exists.
+    import socket as _s
+    try:
+        with _s.create_connection(("127.0.0.1", 53), timeout=1):
+            pass
+    except OSError:
+        pytest.skip("no local DNS resolver on this host (CI)")
     assert doc._dns_resolves() is True
 
 

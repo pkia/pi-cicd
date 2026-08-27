@@ -1,0 +1,13 @@
+[Unit]
+Description=Probe service uptime every 5 minutes
+# every 5 min: fast enough to confirm an outage within 2 sweeps
+# (CONFIRM_FAILS=2), quiet enough to be invisible in the graphs
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

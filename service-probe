@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""service-probe — uptime scoreboard for the Pi's long-running services.
+
+One stdlib probe per service the box actually serves: HTTP(S) checks for
+the dashboards, portal and public funnel endpoints, and a real DNS query
+(no dig needed — a hand-built UDP A-record packet) for AdGuardHome.
+Every sweep writes a status.json the portal renders, and publishes ONE
+digest to the ntfy backbone when a service goes DOWN (after
+CONFIRM_FAILS consecutive failures — one blip is not an outage) or comes
+back UP.
+
+    service-probe [--config FILE] [--state FILE] [--dry-run] [-v]
+    service-probe --list [--state FILE]     print last-known status
+
+Why not Uptime Kuma: it wants a container and a Node runtime; this box
+runs Debian packages and stdlib Python (see docs/architecture.md). Why
+no cron-job heartbeats here: loop-heartbeat already owns the scheduled
+jobs — one owner per concern, service-probe owns sockets and endpoints.
+
+Probes (config-driven, one per line, commas allowed in a line):
+  PROBE_HTTP  Name=http://host:port/path — GET must return <400 and, if
+              the body is JSON with a "healthy" key, healthy must be true
+              (same gate loop-heartbeat uses for healthz endpoints)
+  PROBE_DNS   Name=server[:port]:domain — an A query must come back with
+              rcode 0 and at least one answer
+
+State: ~/.local/state/service-probe/state.json (per-probe status,
+failure streaks, last change time) alongside status.json (the rendered
+scoreboard source, rewritten atomically every sweep).
+
+Digests go to ntfy topic 'services' (publisher token, same JSON shape
+as ntfy-notify — see docs/notifications.md). Publishing is best-effort:
+a dead notification path must not fail the run. Exit 0 on a normal run
+(digest or silence), 1 when the run itself is broken (no probes
+configured or the state file cannot be written).
+
+The systemd timer runs this every 5 minutes.
+
+Config: /etc/service-probe.conf (KEY=VALUE, '#' comments):
+
+    NTFY_URL      base URL, e.g. http://100.122.94.33:6839
+    NTFY_TOKEN    access token of the 'publisher' ntfy user
+    NTFY_TOPIC    default 'services'
+    PROBE_HTTP / PROBE_DNS / CONFIRM_FAILS / TIMEOUT_SECS  as above
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import socket
+import struct
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_CONFIG = "/etc/service-probe.conf"
+DEFAULT_STATE = "~/.local/state/service-probe/state.json"
+DEFAULT_TOPIC = "services"
+DEFAULT_TIMEOUT = 10
+DEFAULT_CONFIRM_FAILS = 2
+
+RE_HTTP = re.compile(r"^[\w.-]+=https?://\S+$")
+
+
+# ---------------------------------------------------------------- config
+
+def parse_env_lists(path):
+    """KEY=VALUE lines -> dict of lists (repeated keys accumulate)."""
+    cfg: dict[str, list[str]] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg.setdefault(key.strip(), []).append(value.strip())
+    return cfg
+
+
+def split_entries(values):
+    """List of 'a=b' strings (commas allowed inside one value) -> [a=b]."""
+    out = []
+    for value in values:
+        out.extend(item.strip() for item in value.split(",") if item.strip())
+    return out
+
+
+def load_config(path):
+    """Parse the env-style config into the shape run() expects."""
+    raw = parse_env_lists(path)
+
+    http_probes = []
+    for entry in split_entries(raw.get("PROBE_HTTP", [])):
+        if not RE_HTTP.match(entry):
+            print(f"service-probe: bad PROBE_HTTP entry {entry!r} "
+                  "(want Name=http://url) — skipped", file=sys.stderr)
+            continue
+        name, _, url = entry.partition("=")
+        http_probes.append((name, url))
+
+    dns_probes = []
+    for entry in split_entries(raw.get("PROBE_DNS", [])):
+        if "=" not in entry or ":" not in entry.split("=", 1)[1]:
+            print(f"service-probe: bad PROBE_DNS entry {entry!r} "
+                  "(want Name=server[:port]:domain) — skipped",
+                  file=sys.stderr)
+            continue
+        name, _, rest = entry.partition("=")
+        server, _, domain = rest.rpartition(":")
+        if not server or not domain:
+            print(f"service-probe: bad PROBE_DNS entry {entry!r} — skipped",
+                  file=sys.stderr)
+            continue
+        if ":" in server and not server.rsplit(":", 1)[1].isdigit():
+            print(f"service-probe: bad PROBE_DNS entry {entry!r} — skipped",
+                  file=sys.stderr)
+            continue
+        dns_probes.append((name, server, domain))
+
+    try:
+        confirm = int((raw.get("CONFIRM_FAILS", [""])[-1])
+                      or DEFAULT_CONFIRM_FAILS)
+    except ValueError:
+        confirm = DEFAULT_CONFIRM_FAILS
+    try:
+        timeout = float((raw.get("TIMEOUT_SECS", [""])[-1])
+                        or DEFAULT_TIMEOUT)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
+
+    first = lambda key: (raw.get(key, [""])[-1].strip())  # noqa: E731
+    return {
+        "http": http_probes,
+        "dns": dns_probes,
+        "ntfy_url": first("NTFY_URL").rstrip("/"),
+        "ntfy_token": first("NTFY_TOKEN"),
+        "topic": first("NTFY_TOPIC") or DEFAULT_TOPIC,
+        "timeout": timeout,
+        "confirm_fails": max(confirm, 1),
+    }
+
+
+# ---------------------------------------------------------------- probes
+
+def http_probe(url, timeout):
+    """GET -> (ok, latency_ms, error). 2xx/3xx ok; JSON healthy:false is down."""
+    req = urllib.request.Request(url, method="GET",
+                                 headers={"User-Agent": "pi-service-probe"})
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(4096).decode("utf-8", "replace")
+            code = resp.getcode()
+    except urllib.error.HTTPError as exc:
+        return False, elapsed_ms(start), f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return False, elapsed_ms(start), str(exc)[:120]
+    latency = elapsed_ms(start)
+    if not 200 <= code < 400:
+        return False, latency, f"HTTP {code}"
+    stripped = body.lstrip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, dict) and "healthy" in data \
+                    and data["healthy"] is not True:
+                return False, latency, "healthz reports unhealthy"
+        except ValueError:
+            pass
+    return True, latency, None
+
+
+def elapsed_ms(start):
+    return int((time.monotonic() - start) * 1000)
+
+
+def build_dns_query(domain, query_id=0):
+    """A-record query packet for domain -> bytes (deterministic, testable)."""
+    parts = []
+    for label in domain.split("."):
+        if not label or len(label) > 63:
+            raise ValueError(f"bad dns label in {domain!r}")
+        parts.append(bytes([len(label)]) + label.encode("ascii"))
+    question = b"".join(parts) + b"\x00" + struct.pack("!HH", 1, 1)
+    header = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+    return header + question
+
+
+def parse_dns_response(data):
+    """Response packet -> (rcode, ancount); (None, None) if unparseable."""
+    if len(data) < 12:
+        return None, None
+    (_ident, flags, _qd, an, _ns, _ar) = struct.unpack("!HHHHHH", data[:12])
+    return flags & 0x000F, an
+
+
+def dns_probe(server, domain, timeout):
+    """UDP A query -> (ok, latency_ms, error)."""
+    try:
+        packet = build_dns_query(domain, query_id=0x1234)
+    except ValueError as exc:
+        return False, 0, str(exc)
+    host, _, port = server.rpartition(":")
+    if port.isdigit():
+        addr = (host, int(port))
+    else:
+        addr = (server, 53)
+    start = time.monotonic()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.sendto(packet, addr)
+        data, _ = sock.recvfrom(512)
+    except (socket.timeout, OSError) as exc:
+        return False, elapsed_ms(start), str(exc)[:120]
+    finally:
+        sock.close()
+    latency = elapsed_ms(start)
+    rcode, answers = parse_dns_response(data)
+    if rcode is None:
+        return False, latency, "unparseable DNS response"
+    if rcode != 0:
+        return False, latency, f"DNS rcode {rcode}"
+    if not answers:
+        return False, latency, "DNS: no answer records"
+    return True, latency, None
+
+
+# ------------------------------------------------------------------ ntfy
+
+def ntfy_post(cfg, title, message, tags, timeout):
+    """Publish the digest; True on any 2xx. Never raises."""
+    if not (cfg["ntfy_url"] and cfg["ntfy_token"]):
+        print("service-probe: NTFY_URL/NTFY_TOKEN not configured — "
+              "digest not published", file=sys.stderr)
+        return False
+    payload = {"topic": cfg["topic"], "message": message, "title": title,
+               "tags": tags}
+    req = urllib.request.Request(
+        cfg["ntfy_url"], data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {cfg['ntfy_token']}",
+                 "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.getcode() < 300
+    except urllib.error.HTTPError as exc:
+        print(f"service-probe: ntfy HTTP {exc.code}: "
+              f"{exc.read(200).decode('utf-8', 'replace')}", file=sys.stderr)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"service-probe: ntfy publish failed: {exc}", file=sys.stderr)
+    return False
+
+
+# ----------------------------------------------------------------- state
+
+def load_state(path):
+    """state.json -> {"probes": {...}}. Missing/corrupt -> fresh."""
+    fresh = {"probes": {}}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return fresh
+    except ValueError:
+        print("service-probe: state file corrupt, starting fresh",
+              file=sys.stderr)
+        return fresh
+    probes = data.get("probes")
+    return {"probes": probes} if isinstance(probes, dict) else fresh
+
+
+def save_json_atomic(path, obj):
+    """Write JSON atomically (tmp + rename). False on failure."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except OSError as exc:
+        print(f"service-probe: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+
+
+# ------------------------------------------------------------------ core
+
+def apply_result(name, kind, target, ok, latency, error, cfg, entry,
+                 events, now):
+    """Fold one probe result into state; append DOWN/RECOVERY events."""
+    was = entry.get("status")
+    if ok:
+        streak = int(entry.get("failures", 0))
+        entry["failures"] = 0
+        entry["error"] = None
+        entry["latency_ms"] = latency
+        if was == "down":
+            down_since = parse_ts(entry.get("down_since"))
+            dur = ""
+            if down_since:
+                mins = max(int((now - down_since).total_seconds()) // 60, 0)
+                dur = f" after {mins}m" if mins else ""
+            events.append(f"{name} back UP{dur} "
+                          f"({latency} ms)")
+            entry["status"] = "up"
+            entry["last_change"] = now.isoformat(timespec="seconds")
+            entry.pop("down_since", None)
+        elif was != "up":
+            entry["status"] = "up"
+            entry["last_change"] = now.isoformat(timespec="seconds")
+    else:
+        streak = int(entry.get("failures", 0)) + 1
+        entry["failures"] = streak
+        entry["error"] = error
+        if was != "down" and streak >= cfg["confirm_fails"]:
+            events.append(f"{name} DOWN: {error}")
+            entry["status"] = "down"
+            entry["last_change"] = now.isoformat(timespec="seconds")
+            entry["down_since"] = now.isoformat(timespec="seconds")
+    entry.update({"kind": kind, "target": target})
+
+
+def parse_ts(text):
+    try:
+        return datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_digest(events):
+    """Events -> (title, message, tags)."""
+    downs = [e for e in events if " DOWN" in e]
+    lines = list(events)
+    n = len(events)
+    title = f"service-probe: {n} alert" + ("s" if n != 1 else "")
+    if downs:
+        title = (f"service-probe: {len(downs)} service"
+                 f"{'s' if len(downs) != 1 else ''} DOWN")
+    tags = ["rotating_light"] if downs else ["white_check_mark"]
+    return title, "\n".join(lines), tags
+
+
+def status_document(state, now):
+    """state -> the status.json the portal renders (short names)."""
+    probes = {}
+    for key, e in state["probes"].items():
+        name = key.split(":", 1)[1] if ":" in key else key
+        probes[name] = {
+            "kind": e.get("kind"),
+            "target": e.get("target"),
+            "status": e.get("status", "?"),
+            "latency_ms": e.get("latency_ms"),
+            "error": e.get("error"),
+            "last_change": e.get("last_change"),
+        }
+    return {"generated": now.isoformat(timespec="seconds"),
+            "probes": probes}
+
+
+def run(cfg, state_path, dry_run=False, verbose=False):
+    """One sweep: probe everything, update state, maybe publish, persist."""
+    probes = cfg["http"] + [(n, s) for n, s, _ in cfg["dns"]]
+    if not probes:
+        print("service-probe: no probes configured "
+              "(PROBE_HTTP / PROBE_DNS)", file=sys.stderr)
+        return 1
+
+    state = load_state(state_path)
+    entries = state["probes"]
+    events: list[str] = []
+    now = datetime.now(timezone.utc)
+
+    for name, url in cfg["http"]:
+        ok, latency, error = http_probe(url, cfg["timeout"])
+        if verbose:
+            print(f"  http {name}: {'ok' if ok else 'FAIL'}"
+                  + (f" {error}" if error else f" {latency} ms"))
+        entry = entries.setdefault(f"http:{name}", {})
+        apply_result(name, "http", url, ok, latency, error, cfg, entry,
+                     events, now)
+    for name, server, domain in cfg["dns"]:
+        ok, latency, error = dns_probe(server, domain, cfg["timeout"])
+        if verbose:
+            print(f"  dns {name}: {'ok' if ok else 'FAIL'}"
+                  + (f" {error}" if error else f" {latency} ms"))
+        entry = entries.setdefault(f"dns:{name}", {})
+        target = f"{server} ({domain})"
+        apply_result(name, "dns", target, ok, latency, error, cfg, entry,
+                     events, now)
+
+    up = sum(1 for e in entries.values() if e.get("status") == "up")
+    down = sum(1 for e in entries.values() if e.get("status") == "down")
+    print(f"✓ {up} up, {down} down"
+          + (f" — {len(events)} alert(s)" if events else ""))
+
+    published = False
+    if events:
+        title, message, tags = build_digest(events)
+        if dry_run:
+            print(f"[dry-run] would publish to {cfg['ntfy_url'] or '(ntfy)'} "
+                  f"topic '{cfg['topic']}':\n{message}")
+        else:
+            published = ntfy_post(cfg, title, message, tags, cfg["timeout"])
+            print(("✓ published" if published else "✗ could not publish")
+                  + f" {len(events)} alert(s) to topic '{cfg['topic']}'")
+
+    if dry_run:
+        return 0
+    status_path = Path(state_path).parent / "status.json"
+    if not save_json_atomic(state_path, state):
+        return 1
+    save_json_atomic(status_path, status_document(state, now))
+    if events and not published:
+        print("service-probe: digest was NOT delivered — say this loudly "
+              "in the journal; state saved anyway", file=sys.stderr)
+    return 0
+
+
+def print_state(state_path):
+    state = load_state(state_path)
+    probes = state["probes"]
+    if not probes:
+        print(f"(no state at {state_path} — nothing probed yet)")
+        return 0
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"# state at {state_path}  (listed {now})")
+    for key in sorted(probes):
+        e = probes[key]
+        status = e.get("status", "?")
+        latency = e.get("latency_ms")
+        lat = f" {latency} ms" if status == "up" and latency is not None \
+            else ""
+        err = f" — {e['error']}" if e.get("error") else ""
+        fails = f" [fails: {e['failures']}]" if e.get("failures") else ""
+        print(f"  {key}: {status}{lat}{fails}{err}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="probe services, alert DOWN/UP via ntfy, keep status.json")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"config file (default {DEFAULT_CONFIG})")
+    ap.add_argument("--state", default=DEFAULT_STATE,
+                    help=f"state file (default {DEFAULT_STATE})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the digest, publish and persist nothing")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="per-probe detail")
+    ap.add_argument("--list", action="store_true",
+                    help="print last-known probe status and exit")
+    args = ap.parse_args(argv)
+
+    state_path = Path(args.state).expanduser()
+    if args.list:
+        return print_state(state_path)
+    return run(load_config(args.config), state_path,
+               dry_run=args.dry_run, verbose=args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
