@@ -36,7 +36,7 @@ phone authenticate; the creation passwords are thrown away — reset with
 
 | User | Role | Access | Used by |
 |---|---|---|---|
-| `publisher` | user | write-only grant on `radar`, `loop-heartbeat`, `backups`, `releases` | scripts on the Pi: loop-heartbeat, radar pings, backup jobs, release-watch |
+| `publisher` | user | write-only grant on `radar`, `loop-heartbeat`, `backups`, `releases`, `services` | scripts on the Pi: loop-heartbeat, radar pings, backup jobs, release-watch, service-probe |
 | `subscriber` | user | read-only grant on those topics | the owner's phone |
 
 Tokens live in `/etc/loop-heartbeat.conf` (NTFY_TOKEN) and
@@ -54,6 +54,7 @@ what you want to hear about:
 | `loop-heartbeat` | loop-heartbeat (built in) | dead-man's-switch alerts: silent jobs, failure streaks, zombies, down services, stale timers — plus recovery notices |
 | `backups` | pi-backup (built in) | daily backup results, prune notices, weekly restore-drill PASS/FAIL, failures at high priority |
 | `releases` | release-watch (built in) | upstream release digests for the deployed software (ntfy, AdGuardHome, ais-catcher) and watched status pages — one notification per sweep, only when something moved |
+| `services` | service-probe (built in) | service DOWN alerts (after 2 consecutive failed probes) and recovery notices for the dashboards, portal, funnel endpoints, ntfy itself and AdGuardHome DNS; per-probe status also lands in `~/.local/state/service-probe/status.json` for the portal |
 
 Naming rule for new topics: the topic is named after the job that owns
 it, not the content it carries — `x-writer` publishes to `x-writer`,
@@ -113,6 +114,12 @@ docstring; inspect live state with `release-watch --list`):
 
     sudo ntfy access publisher releases write-only
     sudo ntfy access subscriber releases read-only
+
+Grant for the `services` topic (service-probe — see the script
+docstring; inspect live state with `service-probe --list`):
+
+    sudo ntfy access publisher services write-only
+    sudo ntfy access subscriber services read-only
 
 The server survives reboots (systemd `WantedBy=multi-user.target`,
 `Restart=on-failure`). Restarting ntfy does not touch any other service;

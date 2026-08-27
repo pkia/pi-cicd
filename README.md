@@ -38,7 +38,7 @@ flowchart TB
     DEPLOY -->|unhealthy? rollback to\nlast running commit| SVC
 ```
 
-## The six components
+## The components
 
 | Component | What it does |
 |---|---|
@@ -50,6 +50,8 @@ flowchart TB
 | **`loop-heartbeat`** | Dead-man's switch for the scheduled loop, every 30 min via systemd. Reads the Hermes cron jobs' durable execution history (`hermes cron runs`) and alerts when a watched job missed its schedule, failed repeatedly, is stuck "running", or vanished — plus optional systemd service/timer staleness checks. Alert dedupe + recovery notices; silent when green. |
 | **`ntfy-notify`** | Publisher helper for the self-hosted ntfy notification backbone: one topic per job, token auth, best-effort delivery. loop-heartbeat publishes its alerts there natively; scripts and future backup jobs use this. See [docs/notifications.md](docs/notifications.md). |
 | **`pi-backup`** | Deduplicated, encrypted borg backups of the /etc state git cannot hold (ntfy server, loop configs, units), daily at 03:30, pruned to 7 daily / 4 weekly / 6 monthly. A **weekly restore drill** extracts a fresh archive and byte-compares it against the live sources — PASS/FAIL published to the ntfy `backups` topic. See [docs/backups.md](docs/backups.md). |
+| **`release-watch`** | Upstream release watcher, twice daily: polls the GitHub releases API (and sha256-hashed pages) of every piece of software this machine runs, digests changes to the ntfy `releases` topic. First observation is a baseline, not an alert. |
+| **`service-probe`** | Uptime scoreboard, every 5 min: one stdlib probe per long-running service — HTTP checks for the dashboards, portal and public funnel endpoints (JSON `healthy:false` counts as down), a real DNS query for AdGuardHome — with DOWN confirmation after 2 consecutive failures, recovery notices, alerts to the ntfy `services` topic, and a `status.json` the portal renders. Inspect live state with `service-probe --list`. |
 
 ## Why it is built this way
 

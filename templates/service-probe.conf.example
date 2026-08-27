@@ -1,0 +1,16 @@
+# service-probe — uptime scoreboard. Provisioned on the host, never
+# committed (same rule as every other /etc conf here). One probe per
+# long-running thing this box serves; DNS is checked with a real query.
+# Local dashboards:
+#   maritime  :8000        kiosk-home :8091 (portal is :8090)
+#   cs2-dash  :8001        sat-audio  :8085
+#   mark-site :8089        cs2-tracker healthz :8092 (JSON healthy gate)
+# Public funnel endpoints (443 and 8443 both work; 8443 shown):
+#   /mark/ and /shelfmate are proxied; /cs2trk is served at funnel root
+# ntfy self-check: /v1/health returns {"healthy": true}
+NTFY_URL=http://100.122.94.33:6839
+NTFY_TOKEN=REPLACE_WITH_PUBLISHER_TOKEN
+NTFY_TOPIC=services
+CONFIRM_FAILS=2
+PROBE_HTTP=maritime=http://127.0.0.1:8000/,kiosk-home=http://127.0.0.1:8091/,portal=http://127.0.0.1:8090/,cs2-dash=http://127.0.0.1:8001/,sat-audio=http://127.0.0.1:8085/,mark-site=http://127.0.0.1:8089/,cs2-tracker=http://127.0.0.1:8092/healthz,ntfy=http://100.122.94.33:6839/v1/health,funnel-mark=https://pi.example.ts.net:8443/mark/,funnel-shelfmate=https://pi.example.ts.net:8443/shelfmate,funnel-root=https://pi.example.ts.net:8443/
+PROBE_DNS=adguard=127.0.0.1:53:tailscale.com

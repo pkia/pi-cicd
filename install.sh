@@ -20,8 +20,10 @@ ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
 ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
 ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
 ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
+ln -sf "$REPO_DIR/service-probe" "$BIN_DIR/service-probe"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
-         "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch"
+         "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
+         "$REPO_DIR/service-probe"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -85,6 +87,21 @@ if [ -f /etc/release-watch.conf ]; then
     echo "release-watch timer installed and active"
 else
     echo "note: /etc/release-watch.conf not found - release-watch not installed"
+fi
+
+# service-probe: uptime scoreboard for the long-running services.
+# Needs /etc/service-probe.conf (NTFY keys, PROBE_HTTP/PROBE_DNS) and the
+# 'services' topic ACLs — see the script's docstring,
+# templates/service-probe.conf.example and docs/notifications.md.
+# Install is skipped silently when the config is absent.
+if [ -f /etc/service-probe.conf ]; then
+    sudo cp "$REPO_DIR/systemd/service-probe.service" \
+            "$REPO_DIR/systemd/service-probe.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now service-probe.timer
+    echo "service-probe timer installed and active"
+else
+    echo "note: /etc/service-probe.conf not found - service-probe not installed"
 fi
 
 echo
