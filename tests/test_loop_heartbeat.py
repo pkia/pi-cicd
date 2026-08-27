@@ -464,9 +464,30 @@ def test_parse_healthz():
 
 
 def test_check_healthz_ok():
-    # real local server: the tracker itself is running on this box
-    alerts = lh.check_healthz("http://127.0.0.1:8092/healthz", "cs2-tracker")
-    assert alerts == []
+    # hermetic local server: the healthy path must produce no alerts
+    # (the previous live version probed :8092, which only exists on the Pi
+    # and made CI red — see run 32978462285)
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"healthy":true}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        alerts = lh.check_healthz(
+            f"http://127.0.0.1:{srv.server_port}/healthz", "fake")
+        assert alerts == []
+    finally:
+        srv.shutdown()
 
 
 def test_check_healthz_down():
