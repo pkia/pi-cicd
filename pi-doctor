@@ -40,6 +40,8 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 
+import ntfy_lib
+
 # --------------------------------------------------------------------------
 # project registry — the source of truth for what "healthy" means here.
 # healthz endpoints (self-healer aware) are checked harder than plain UI.
@@ -373,6 +375,25 @@ def _ntfy_token():
     return ""
 
 
+def check_mute(mute_file=None):
+    """A standing global mute is a finding: the kill switch must not
+    silently silence the box forever. (Doctor reports; owner unmutes.)"""
+    if mute_file is None:  # call-time default, patchable in tests
+        mute_file = ntfy_lib.DEFAULT_MUTE_FILE
+    is_muted, reason = ntfy_lib.muted(mute_file)
+    if is_muted:
+        age = ""
+        try:
+            mtime = os.path.getmtime(mute_file)
+            hours = (time.time() - mtime) / 3600
+            age = f" for {hours:.0f}h" if hours >= 1 else ""
+        except OSError:
+            pass
+        return ([f"ntfy:muted — every publisher on this box is silenced"
+                 f"{age} ({reason}); unmute with: ntfy-notify --unmute"], [])
+    return [], []
+
+
 def main():
     verbose = "--verbose" in sys.argv
     now = datetime.now()
@@ -398,6 +419,12 @@ def main():
         all_fixes += x
     except Exception as e:
         all_findings.append(f"doctor:sdr:check-error {type(e).__name__}: {e}")
+    try:
+        f, x = check_mute()
+        all_findings += f
+        all_fixes += x
+    except Exception as e:
+        all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
 
     report = format_report(all_findings, all_fixes, now)
     if verbose:

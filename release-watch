@@ -58,6 +58,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import ntfy_lib
+
 DEFAULT_CONFIG = "/etc/release-watch.conf"
 DEFAULT_STATE = "~/.local/state/release-watch/state.json"
 DEFAULT_TOPIC = "releases"
@@ -175,26 +177,17 @@ def fetch_page_sha(url, timeout):
 
 
 def ntfy_post(cfg, title, message, tags, timeout):
-    """Publish the digest; True on any 2xx. Never raises."""
+    """Publish the digest via the shared ntfy_lib; True on any 2xx or
+    muted. Never raises."""
     if not (cfg["ntfy_url"] and cfg["ntfy_token"]):
         print("release-watch: NTFY_URL/NTFY_TOKEN not configured — "
               "digest not published", file=sys.stderr)
         return False
     payload = {"topic": cfg["topic"], "message": message, "title": title,
                "tags": tags}
-    req = urllib.request.Request(
-        cfg["ntfy_url"], data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {cfg['ntfy_token']}",
-                 "Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.getcode() < 300
-    except urllib.error.HTTPError as exc:
-        print(f"release-watch: ntfy HTTP {exc.code}: "
-              f"{exc.read(200).decode('utf-8', 'replace')}", file=sys.stderr)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        print(f"release-watch: ntfy publish failed: {exc}", file=sys.stderr)
-    return False
+    return ntfy_lib.publish(
+        cfg["ntfy_url"], {"Authorization": f"Bearer {cfg['ntfy_token']}"},
+        payload, timeout=timeout, _urlopen=urllib.request.urlopen)
 
 
 # ----------------------------------------------------------------- state

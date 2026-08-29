@@ -161,7 +161,11 @@ def main(argv=None):
     ok = notify(cfg, topic, args.title, args.message, args.tag, priority,
                 dry_run=args.dry_run)
     if ok and not args.dry_run:
-        print(f"✓ published to {cfg['url']} topic '{topic}'")
+        is_muted, reason = ntfy_lib.muted()
+        if is_muted:
+            print(f"🔇 suppressed (muted: {reason}) — nothing was sent")
+        else:
+            print(f"✓ published to {cfg['url']} topic '{topic}'")
     return 0 if ok else 1
 
 

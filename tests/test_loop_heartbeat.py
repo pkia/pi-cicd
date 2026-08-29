@@ -516,3 +516,32 @@ def test_check_healthz_unhealthy_flag():
         assert alerts and alerts[0]["key"] == "healthz:fake:unhealthy"
     finally:
         srv.shutdown()
+
+
+# ---------------------------------------- shared ntfy_lib delegation
+
+def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
+    """Storm path: global mute file silences the ntfy channel."""
+    mute = tmp_path / "mute"
+    mute.write_text("storm drill\n")
+    monkeypatch.setattr(lh.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
+
+    def boom(req, timeout=None):
+        raise AssertionError("network must not be touched while muted")
+
+    monkeypatch.setattr(lh.urllib.request, "urlopen", boom)
+    assert lh.ntfy_post("http://n:6839", {}, {"topic": "t"}) is True
+    assert "muted" in capsys.readouterr().err
+
+
+def test_ntfy_post_timeout_sanitised_by_shared_lib(monkeypatch):
+    """Hang path: bogus timeout never reaches the network."""
+    seen = {}
+
+    def fake(req, timeout=None):
+        seen["t"] = timeout
+        return Resp(200)
+
+    monkeypatch.setattr(lh.urllib.request, "urlopen", fake)
+    assert lh.ntfy_post("http://n:6839", {}, {"topic": "t"}, timeout=None) is True
+    assert seen["t"] == lh.ntfy_lib.DEFAULT_TIMEOUT

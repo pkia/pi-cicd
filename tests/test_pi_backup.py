@@ -372,3 +372,19 @@ def test_main_list_ignores_missing_config_gracefully(tmp_path, capsys):
     rc = pb.main(["--config", "/nonexistent", "list"])
     assert rc == 1
     assert capsys.readouterr().err
+
+
+# ---------------------------------------- shared ntfy_lib delegation
+
+def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
+    mute = tmp_path / "mute"
+    mute.write_text("storm drill\n")
+    monkeypatch.setattr(pb.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
+
+    def boom(req, timeout=None):
+        raise AssertionError("network must not be touched while muted")
+
+    monkeypatch.setattr(pb.urllib.request, "urlopen", boom)
+    assert pb.ntfy_post("http://n", {"Authorization": "Bearer x"},
+                        {"topic": "backups"}) is True
+    assert "muted" in capsys.readouterr().err

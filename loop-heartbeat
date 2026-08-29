@@ -51,6 +51,8 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import ntfy_lib
+
 DEFAULT_WATCH_JOBS = [
     "Daily devlog post",
     "X content writer",
@@ -472,16 +474,9 @@ def ntfy_publish(cfg, subject, body):
 
 
 def ntfy_post(url, headers, payload, timeout=15):
-    """POST JSON to the ntfy root endpoint; True on any 2xx. Isolated for tests."""
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode("utf-8"),
-            headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.getcode() < 300
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        print(f"note: ntfy publish failed: {exc}", file=sys.stderr)
-        return False
+    """POST JSON via the shared ntfy_lib (mute + timeouts); True on 2xx."""
+    return ntfy_lib.publish(url, headers, payload, timeout=timeout,
+                            _urlopen=urllib.request.urlopen)
 
 
 # ----------------------------------------------------------------- main
