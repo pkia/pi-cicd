@@ -14,6 +14,13 @@ BIN_DIR="$HOME/.local/bin"
 }
 
 mkdir -p "$BIN_DIR"
+
+# State dir for the global alert-storm kill switch (ntfy_lib mute file).
+# Created as the invoking user (ev) BEFORE any root-run tool can create
+# it root-owned — pi-backup runs as root and would otherwise lock the
+# owner out of ntfy-notify --mute (see docs/notifications.md).
+mkdir -p "$HOME/.local/state/ntfy"
+
 ln -sf "$REPO_DIR/project-guard" "$BIN_DIR/project-guard"
 ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
 ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"

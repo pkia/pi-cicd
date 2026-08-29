@@ -99,12 +99,25 @@ def notify(cfg, topic, title, message, tags, priority, dry_run=False,
 
 
 def set_mute(mute_file, reason):
-    """Create the global mute file (first line = free-text reason)."""
+    """Create the global mute file (first line = free-text reason).
+
+    Returns True on success; False (with a stderr hint) when the mute
+    dir is not writable — typically a root-run tool created it root-
+    owned, which would lock the owner out of the kill switch.
+    """
     p = Path(mute_file)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text((reason or "no reason given") + "\n", encoding="utf-8")
-    tmp.replace(p)  # atomic: publishers see old or new, never partial
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text((reason or "no reason given") + "\n",
+                       encoding="utf-8")
+        tmp.replace(p)  # atomic: publishers see old or new, never partial
+        return True
+    except OSError as exc:
+        print(f"ntfy-notify: cannot write mute file {mute_file}: {exc}\n"
+              f"  (state dir root-owned? fix with: "
+              f"sudo chown ev:ev {p.parent})", file=sys.stderr)
+        return False
 
 
 def main(argv=None):
@@ -132,7 +145,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.mute is not None:
-        set_mute(MUTE_FILE, args.mute.strip())
+        if not set_mute(MUTE_FILE, args.mute.strip()):
+            return 1
         is_muted, reason = ntfy_lib.muted(MUTE_FILE)
         print(f"🔇 muted ({reason}) — every publisher on this box is "
               f"silent until --unmute")
