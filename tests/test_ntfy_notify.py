@@ -180,3 +180,76 @@ def test_cli_dry_run(monkeypatch, tmp_path, capsys):
 
 def test_default_config_path_points_at_etc():
     assert nn.DEFAULT_CONFIG == "/etc/ntfy-notify.conf"
+
+
+# ------------------------------------------------- shared-library mute
+
+def test_notify_suppressed_when_global_mute_file_present(
+        monkeypatch, tmp_path, capsys):
+    """Storm path: mute file present -> no network, reported delivered."""
+    mute = tmp_path / "mute"
+    mute.write_text("storm drill\n")
+    monkeypatch.setattr(nn.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
+
+    def boom(req, timeout=None):
+        raise AssertionError("network must not be touched while muted")
+
+    monkeypatch.setattr(nn.urllib.request, "urlopen", boom)
+    cfg = {"url": "http://x", "token": "tk", "topic": "radar"}
+    assert nn.notify(cfg, "radar", "t", "m", [], None) is True
+    assert "muted" in capsys.readouterr().err
+
+
+def test_notify_timeout_always_finite(monkeypatch):
+    """Hang path: a bogus timeout must be sanitised by ntfy_lib."""
+    seen = {}
+
+    def fake(req, timeout=None):
+        seen["timeout"] = timeout
+        return FakeResponse(200)
+
+    monkeypatch.setattr(nn.urllib.request, "urlopen", fake)
+    cfg = {"url": "http://x", "token": "tk", "topic": "radar"}
+    assert nn.notify(cfg, "radar", "t", "m", [], None, timeout=None) is True
+    assert seen["timeout"] == nn.ntfy_lib.DEFAULT_TIMEOUT
+
+
+# ---------------------------------------------------------- mute CLI
+
+def test_cli_mute_writes_reason_file(monkeypatch, tmp_path, capsys):
+    mute = tmp_path / "mute"
+    monkeypatch.setattr(nn, "MUTE_FILE", str(mute))
+    rc = nn.main(["--mute", "ais-catcher storm", "unused"])
+    assert rc == 0
+    assert mute.read_text().strip() == "ais-catcher storm"
+    assert "muted" in capsys.readouterr().out.lower()
+
+
+def test_cli_mute_without_reason_still_mutes(monkeypatch, tmp_path):
+    mute = tmp_path / "mute"
+    monkeypatch.setattr(nn, "MUTE_FILE", str(mute))
+    assert nn.main(["--mute"]) == 0
+    assert mute.exists()
+
+
+def test_cli_unmute_removes_file(monkeypatch, tmp_path, capsys):
+    mute = tmp_path / "mute"
+    mute.write_text("storm\n")
+    monkeypatch.setattr(nn, "MUTE_FILE", str(mute))
+    rc = nn.main(["--unmute", "unused"])
+    assert rc == 0
+    assert not mute.exists()
+
+
+def test_cli_unmute_when_not_muted_is_fine(monkeypatch, tmp_path):
+    monkeypatch.setattr(nn, "MUTE_FILE", str(tmp_path / "mute"))
+    assert nn.main(["--unmute", "unused"]) == 0
+
+
+def test_cli_mute_status_reports_state(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(nn, "MUTE_FILE", str(tmp_path / "mute"))
+    assert nn.main(["--mute-status", "unused"]) == 1   # not muted
+    Path(str(tmp_path / "mute")).write_text("storm\n")
+    assert nn.main(["--mute-status", "unused"]) == 0   # muted
+    assert "storm" in capsys.readouterr().out
+

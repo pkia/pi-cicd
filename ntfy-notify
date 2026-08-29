@@ -17,6 +17,12 @@ committed:
     NTFY_TOKEN  access token of the 'publisher' ntfy user
     NTFY_TOPIC  default topic when -t is not given
 
+Alert-storm kill switch (2026-08-29): `--mute REASON` drops one file
+that suppresses EVERY publisher on the box (they all share ntfy_lib);
+`--unmute` removes it, `--mute-status` reports it. Muted publishes are
+reported as delivered so jobs keep flowing; pi-doctor reports a
+standing mute so it can't silence the box unnoticed.
+
 Exit 0 on a 2xx publish, non-zero otherwise — callers can treat failure
 as "log it and move on" without breaking their own success path.
 
@@ -33,7 +39,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import ntfy_lib
+
 DEFAULT_CONFIG = "/etc/ntfy-notify.conf"
+MUTE_FILE = ntfy_lib.DEFAULT_MUTE_FILE
 
 PRIORITIES = {  # ntfy's 5-level scale, so callers can say -p high
     "min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5,
@@ -66,7 +75,7 @@ def load_config(path):
 
 def notify(cfg, topic, title, message, tags, priority, dry_run=False,
            timeout=15):
-    """POST one JSON message to the ntfy root; True on any 2xx."""
+    """Publish via the shared ntfy_lib layer; True on any 2xx or muted."""
     if not (cfg.get("url") and cfg.get("token") and topic):
         print("ntfy-notify: NTFY_URL/NTFY_TOKEN (config) and a topic are "
               "all required", file=sys.stderr)
@@ -82,27 +91,27 @@ def notify(cfg, topic, title, message, tags, priority, dry_run=False,
         print(f"[dry-run] would publish to {cfg['url']} topic '{topic}':\n"
               f"  {json.dumps(payload, ensure_ascii=False)}")
         return True
-    req = urllib.request.Request(
-        cfg["url"], data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {cfg['token']}",
-                 "Content-Type": "application/json"},
-        method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            code = resp.getcode()
-            return 200 <= code < 300
-    except urllib.error.HTTPError as exc:
-        body = exc.read(200).decode("utf-8", "replace")
-        print(f"ntfy-notify: HTTP {exc.code}: {body}", file=sys.stderr)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        print(f"ntfy-notify: {exc}", file=sys.stderr)
-    return False
+    return ntfy_lib.publish(
+        cfg["url"], {"Authorization": f"Bearer {cfg['token']}"}, payload,
+        timeout=timeout,
+        # call-time lookup so tests can patch urllib.request.urlopen
+        _urlopen=urllib.request.urlopen)
+
+
+def set_mute(mute_file, reason):
+    """Create the global mute file (first line = free-text reason)."""
+    p = Path(mute_file)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text((reason or "no reason given") + "\n", encoding="utf-8")
+    tmp.replace(p)  # atomic: publishers see old or new, never partial
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="publish one notification to the ntfy backbone")
-    ap.add_argument("message", help="notification body text")
+    ap.add_argument("message", nargs="?", default="",
+                    help="notification body text")
     ap.add_argument("-t", "--topic", default="",
                     help="topic to publish to (default: NTFY_TOPIC from config)")
     ap.add_argument("-T", "--title", default="", help="notification title")
@@ -113,7 +122,32 @@ def main(argv=None):
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--dry-run", action="store_true",
                     help="print the payload, publish nothing")
+    ap.add_argument("--mute", nargs="?", const="", default=None,
+                    metavar="REASON",
+                    help="mute EVERY publisher on the box (kill switch)")
+    ap.add_argument("--unmute", action="store_true",
+                    help="remove the global mute file")
+    ap.add_argument("--mute-status", action="store_true",
+                    help="report whether publishers are muted")
     args = ap.parse_args(argv)
+
+    if args.mute is not None:
+        set_mute(MUTE_FILE, args.mute.strip())
+        is_muted, reason = ntfy_lib.muted(MUTE_FILE)
+        print(f"🔇 muted ({reason}) — every publisher on this box is "
+              f"silent until --unmute")
+        return 0
+    if args.unmute:
+        Path(MUTE_FILE).unlink(missing_ok=True)
+        print("🔊 unmuted — publishers deliver again")
+        return 0
+    if args.mute_status:
+        is_muted, reason = ntfy_lib.muted(MUTE_FILE)
+        if is_muted:
+            print(f"muted: {reason}")
+            return 0
+        print("not muted")
+        return 1
 
     priority = None
     if args.priority is not None:
