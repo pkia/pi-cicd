@@ -255,6 +255,79 @@ def check_system():
     return findings, fixes
 
 
+# ---------------------------------------------------------------- sdr
+
+def check_sdr():
+    """Detect a wedged RTL-SDR dongle and revive it with USBDEVFS_RESET.
+
+    Wedge signature (seen 2026-08-27, since ~Aug 23 for rtl_power): the
+    dongle enumerates and the USB claim succeeds, but zero samples flow —
+    ais-catcher logs 'RTLSDR: timeout' ~40x/min forever, rtl_power/rtl_sdr
+    produce nothing, NOAA captures fail 'could not open SDR'. A USB protocol
+    reset (not sysfs authorize toggling — that does NOT clear it) restores
+    the stream. Skipped during satellite captures (SDR handed to NOAA)."""
+    findings, fixes = [], []
+
+    rc, _ = run(["systemctl", "is-active", "ais-catcher"])
+    if rc != 0 or _sat_capture_running():
+        return findings, fixes
+    rc, out = run(["journalctl", "-u", "ais-catcher", "--since", "-10 min",
+                   "--no-pager", "-q"])
+    timeouts = sum(1 for l in (out or "").splitlines()
+                   if "RTLSDR: timeout" in l)
+    if timeouts < 30:      # wedged ≈ 400/10min; scan blips are single digits
+        return findings, fixes
+
+    if _sdr_usb_reset():
+        time.sleep(20)     # let ais-catcher re-attach and stream (or not)
+        rc, pid = run(["systemctl", "show", "ais-catcher",
+                       "-p", "MainPID", "--value"])
+        if pid.isdigit():
+            rc, out = run(["journalctl", "-u", "ais-catcher", "_PID=" + pid,
+                           "--no-pager", "-q"])
+            still = sum(1 for l in (out or "").splitlines()
+                        if "RTLSDR: timeout" in l)
+        else:
+            still = 1        # couldn't verify — be conservative
+        if still == 0:
+            fixes.append(f"un-wedged RTL-SDR via USB reset "
+                         f"({timeouts} timeouts/10min)")
+        else:
+            findings.append("sys:sdr-wedged — USB reset did not restore stream")
+    else:
+        findings.append("sys:sdr-wedged — USBDEVFS_RESET failed, "
+                        "needs physical replug")
+    return findings, fixes
+
+
+def _sdr_usb_reset() -> bool:
+    """USBDEVFS_RESET the 0bda:2838 dongle, restarting both consumers."""
+    import fcntl
+    rc, out = run(["lsusb"])
+    path = None
+    for line in (out or "").splitlines():
+        m = re.match(r"Bus (\d+) Device (\d+): ID 0bda:2838", line)
+        if m:
+            path = f"/dev/bus/usb/{int(m.group(1)):03d}/{int(m.group(2)):03d}"
+    if not path or not os.path.exists(path):
+        return False
+    run(["sudo", "-n", "systemctl", "stop", "sdr-monitor", "ais-catcher"], 90)
+    time.sleep(2)
+    try:
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            fcntl.ioctl(fd, 21780, 0)     # USBDEVFS_RESET
+        finally:
+            os.close(fd)
+    except OSError:
+        run(["sudo", "-n", "systemctl", "start", "ais-catcher",
+             "sdr-monitor"], 90)
+        return False
+    time.sleep(3)
+    run(["sudo", "-n", "systemctl", "start", "ais-catcher", "sdr-monitor"], 90)
+    return True
+
+
 # ---------------------------------------------------------------- reporting
 
 def load_state():
@@ -319,6 +392,12 @@ def main():
         all_fixes += x
     except Exception as e:
         all_findings.append(f"doctor:system:check-error {type(e).__name__}: {e}")
+    try:
+        f, x = check_sdr()
+        all_findings += f
+        all_fixes += x
+    except Exception as e:
+        all_findings.append(f"doctor:sdr:check-error {type(e).__name__}: {e}")
 
     report = format_report(all_findings, all_fixes, now)
     if verbose:

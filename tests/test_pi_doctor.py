@@ -157,3 +157,18 @@ def test_disk_pct_math():
         except OSError:
             raised = True
         assert raised  # documented: main() catches it as doctor:system error
+\n
+
+# ------------------------------------------------------- standing mute
+
+def test_standing_mute_is_a_finding(tmp_path):
+    import ntfy_lib
+    mute = tmp_path / "mute"
+    mute.write_text("storm since monday\n")
+    f, x = doc.check_mute(str(mute))
+    assert f and "muted" in f[0] and "storm since monday" in f[0]
+
+
+def test_no_mute_no_finding(tmp_path):
+    f, x = doc.check_mute(str(tmp_path / "absent"))
+    assert f == [] and x == []

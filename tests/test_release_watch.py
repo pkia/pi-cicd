@@ -432,3 +432,19 @@ def test_main_list_subcommand(tmp_path, capsys, monkeypatch):
 
 def test_main_state_path_expands_home(tmp_path):
     assert rw.main(["--state", "~/nowhere-x/state.json", "--list"]) == 0
+\n
+
+# ---------------------------------------- shared ntfy_lib delegation
+
+def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
+    mute = tmp_path / "mute"
+    mute.write_text("storm drill\n")
+    monkeypatch.setattr(rw.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
+
+    def boom(req, timeout=None):
+        raise AssertionError("network must not be touched while muted")
+
+    monkeypatch.setattr(rw.urllib.request, "urlopen", boom)
+    assert rw.ntfy_post(make_cfg(), "t", "m", [], 5) is True
+    assert "muted" in capsys.readouterr().err
+    # a muted sweep must still count as published so state is kept

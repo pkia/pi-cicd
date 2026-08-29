@@ -425,3 +425,18 @@ def test_elapsed_ms_monotonic(monkeypatch):
     start = sp.time.monotonic()
     clock.now = 5.5
     assert sp.elapsed_ms(start) == 500
+\n
+
+# ---------------------------------------- shared ntfy_lib delegation
+
+def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
+    mute = tmp_path / "mute"
+    mute.write_text("storm drill\n")
+    monkeypatch.setattr(sp.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
+
+    def boom(req, timeout=None):
+        raise AssertionError("network must not be touched while muted")
+
+    monkeypatch.setattr(sp.urllib.request, "urlopen", boom)
+    assert sp.ntfy_post(make_cfg(), "t", "m", [], 5) is True
+    assert "muted" in capsys.readouterr().err
