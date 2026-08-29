@@ -10,7 +10,7 @@ import importlib.util
 import importlib.machinery
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -121,8 +121,12 @@ def test_init_and_create_roundtrip(tmp_path):
     assert stats["original_size"] > 0
     assert name.startswith("pi-")
 
-    # identical second archive dedups to (almost) nothing
-    ok2, name2, stats2 = pb.create_archive(cfg, datetime.now())
+    # identical second archive dedups to (almost) nothing. Fixed `now`
+    # (1s apart): two datetime.now() calls can land in the same second
+    # and collide on the second-resolution archive name (CI flake,
+    # run 33231581403).
+    ok2, name2, stats2 = pb.create_archive(
+        cfg, datetime.now() + timedelta(seconds=1))
     assert ok2, stats2
     assert stats2["deduplicated_size"] < stats["original_size"]
 
