@@ -425,7 +425,7 @@ def test_elapsed_ms_monotonic(monkeypatch):
     start = sp.time.monotonic()
     clock.now = 5.5
     assert sp.elapsed_ms(start) == 500
-\n
+
 
 # ---------------------------------------- shared ntfy_lib delegation
 

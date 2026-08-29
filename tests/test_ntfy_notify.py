@@ -216,6 +216,23 @@ def test_notify_timeout_always_finite(monkeypatch):
 
 # ---------------------------------------------------------- mute CLI
 
+def test_cli_reports_suppressed_not_published(monkeypatch, tmp_path, capsys):
+    mute = tmp_path / "mute"
+    mute.write_text("storm\n")
+    monkeypatch.setattr(nn.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
+    cfg = tmp_path / "nn.conf"
+    cfg.write_text("NTFY_URL=http://n:6839\nNTFY_TOKEN=tk\nNTFY_TOPIC=radar\n")
+
+    def boom(req, timeout=None):
+        raise AssertionError("network must not be touched while muted")
+
+    monkeypatch.setattr(nn.urllib.request, "urlopen", boom)
+    assert nn.main(["--config", str(cfg), "m"]) == 0
+    out = capsys.readouterr()
+    assert "suppressed" in out.out and "storm" in out.out
+    assert "✓ published" not in out.out
+
+
 def test_cli_mute_writes_reason_file(monkeypatch, tmp_path, capsys):
     mute = tmp_path / "mute"
     monkeypatch.setattr(nn, "MUTE_FILE", str(mute))

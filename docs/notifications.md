@@ -79,6 +79,37 @@ For Python code already holding config (loop-heartbeat), publish
 directly via `ntfy_post()` in `loop-heartbeat` — same JSON shape, same
 auth — instead of shelling out.
 
+## Alert-storm kill switch (global mute)
+
+One file mutes **every** publisher on this box — loop-heartbeat,
+release-watch, service-probe, pi-backup, ntfy-notify itself — because
+they all publish through the shared `ntfy_lib.py` (added 2026-08-29):
+
+    ntfy-notify --mute "ais-catcher storm, investigating"   # mute
+    ntfy-notify --mute-status                               # 0 muted / 1 not
+    ntfy-notify --unmute                                    # back to normal
+
+Semantics, deliberately:
+
+- **Mute file** is `/home/ev/.local/state/ntfy/mute` (absolute, not
+  `~`-relative, because pi-backup runs as root and `~` would resolve to
+  `/root`). First line is the free-text reason. Override per-process
+  with `NTFY_MUTE_FILE` (drills, tests).
+- **Muted publishes count as delivered** (exit 0 / True), so a muted
+  job never looks failed and never blocks on the notification path —
+  the storm stops, the jobs keep flowing. The suppression is logged to
+  stderr (`ntfy: muted (reason) — publish suppressed`) and the CLI
+  says `🔇 suppressed`, not `✓ published`.
+- **Fails open**: an unreadable/corrupt mute path counts as NOT muted.
+  A permissions hiccup must never silence the box by accident.
+- **Not forever-silent**: pi-doctor's daily 07:00 audit reports a
+  standing mute as a finding (`ntfy:muted — ... unmute with:
+  ntfy-notify --unmute`), so a forgotten kill switch resurfaces within
+  a day. It reports; it never unmutes on its own.
+- Timeouts: every publish through `ntfy_lib` carries a finite timeout
+  (15 s default, sanitised if a caller passes None/0/negative), so a
+  dead ntfy server can delay a job by seconds, never hang it.
+
 ## loop-heartbeat wiring
 
 `/etc/loop-heartbeat.conf` gains:

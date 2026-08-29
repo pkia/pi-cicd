@@ -56,6 +56,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import ntfy_lib
+
 DEFAULT_CONFIG = "/etc/pi-backup.conf"
 
 
@@ -272,17 +274,9 @@ def run_drill(cfg, now):
 # ------------------------------------------------------------- notify
 
 def ntfy_post(url, headers, payload, timeout=15):
-    """POST JSON to the ntfy root endpoint; True on any 2xx."""
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", **headers},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
-    except (OSError, urllib.error.URLError) as exc:
-        print(f"note: ntfy publish failed: {exc}", file=sys.stderr)
-        return False
+    """POST JSON via the shared ntfy_lib (mute + timeouts); True on 2xx."""
+    return ntfy_lib.publish(url, headers, payload, timeout=timeout,
+                            _urlopen=urllib.request.urlopen)
 
 
 def notify(cfg, title, message, priority=None, dry_run=False):

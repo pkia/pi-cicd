@@ -516,12 +516,12 @@ def test_check_healthz_unhealthy_flag():
         assert alerts and alerts[0]["key"] == "healthz:fake:unhealthy"
     finally:
         srv.shutdown()
-\n
+
 
 # ---------------------------------------- shared ntfy_lib delegation
 
 def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
-    """Storm path: global mute file silences loop-heartbeat's ntfy channel."""
+    """Storm path: global mute file silences the ntfy channel."""
     mute = tmp_path / "mute"
     mute.write_text("storm drill\n")
     monkeypatch.setattr(lh.ntfy_lib, "DEFAULT_MUTE_FILE", str(mute))
