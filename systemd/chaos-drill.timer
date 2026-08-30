@@ -1,0 +1,10 @@
+[Unit]
+Description=Run one chaos drill per night at 04:45 (after the 03:30 backup, clear of the 04:00 implementer)
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+AccuracySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

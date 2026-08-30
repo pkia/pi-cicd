@@ -28,9 +28,10 @@ ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
 ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
 ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
 ln -sf "$REPO_DIR/service-probe" "$BIN_DIR/service-probe"
+ln -sf "$REPO_DIR/chaos-drill"   "$BIN_DIR/chaos-drill"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
-         "$REPO_DIR/service-probe"
+         "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -109,6 +110,21 @@ if [ -f /etc/service-probe.conf ]; then
     echo "service-probe timer installed and active"
 else
     echo "note: /etc/service-probe.conf not found - service-probe not installed"
+fi
+
+# chaos-drill: nightly deliberate-failure drills (dead-port detection,
+# ntfy fail-closed, timer liveness). Needs /etc/chaos-drill.conf and a
+# read grant on the 'chaos' topic for the subscriber — see the script's
+# docstring, templates/chaos-drill.conf.example and docs/notifications.md.
+# Install is skipped silently when the config is absent.
+if [ -f /etc/chaos-drill.conf ]; then
+    sudo cp "$REPO_DIR/systemd/chaos-drill.service" \
+            "$REPO_DIR/systemd/chaos-drill.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now chaos-drill.timer
+    echo "chaos-drill timer installed and active"
+else
+    echo "note: /etc/chaos-drill.conf not found - chaos-drill not installed"
 fi
 
 echo

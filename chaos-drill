@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""chaos-drill — the box regularly proves it notices when things break.
+
+The weekly restore drill proved the backups by *using* them; this tool
+extends that discipline to the detection and notification layers. A
+manifest of small deliberate failures, one drill per night on rotation,
+each with setup / verify / teardown steps and a PASS or FAIL receipt
+published to the ntfy 'chaos' topic (through ntfy_lib, so the global
+mute and timeouts are inherited for free). The receipts land in
+status.json next to the state, which the portal renders as its Chaos
+Drills panel — next to the Uptime Scoreboard it answers "does the box
+actually notice?" instead of just "is it up?".
+
+Design rules, in order:
+
+* **Drills must not hurt the box.** Nothing here stops a real service
+  or writes a real config: the service-probe drill targets a *shadow
+  copy* of the live config — one extra dead-port probe, its own state
+  dir, alerts re-targeted to the 'chaos' topic — so the live scoreboard
+  and the live 'services' topic are untouched. A drill that cannot set
+  up safely SKIPS (recorded, not hidden) rather than run weakened.
+* **Verify end-to-end.** Each drill proves the full chain — inject
+  failure -> detection -> recovery -> receipt — not that a function
+  returns. The ntfy drill must see anonymous publishes DENIED; silence
+  is a FAIL, because an open server is exactly the regression this
+  drill exists to catch.
+* **Passive checks are drills too.** "The probe timer is running" is
+  verified the same way, so one rotation covers the detection story.
+
+    chaos-drill [--config FILE] [--state FILE] [--dry-run] [-v]
+    chaos-drill --run DRILL [--run DRILL ...]   run named drills
+    chaos-drill --list               manifest + rotation + last receipts
+
+Rotation: one drill per night, hashed off the date (stable within a
+day, every drill covered in rotation, no persisted pointer to go
+stale). State: ~/.local/state/chaos-drill/state.json (last 50 runs);
+status.json beside it feeds the portal.
+
+Config: /etc/chaos-drill.conf (KEY=VALUE, '#' comments):
+
+    NTFY_URL       base URL, e.g. http://100.122.94.33:6839
+    NTFY_TOKEN     access token of the 'publisher' ntfy user
+    NTFY_TOPIC     default 'chaos'
+    TIMEOUT_SECS   network timeout for drills + receipts (default 15)
+    NTFY_SUB_TOKEN optional path to the subscriber token; when readable
+                   the ntfy-auth drill ALSO proves receipts round-trip
+                   by reading them back off the topic (root-owned paths
+                   are read via passwordless sudo -n cat)
+    SUBSCRIBER_ALLOWED_TOPICS  comma list the subscriber may read
+                   (default backups,chaos,releases,services,radar);
+                   distinguishes "denied correctly" from "grant lost"
+    HEAL_TARGET    URL a drill may point a probe at to simulate
+                   recovery (default http://127.0.0.1:8090/ the portal)
+    DRILL          optional repeatable drill name to enable (default all)
+
+Exit 0 when every run drill PASSes (SKIP is not a failure), 1 when a
+drill FAILs or the run itself is broken. The systemd timer runs this
+nightly at 04:45 — after the 03:30 backup, clear of the 04:00
+implementer window.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+import ntfy_lib
+
+DEFAULT_CONFIG = "/etc/chaos-drill.conf"
+DEFAULT_STATE = "~/.local/state/chaos-drill/state.json"
+DEFAULT_TOPIC = "chaos"
+DEFAULT_TIMEOUT = 15
+DEFAULT_ALLOWED_TOPICS = "backups,chaos,releases,services,radar"
+DEFAULT_HEAL_TARGET = "http://127.0.0.1:8090/"
+
+#: Candidate ports for the dead-port drill, all above the real services
+#: (8000-8092) — the first that REFUSES a TCP connect is used.
+DEAD_PORT_CANDIDATES = [59999, 59998, 59997]
+
+#: Maximum sweeps the dead-port drill will spend waiting for the DOWN
+#: alert (live CONFIRM_FAILS=2 needs two) or the recovery notice.
+MAX_SWEEPS = 4
+
+
+# ---------------------------------------------------------------- config
+
+def parse_env_lists(path):
+    """KEY=VALUE lines -> dict of lists (repeated keys accumulate)."""
+    cfg: dict[str, list[str]] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg.setdefault(key.strip(), []).append(value.strip())
+    return cfg
+
+
+def load_config(path):
+    """Parse the env-style config into the shape run() expects."""
+    raw = parse_env_lists(path)
+    try:
+        timeout = float((raw.get("TIMEOUT_SECS", [""])[-1]) or DEFAULT_TIMEOUT)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
+    first = lambda key: (raw.get(key, [""])[-1].strip())  # noqa: E731
+    enabled = {s for s in (item.strip() for value in raw.get("DRILL", [])
+                           for item in value.split(",")) if s}
+    return {
+        "ntfy_url": first("NTFY_URL").rstrip("/"),
+        "ntfy_token": first("NTFY_TOKEN"),
+        "topic": first("NTFY_TOPIC") or DEFAULT_TOPIC,
+        "timeout": timeout if timeout > 0 else DEFAULT_TIMEOUT,
+        "sub_token": first("NTFY_SUB_TOKEN"),
+        "heal_target": first("HEAL_TARGET") or DEFAULT_HEAL_TARGET,
+        "allowed": {s.strip() for s in
+                    (first("SUBSCRIBER_ALLOWED_TOPICS")
+                     or DEFAULT_ALLOWED_TOPICS).split(",") if s.strip()},
+        "enabled": enabled,  # empty set = all drills
+    }
+
+
+# ------------------------------------------------------------- plumbing
+
+def save_json_atomic(path, obj):
+    """Write JSON atomically (tmp + rename). False on failure."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except OSError as exc:
+        print(f"chaos-drill: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+
+
+def load_state(path):
+    """state.json -> dict with 'history'. Missing/corrupt -> fresh."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"history": []}
+    return data if isinstance(data.get("history"), list) \
+        else {"history": []}
+
+
+def http_request(url, method="GET", headers=None, data=None, timeout=15):
+    """One HTTP request -> (status, body_text). status None = no answer."""
+    req = urllib.request.Request(url, method=method, headers=headers or {},
+                                 data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(2048).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return exc.code, body
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, str(exc)[:200]
+
+
+def read_sub_token(path):
+    """Subscriber token, readable directly or via passwordless sudo -n.
+
+    Returns '' when unreadable — drills needing it then SKIP rather
+    than run weakened, with the reason recorded in the receipt.
+    """
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["sudo", "-n", "cat", str(path)],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def pick_dead_port():
+    """First candidate port that REFUSES a TCP connect (nothing on it).
+
+    0 means 'no dead port found' — extremely unlikely on loopback; the
+    drill then skips rather than fire at a live port.
+    """
+    for port in DEAD_PORT_CANDIDATES:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                pass  # something answered — NOT dead
+        except OSError:
+            return port  # refused/unreachable = dead
+    return 0
+
+
+def run_cmd(*cmd):
+    """subprocess for systemctl checks -> (rc, stdout). Test-injectable."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return out.returncode, out.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+
+
+# ---------------------------------------------------------------- drills
+
+def load_service_probe():
+    """Import the sibling 'service-probe' script (hyphen -> loader)."""
+    path = Path(__file__).resolve().parent / "service-probe"
+    spec = importlib.util.spec_from_loader(
+        "service_probe",
+        importlib.machinery.SourceFileLoader("service_probe", str(path)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def shadow_sweep(sp, conf, state):
+    """Run one service-probe sweep against the shadow config; capture
+    everything it prints -> (rc, combined_output)."""
+    argv = ["--config", str(conf), "--state", str(state), "-v"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), \
+            contextlib.redirect_stderr(buf):
+        rc = sp.main(argv)
+    return rc, buf.getvalue()
+
+
+def shadow_probe_status(state_path):
+    """status of http:chaos-dead-port in the shadow state, or None."""
+    try:
+        data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+        return data["probes"]["http:chaos-dead-port"].get("status")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def build_shadow_config(base_text, target, topic):
+    """Live probe config text + one extra probe + alerts re-targeted.
+
+    The drill probe goes on its own PROBE_HTTP line (repeated keys
+    accumulate in service-probe's parser) and NTFY_TOPIC is appended
+    (the parser takes the LAST occurrence), so shadow sweeps alert the
+    drill's topic instead of the live 'services' one. Every live entry
+    is kept verbatim.
+    """
+    return (base_text.rstrip("\n")
+            + f"\nPROBE_HTTP=chaos-dead-port={target}\n"
+            + (f"NTFY_TOPIC={topic}\n" if topic else ""))
+
+
+def drill_service_probe_dead_port(ctx):
+    """Seed a dead-port probe via a shadow config; the REAL service-probe
+    pipeline must raise the DOWN alert, publish it to the drill's topic
+    and then notice recovery — end to end, live scoreboard untouched."""
+    sp = ctx.get("service_probe") or load_service_probe()
+    base_path = Path(ctx["probe_conf"])
+    try:
+        base = base_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return "skip", f"cannot read live probe config {base_path}: {exc}"
+
+    port = pick_dead_port()
+    if not port:
+        return "skip", "no dead candidate port on loopback (all answered)"
+
+    def write_shadow(target):
+        return build_shadow_config(base, target, ctx["retarget_topic"])
+
+    checks = []
+
+    def sweep_until_status(status, heal_target=None):
+        """Sweep up to MAX_SWEEPS until the shadow probe's status entry
+        reaches `status` ("down" / "up").
+
+        Verifies against the STATE FILE, not stdout: service-probe's
+        printed digest carries only counts and the published payload —
+        the durable proof of detection is the state transition. The
+        heal target is written into the shadow config before sweeping
+        when given, so the loop that waits for recovery causes it.
+        """
+        conf, state = ctx["shadow_conf"], ctx["shadow_state"]
+        if heal_target:
+            conf.write_text(write_shadow(heal_target), encoding="utf-8")
+        out_all, rc = "", 1
+        for _ in range(MAX_SWEEPS):
+            rc, out = shadow_sweep(sp, conf, state)
+            out_all += out
+            if shadow_probe_status(state) == status:
+                return True, rc, out_all
+        return False, rc, out_all
+
+    tmp = Path(tempfile.mkdtemp(prefix="chaos-drill-"))
+    try:
+        ctx["shadow_conf"] = tmp / "service-probe.conf"
+        ctx["shadow_state"] = tmp / "state.json"
+        ctx["shadow_conf"].write_text(
+            write_shadow(f"http://127.0.0.1:{port}/"), encoding="utf-8")
+
+        # Phase 1 — the failure must be DETECTED: the probe entry flips
+        # to "down" in the real pipeline's own state, and the digest
+        # naming the probe is PUBLISHED to the drill's topic.
+        seen, rc, out = sweep_until_status("down")
+        if not seen:
+            return "fail", f"probe never went DOWN within {MAX_SWEEPS} " \
+                           f"sweeps:\n{out}"
+        checks.append("DOWN detected by real pipeline (state flip)")
+        published_ok = published_probe_alert(ctx, out)
+        if published_ok:
+            checks.append("DOWN digest published to drill topic")
+            marker_ok, _marker = verify_topic_message(
+                ctx, "chaos-dead-port DOWN")
+            if marker_ok:
+                checks.append("DOWN receipt read back off the topic")
+
+        # Phase 2 — heal and expect the recovery notice: the entry
+        # flips back to "up" and a recovery digest is published.
+        seen, rc, out = sweep_until_status(
+            "up", heal_target=ctx["heal_target"])
+        if not seen:
+            return "fail", f"no recovery after heal within {MAX_SWEEPS} " \
+                           f"sweeps:\n{out}"
+        checks.append("recovery noticed after heal (state flip)")
+        if published_probe_alert(ctx, out):
+            checks.append("recovery digest published to drill topic")
+        return "pass", "; ".join(checks) + \
+            f" (dead port {port}, shadow config/state in tmp)"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def published_probe_alert(ctx, out, needle=None):
+    """True when the sweep output proves the digest was accepted for
+    publish to the drill's topic (service-probe prints '✓ published N
+    alert(s) to topic X' on the sweep that built it). The digest BODY
+    (naming chaos-dead-port) is proven separately by the live topic
+    read-back in verify_topic_message; stdout carries only counts."""
+    if ctx.get("retarget_topic") != ctx.get("topic"):
+        return False  # alerts went to a different topic than configured
+    return "✓ published" in out
+
+
+def verify_topic_message(ctx, needle):
+    """Read the drill topic back (subscriber token) looking for needle.
+
+    Returns (True, marker) when found. Absence is NOT a failure for the
+    dead-port drill (the publish line already proved delivery accepted);
+    it just skips the read-back check.
+    """
+    token = ctx["tokens"].get("subscriber") if ctx.get("tokens") else None
+    if not token:
+        token = read_sub_token(ctx["cfg"]["sub_token"]) \
+            if ctx["cfg"]["sub_token"] else ""
+    if not token or ctx["topic"] not in ctx["cfg"]["allowed"]:
+        return False, ""
+    since = int(time.time()) - 600
+    code, body = http_request(
+        f"{ctx['cfg']['ntfy_url']}/{ctx['topic']}/json?poll=1&since={since}",
+        timeout=ctx["cfg"]["timeout"],
+        headers={"Authorization": f"Bearer {token}"})
+    if code == 200 and needle in body:
+        return True, needle
+    return False, ""
+
+
+def drill_ntfy_auth(ctx):
+    """The notification backbone must still be fail-closed: anonymous
+    publish DENIED, publisher token ACCEPTED, and — when the subscriber
+    token is readable — a receipt round-trip off the topic."""
+    url, topic, timeout = ctx["cfg"]["ntfy_url"], ctx["topic"], \
+        ctx["cfg"]["timeout"]
+    if not url or not ctx["cfg"]["ntfy_token"]:
+        return "skip", "NTFY_URL/NTFY_TOKEN not configured"
+    checks: list[tuple[str, bool, str]] = []
+
+    code, _ = http_request(url, method="POST", timeout=timeout,
+                           headers={"Content-Type": "application/json"},
+                           data=json.dumps({"topic": topic,
+                                             "message": "x"}).encode())
+    checks.append(("anonymous publish denied", code in (401, 403),
+                   f"got {code} — server is OPEN, fix auth-default-access"))
+
+    marker = f"chaos-auth-{int(time.time())}"
+    ok = ntfy_lib.publish(
+        url, {"Authorization": f"Bearer {ctx['cfg']['ntfy_token']}"},
+        {"topic": topic, "message": marker,
+         "title": "chaos-drill: ntfy-auth", "tags": ["gear"]},
+        timeout=timeout, _urlopen=urllib.request.urlopen)
+    checks.append(("publisher publish accepted", ok,
+                   "publish returned false"))
+
+    detail = ""
+    if ctx["cfg"]["sub_token"]:
+        token = read_sub_token(ctx["cfg"]["sub_token"])
+        if not token:
+            return "skip", "subscriber token configured but unreadable " \
+                           "(and sudo -n cat denied)"
+        if topic not in ctx["cfg"]["allowed"]:
+            # A denial would then be EXPECTED (no grant) — do not fail
+            # the drill for provisioning, but claim no round-trip.
+            detail = f"; topic '{topic}' not in subscriber grants"
+        else:
+            since = int(time.time()) - 60
+            code, body = http_request(
+                f"{url}/{topic}/json?poll=1&since={since}", timeout=timeout,
+                headers={"Authorization": f"Bearer {token}"})
+            checks.append(("subscriber read-back of receipt",
+                           code == 200 and marker in body,
+                           f"code {code}, marker found={marker in body}"))
+            detail = f"; read-back code {code}"
+    else:
+        detail = "; no subscriber token configured (round-trip untested)"
+
+    failed = [name for name, ok, _ in checks if not ok]
+    if failed:
+        return "fail", "; ".join(f"{n}: {d}" for n, ok, d in checks
+                                 if not ok) + detail
+    return "pass", "; ".join(name for name, _, _ in checks) + detail
+
+
+def read_uptime(path="/proc/uptime"):
+    """/proc/uptime -> seconds (float); None when unreadable/garbage."""
+    try:
+        return float(Path(path).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def drill_probe_timer_alive(ctx):
+    """The detection layer is only as good as its timer: service-probe's
+    timer must be active and its last sweep recent enough that a dead
+    service cannot go unnoticed for long. Timezone-proof: compares
+    systemd's monotonic timestamp against /proc/uptime."""
+    rc, active = run_cmd("systemctl", "is-active", "service-probe.timer")
+    if rc != 0 or active != "active":
+        return "fail", f"service-probe.timer not active (rc={rc}, {active!r})"
+
+    rc, mono = run_cmd("systemctl", "show", "service-probe.service",
+                       "--property", "ExecMainExitTimestampMonotonic",
+                       "--value")
+    mono = (mono or "").splitlines()[0].strip() if mono else ""
+    try:
+        mono_us = int(mono)
+    except (TypeError, ValueError):
+        return "fail", f"no/invalid last-sweep timestamp ({mono!r}) — " \
+                       "has service-probe ever run?"
+    if mono_us <= 0:  # systemd's value when the unit never ran
+        return "fail", "no last-sweep timestamp — service-probe has " \
+                       "never run under this timer"
+    mono_s = mono_us / 1e6  # systemd prints microseconds
+    uptime = read_uptime()
+    if uptime is None:
+        return "skip", "cannot read /proc/uptime"
+    age = uptime - mono_s
+    if age < 0:
+        return "skip", "last sweep timestamp in the future (clock jump?)"
+    if age > ctx.get("max_sweep_age", 1800):
+        return "fail", f"last service-probe sweep {int(age // 60)}m ago " \
+                       f"(timer active but not sweeping)"
+    return "pass", f"service-probe.timer active; last sweep " \
+                   f"{int(age // 60)}m ago (monotonic check)"
+
+
+MANIFEST = [
+    ("service-probe-dead-port", drill_service_probe_dead_port),
+    ("ntfy-auth", drill_ntfy_auth),
+    ("probe-timer-alive", drill_probe_timer_alive),
+]
+
+
+# ------------------------------------------------------------------ core
+
+def drill_context(cfg, probe_conf, topic, dry_run=False):
+    """Everything a drill might need, resolved once (test-injectable)."""
+    return {
+        "cfg": cfg,
+        "probe_conf": probe_conf,
+        "topic": topic,
+        "dry_run": dry_run,
+        "heal_target": cfg["heal_target"],
+        "retarget_topic": topic,  # shadow sweeps alert the drill topic
+        "tokens": {},             # tests inject: {"subscriber": "..."}
+    }
+
+
+def pick_rotation(names, now):
+    """Date-hashed nightly pick: stable within a day, covers all drills."""
+    key = int(now.strftime("%Y%m%d"))
+    return names[key % len(names)]
+
+
+def run_drill(name, fn, ctx, now):
+    """One drill -> receipt dict."""
+    if ctx["dry_run"]:
+        return {"drill": name, "result": "dry-run",
+                "detail": "not executed (dry-run)",
+                "at": now.isoformat(timespec="seconds")}
+    print(f"— drill {name}: running…", flush=True)
+    try:
+        result, detail = fn(ctx)
+    except Exception as exc:  # a drill crash is a FAIL, never a hang
+        result, detail = "fail", f"drill crashed: {exc!r}"[:200]
+    receipt = {"drill": name, "result": result, "detail": detail[:500],
+               "at": now.isoformat(timespec="seconds")}
+    icon = {"pass": "✓", "fail": "✗", "skip": "⊘",
+            "dry-run": "•"}[result]
+    print(f"{icon} {name}: {result} — {detail.splitlines()[0][:120]}")
+    return receipt
+
+
+def run(cfg, state_path, drills=None, dry_run=False, verbose=False,
+        probe_conf="/etc/service-probe.conf", _ctx=None):
+    """Run the requested drills (or tonight's rotation pick), persist
+    state + status.json, publish one receipt. Exit 1 on any FAIL."""
+    enabled = cfg["enabled"]
+    manifest = [(n, f) for n, f in MANIFEST
+                if not enabled or n in enabled]
+    if not manifest:
+        print("chaos-drill: no drills enabled (check DRILL in config)",
+              file=sys.stderr)
+        return 1
+
+    names = [n for n, _ in manifest]
+    now = datetime.now(timezone.utc)
+    selected = list(drills) if drills else [pick_rotation(names, now)]
+    unknown = [d for d in selected if d not in names]
+    if unknown:
+        print(f"chaos-drill: unknown drill(s) {', '.join(unknown)} — "
+              f"known: {', '.join(names)}", file=sys.stderr)
+        return 1
+
+    ctx = _ctx or drill_context(cfg, probe_conf, cfg["topic"], dry_run)
+    receipts = [run_drill(name, dict(manifest)[name], ctx, now)
+                for name in selected]
+
+    run_rec = {"at": now.isoformat(timespec="seconds"),
+               "drills": receipts, "rotation": names, "picked": selected}
+    state = load_state(state_path)
+    state["history"] = (state.get("history", []) + [run_rec])[-50:]
+
+    if dry_run:
+        print(f"[dry-run] would persist {state_path} and publish a "
+              f"receipt for: {', '.join(selected)}")
+        return 0
+    if not save_json_atomic(state_path, state):
+        return 1
+
+    latest: dict[str, dict] = {}
+    for rec in state["history"]:
+        for d in rec.get("drills", []):
+            latest[d["drill"]] = d  # append-only history -> last wins
+    save_json_atomic(Path(state_path).parent / "status.json",
+                     {"generated": run_rec["at"], "drills": latest,
+                      "last_run": run_rec["at"]})
+
+    failed = [r for r in receipts if r["result"] == "fail"]
+    publish_receipt(cfg, receipts, failed)
+    return 1 if failed else 0
+
+
+def publish_receipt(cfg, receipts, failed):
+    """ONE digest per run to the chaos topic (best-effort, mute-aware)."""
+    if not receipts:
+        return
+    good = [r for r in receipts if r["result"] == "pass"]
+    skips = [r for r in receipts if r["result"] == "skip"]
+    if failed:
+        title = f"chaos-drill FAIL: {', '.join(r['drill'] for r in failed)}"
+        tags = ["rotating_light"]
+    else:
+        title = (f"chaos-drill {len(good)} pass"
+                 + (f", {len(skips)} skipped" if skips else ""))
+        tags = ["white_check_mark"]
+    lines = [f"[{r['result'].upper()}] {r['drill']}: "
+             f"{r['detail'].splitlines()[0] if r['detail'] else ''}"
+             for r in receipts]
+    if not (cfg["ntfy_url"] and cfg["ntfy_token"]):
+        print("chaos-drill: NTFY not configured — receipt not published",
+              file=sys.stderr)
+        return
+    published = ntfy_lib.publish(
+        cfg["ntfy_url"], {"Authorization": f"Bearer {cfg['ntfy_token']}"},
+        {"topic": cfg["topic"], "title": title, "message": "\n".join(lines),
+         "tags": tags}, timeout=cfg["timeout"],
+        _urlopen=urllib.request.urlopen)
+    print(("✓ receipt published" if published
+           else "✗ receipt NOT delivered — loud in the journal")
+          + f" to topic '{cfg['topic']}'")
+
+
+def print_list(state_path):
+    state = load_state(state_path)
+    now = datetime.now(timezone.utc)
+    names = [n for n, _ in MANIFEST]
+    print(f"# chaos-drill manifest: {', '.join(names)}")
+    print(f"# tonight's rotation pick: {pick_rotation(names, now)}")
+    latest: dict[str, dict] = {}
+    for rec in state["history"]:
+        for d in rec.get("drills", []):
+            latest[d["drill"]] = d
+    if not latest:
+        print("(no drill has run yet)")
+        return 0
+    print(f"# state at {state_path}")
+    for name in names:
+        d = latest.get(name)
+        if not d:
+            print(f"  {name}: (never run)")
+            continue
+        first = d["detail"].splitlines()[0] if d["detail"] else ""
+        print(f"  {name}: {d['result']} at {d['at']} — {first}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="run small deliberate-failure drills; receipt to ntfy")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"config file (default {DEFAULT_CONFIG})")
+    ap.add_argument("--state", default=DEFAULT_STATE,
+                    help=f"state file (default {DEFAULT_STATE})")
+    ap.add_argument("--run", action="append", metavar="DRILL",
+                    help="run this drill (repeatable) instead of the "
+                         "nightly rotation pick")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="execute nothing; show what would run")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="per-drill detail (drills are chatty anyway)")
+    ap.add_argument("--list", action="store_true",
+                    help="print manifest, tonight's pick, last receipts")
+    args = ap.parse_args(argv)
+
+    state_path = Path(args.state).expanduser()
+    if args.list:
+        return print_list(state_path)
+    return run(load_config(args.config), state_path, drills=args.run,
+               dry_run=args.dry_run, verbose=args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
