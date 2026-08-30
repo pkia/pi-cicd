@@ -174,7 +174,8 @@ def test_no_mute_no_finding(tmp_path):
 
 
 def test_check_rtk_reports_savings(monkeypatch):
-    import subprocess
+    import shutil, subprocess
+    monkeypatch.setattr(shutil, "which", lambda *a: "/usr/bin/rtk")
     fake = subprocess.CompletedProcess(
         ["rtk", "gain"], 0,
         stdout="Total commands: 42\nOutput tokens: 1000\nTokens saved: 5.2K (83.9%)\nEfficiency meter: ████████ 83.9%\n")
