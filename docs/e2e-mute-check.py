@@ -62,7 +62,14 @@ def main():
         sys.exit(f"box is already muted ({out}) — unmute before drilling")
 
     marker = f"mute-drill-{int(time.time())}"
+    pre_existing = Path(MUTE).exists()
     try:
+        # 0. run as root, the mute dir may be created root-owned — which
+        # would lock the owner (ev) out of their own kill switch. Chown
+        # it to ev so --mute works for the human too.
+        d = Path(MUTE).parent
+        if d.exists():
+            subprocess.run(["chown", "ev:ev", str(d)], check=False)
         # 1. mute with a reason
         rc, out, _ = sh([NN, "--mute", f"{marker} e2e drill"])
         check("mute: file created, reason recorded",
@@ -112,6 +119,8 @@ def main():
     print(f"\n{len(checks) - len(bad)}/{len(checks)} checks passed")
     if bad:
         sys.exit("FAILED: " + "; ".join(bad))
+    if not pre_existing:
+        print("note: box left unmuted; mute file never pre-existed")
 
 
 if __name__ == "__main__":

@@ -263,6 +263,22 @@ def test_cli_unmute_when_not_muted_is_fine(monkeypatch, tmp_path):
     assert nn.main(["--unmute", "unused"]) == 0
 
 
+def test_mute_fails_cleanly_when_dir_not_writable(monkeypatch, tmp_path,
+                                                  capsys):
+    """A root-owned state dir must produce a hint, not a traceback."""
+    d = tmp_path / "ntfy"
+    d.mkdir()
+    d.chmod(0o500)  # read+execute only: writes fail (as non-root)
+    monkeypatch.setattr(nn, "MUTE_FILE", str(d / "mute"))
+    try:
+        assert nn.set_mute(str(d / "mute"), "x") is False
+        rc = nn.main(["--mute", "x"])
+        assert rc == 1
+        assert "chown" in capsys.readouterr().err
+    finally:
+        d.chmod(0o700)  # restore so tmp cleanup works
+
+
 def test_cli_mute_status_reports_state(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(nn, "MUTE_FILE", str(tmp_path / "mute"))
     assert nn.main(["--mute-status", "unused"]) == 1   # not muted
