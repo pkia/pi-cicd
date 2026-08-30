@@ -1,0 +1,9 @@
+[Unit]
+Description=Chaos drill — prove the box notices when things break (one drill per night)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+ExecStart=/home/ev/.local/bin/chaos-drill

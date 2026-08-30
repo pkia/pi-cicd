@@ -1,0 +1,17 @@
+# chaos-drill — nightly deliberate-failure drills. Provisioned on the
+# host, never committed (same rule as every other /etc conf here).
+# NTFY_URL/TOKEN are the shared publisher credentials (see
+# docs/notifications.md); receipts go to the 'chaos' topic, which the
+# subscriber user needs a read grant on:
+#   sudo ntfy access subscriber chaos read-only
+NTFY_URL=http://100.122.94.33:6839
+NTFY_TOKEN=REPLACE_WITH_PUBLISHER_TOKEN
+NTFY_TOPIC=chaos
+TIMEOUT_SECS=15
+# root-owned token path is fine: read directly as ev, else sudo -n cat
+NTFY_SUB_TOKEN=/etc/ntfy/tokens/subscriber.txt
+SUBSCRIBER_ALLOWED_TOPICS=backups,chaos,releases,services,radar
+# what a dead probe is healed to, to simulate recovery (the portal)
+HEAL_TARGET=http://127.0.0.1:8090/
+# optional: restrict to specific drills (default: all)
+# DRILL=ntfy-auth
