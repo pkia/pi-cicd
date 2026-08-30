@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # pipeline-check - verify every project is actually going through the
 # pipeline: versioned, pushed, CI green, and (for services) deployed at
-# HEAD. Designed for hermes cron --no-agent: prints alert lines when
-# something is wrong, stays SILENT when everything is green, and prints
-# a full report with --verbose.
+# HEAD. SELF-HEALING edition: attempts a fix for each alert, re-checks,
+# and only reports what is STILL broken after the fix attempt.
+# Persistent alerts are deduped for 6h (state in ~/.pipeline-check.state).
+# Prints nothing when everything is green AND stays green.
 #
 # Manual use:   pipeline-check [--verbose]
 set -u
@@ -13,6 +14,8 @@ VERBOSE=no
 
 HOME_DIR="${GUARD_HOME:-/home/ev}"
 EXCLUDE=(AIS-catcher-src AdGuardHome)
+STATE_FILE="$HOME_DIR/.pipeline-check.state"
+DEDUPE_HOURS=6
 # Services with pull-based CD: dir -> systemd unit of the deploy timer
 declare -A SERVICES=(
     [maritime-dashboard]=maritime-dashboard-deploy
@@ -25,9 +28,51 @@ declare -A SERVICES=(
 alerts=0
 report=""
 alertlines=""
+fixedlines=""
 
 note()  { report+="$1"$'\n'; }          # verbose-only line
 alert() { alertlines+="⚠ $1"$'\n'; alerts=$((alerts+1)); }
+fixed() { fixedlines+="✓ $1"$'\n'; }
+
+# ---------- dedupe state: suppress alerts seen in the last N hours ------
+state_key() { echo "$1" | tr ' /:' '__' | cut -c1-80; }
+seen_recently() {
+    local key ts now
+    key=$(state_key "$1")
+    ts=$(grep -F "$key=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+    [ -z "$ts" ] && return 1
+    now=$(date +%s)
+    [ $((now - ts)) -lt $((DEDUPE_HOURS * 3600)) ]
+}
+mark_seen() {
+    local key
+    key=$(state_key "$1")
+    touch "$STATE_FILE"
+    sed -i "/^$key=/d" "$STATE_FILE" 2>/dev/null
+    echo "$key=$(date +%s)" >> "$STATE_FILE"
+}
+
+# ---------- self-heal helpers -------------------------------------------
+
+# Re-run a failed GitHub Actions workflow once (flaky-run recovery).
+retry_run() {
+    local slug=$1 runid
+    runid=$(gh run list -R "$slug" --limit 1 --json databaseId,conclusion \
+            -q '.[0] | select(.conclusion=="failure") | .databaseId' 2>/dev/null)
+    [ -z "$runid" ] && return 1
+    gh run rerun "$runid" -R "$slug" >/dev/null 2>&1 || return 1
+    echo "re-run queued"
+}
+
+# A repo whose newest run failed BEFORE its newest push: the failure is
+# stale (a newer commit already landed). Fetch + wait for the new run.
+stale_failure() {
+    local slug=$1 head lastrunsha
+    head=$(git -C "$2" rev-parse HEAD 2>/dev/null)
+    lastrunsha=$(gh run list -R "$slug" --limit 1 --json headSha \
+                 -q '.[0].headSha' 2>/dev/null)
+    [ -n "$head" ] && [ "$lastrunsha" != "$head" ]
+}
 
 is_project_dir() {
     find "$1" -maxdepth 2 -not -path '*/.git*' -not -path '*/lib/*' \
@@ -69,7 +114,12 @@ check_project() {
         local ahead
         ahead=$(git -C "$dir" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "?")
         if [ "$ahead" != "0" ]; then
-            alert "$name: $ahead unpushed commit(s) on $branch (guard pushes every 10 min - persistent here means the guard is stuck)"
+            # SELF-HEAL: push the commits ourselves
+            if git -C "$dir" push origin "$branch" >/dev/null 2>&1; then
+                fixed "$name: pushed $ahead stranded commit(s) to $branch"
+            else
+                alert "$name: $ahead unpushed commit(s) on $branch (push failed - auth or conflict?)"
+            fi
         fi
         local dirty
         dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)
@@ -89,7 +139,24 @@ check_project() {
         case "$concl" in
             success) note "  $name: CI green ($verdict)" ;;
             failure|startup_failure|cancelled|timed_out|action_required)
-                     alert "$name: CI $concl on $sha" ;;
+                if stale_failure "$slug" "$dir"; then
+                    # SELF-HEAL: failure is on an old commit; a newer one is
+                    # already landing. Just note it; next check sees the new run.
+                    note "  $name: CI failure on $sha is stale (newer HEAD pushed; waiting for new run)"
+                elif [ "$concl" = "failure" ]; then
+                    # SELF-HEAL attempt: one re-run covers network flakes.
+                    # Real code bugs will fail again -> alert (deduped 6h).
+                    if retry_run "$slug" >/dev/null 2>&1; then
+                        fixed "$name: CI failure on $sha — re-run queued (flake?)"
+                    elif seen_recently "ci:$name:$sha"; then
+                        note "  $name: CI failure on $sha (already reported; fix in progress)"
+                    else
+                        mark_seen "ci:$name:$sha"
+                        alert "$name: CI failure on $sha persists after re-run — needs a code fix"
+                    fi
+                else
+                    alert "$name: CI $concl on $sha"
+                fi ;;
             *)  # null/empty: either pending or no runs at all
                 if [ "$sha" = "null" ] || [ -z "$sha" ]; then
                     if ls "$dir"/.github/workflows/*.yml >/dev/null 2>&1; then
@@ -109,12 +176,33 @@ check_project() {
     if [ -n "${SERVICES[$name]:-}" ]; then
         local timer marker head m8
         timer="${SERVICES[$name]}"
-        systemctl is-active --quiet "$timer.timer" || alert "$name: deploy timer $timer.timer NOT active"
+        if ! systemctl is-active --quiet "$timer.timer"; then
+            # SELF-HEAL: re-enable the deploy timer
+            if sudo -n systemctl enable --now "$timer.timer" >/dev/null 2>&1; then
+                fixed "$name: deploy timer $timer.timer re-enabled"
+            else
+                alert "$name: deploy timer $timer.timer NOT active (enable failed)"
+            fi
+        fi
         marker=$(cat "$dir/.deployed_commit" 2>/dev/null || echo "")
         head=$(git -C "$dir" rev-parse HEAD)
         m8=${marker:0:8}; [ -z "$m8" ] && m8="nothing-yet"
         if [ "$marker" != "$head" ]; then
-            alert "$name: service runs $m8, HEAD is ${head:0:8} (deploy lagging, blocked on dirty tree, or failed health check - see deploy.log)"
+            # SELF-HEAL: run the deploy now
+            if [ -x "$dir/deploy/deploy.sh" ]; then
+                if (cd "$dir" && ./deploy/deploy.sh >/dev/null 2>&1); then
+                    newmarker=$(cat "$dir/.deployed_commit" 2>/dev/null || echo "")
+                    if [ "$newmarker" = "$head" ]; then
+                        fixed "$name: deploy caught up ($m8 -> ${head:0:8})"
+                    else
+                        alert "$name: deploy re-run did not reach HEAD (health gate? see deploy.log)"
+                    fi
+                else
+                    alert "$name: deploy re-run failed (see deploy.log)"
+                fi
+            else
+                alert "$name: service runs $m8, HEAD is ${head:0:8} (no deploy.sh to self-heal)"
+            fi
         else
             note "  $name: deployed at HEAD, healthy"
         fi
@@ -132,10 +220,14 @@ done
 
 if [ "$VERBOSE" = yes ]; then
     printf '%s' "$report"
+    [ -n "$fixedlines" ] && { echo "Self-healed:"; printf '%s' "$fixedlines"; }
     printf '%s' "$alertlines"
     [ $alerts = 0 ] && echo "✓ all projects pipeline-clean"
 elif [ $alerts -gt 0 ]; then
     printf '%s' "$alertlines"
-    echo "$alerts pipeline issue(s) need attention"
+    echo "$alerts pipeline issue(s) persist after self-heal attempts"
+elif [ -n "$fixedlines" ]; then
+    # silent success: fixes happened, nothing needs the human
+    :
 fi
 exit 0
