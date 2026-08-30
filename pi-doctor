@@ -394,6 +394,29 @@ def check_mute(mute_file=None):
     return [], []
 
 
+def check_rtk():
+    """RTK (Rust Token Killer) savings summary — informational only."""
+    import shutil, subprocess
+    if not shutil.which("rtk"):
+        return []
+    try:
+        r = subprocess.run(["rtk", "gain"], capture_output=True, text=True, timeout=20)
+        out = r.stdout
+        saved = pct = None
+        for line in out.splitlines():
+            if "Tokens saved:" in line:
+                saved = line.split(":")[-1].strip().split("(")[0].strip()
+            if "Efficiency meter:" in line:
+                import re
+                m = re.search(r"([\d.]+)%", line)
+                pct = m.group(1) if m else None
+        if saved:
+            return [f"rtk saved {saved} tokens ({pct}%) since install"]
+    except Exception:
+        pass
+    return []
+
+
 def main():
     verbose = "--verbose" in sys.argv
     now = datetime.now()
@@ -427,8 +450,14 @@ def main():
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
 
     report = format_report(all_findings, all_fixes, now)
+    info = check_rtk()
     if verbose:
         print(report)
+        if info:
+            print()
+            print("RTK token savings:")
+            for i in info:
+                print("  ✓", i)
 
     if all_findings:
         state = load_state()

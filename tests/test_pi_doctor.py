@@ -171,3 +171,21 @@ def test_standing_mute_is_a_finding(tmp_path):
 def test_no_mute_no_finding(tmp_path):
     f, x = doc.check_mute(str(tmp_path / "absent"))
     assert f == [] and x == []
+
+
+def test_check_rtk_reports_savings(monkeypatch):
+    import subprocess
+    doc = _load()
+    fake = subprocess.CompletedProcess(
+        ["rtk", "gain"], 0,
+        stdout="Total commands: 42\nOutput tokens: 1000\nTokens saved: 5.2K (83.9%)\nEfficiency meter: ████████ 83.9%\n")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: fake)
+    info = doc.check_rtk()
+    assert any("5.2K" in i and "83.9" in i for i in info)
+
+
+def test_check_rtk_silent_without_binary(monkeypatch):
+    import shutil
+    doc = _load()
+    monkeypatch.setattr(shutil, "which", lambda *a: None)
+    assert doc.check_rtk() == []
