@@ -147,6 +147,8 @@ templates/deploy.sh        parameterised pull-based deploy script (__NAME__/__PO
 templates/deploy.timer     matching systemd timer
 systemd/                guard + heartbeat units
 docs/architecture.md    design decisions and the incident log
+docs/layers.md          one page per operational layer (deploy, guard, heartbeat, …)
+docs/units.md           the unit index — every running unit → config, timer, topic
 docs/notifications.md   ntfy backbone: topics, auth model, runbook
 install.sh              fresh-host installer
 tests/                  loop-heartbeat + ntfy-notify suites (fixtures from real hermes output)
