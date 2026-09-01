@@ -450,6 +450,9 @@ def main():
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
 
     report = format_report(all_findings, all_fixes, now)
+    heals = _recent_heals(now)
+    if heals:
+        report += f"\nSelf-healed in the last 24h: {heals} thing(s)"
     info = check_rtk()
     if verbose:
         print(report)
@@ -475,6 +478,30 @@ def main():
     # all green and nothing fixed -> silent
 
     return 0
+
+
+def _recent_heals(now=None, hours=24, state_file=None):
+    """Count pipeline-check self-heals recorded in the last `hours`."""
+    import json
+    import os
+    from datetime import timedelta
+    path = state_file or os.path.expanduser(
+        "~/.local/state/pipeline-check/status.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return 0
+    now = now or datetime.now()
+    cutoff = now - timedelta(hours=hours)
+    n = 0
+    for heal in data.get("heals", []):
+        try:
+            if datetime.fromisoformat(heal["ts"]) >= cutoff:
+                n += 1
+        except (KeyError, TypeError, ValueError):
+            continue
+    return n
 
 
 def _key(finding):

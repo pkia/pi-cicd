@@ -6,6 +6,10 @@
 # Persistent alerts are deduped for 6h (state in ~/.pipeline-check.state).
 # Prints nothing when everything is green AND stays green.
 #
+# Every self-heal is recorded to ~/.local/state/pipeline-check/status.json
+# (event-driven, bounded 50-entry ledger) so the portal's Self-healing
+# panel and pi-doctor's audit can show the self-healer's work.
+#
 # Manual use:   pipeline-check [--verbose]
 set -u
 set +o pipefail
@@ -16,6 +20,8 @@ HOME_DIR="${GUARD_HOME:-/home/ev}"
 EXCLUDE=(AIS-catcher-src AdGuardHome)
 STATE_FILE="$HOME_DIR/.pipeline-check.state"
 DEDUPE_HOURS=6
+HEAL_STATE_DIR="$HOME_DIR/.local/state/pipeline-check"
+HEALS_FILE="$HEAL_STATE_DIR/status.json"
 # Services with pull-based CD: dir -> systemd unit of the deploy timer
 declare -A SERVICES=(
     [maritime-dashboard]=maritime-dashboard-deploy
@@ -32,7 +38,34 @@ fixedlines=""
 
 note()  { report+="$1"$'\n'; }          # verbose-only line
 alert() { alertlines+="⚠ $1"$'\n'; alerts=$((alerts+1)); }
-fixed() { fixedlines+="✓ $1"$'\n'; }
+
+# ---------- heal ledger: every self-heal, with before -> after detail ----
+record_heal() {  # $1=machine key, $2=human detail line
+    mkdir -p "$HEAL_STATE_DIR"
+    python3 - "$HEALS_FILE" "$1" "$2" <<'PY'
+import json, os, sys, datetime
+path, what, detail = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {"heals": []}
+entry = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+         "what": what, "detail": detail}
+data.setdefault("heals", []).append(entry)
+data["heals"] = data["heals"][-50:]  # keep the ledger bounded
+data["updated"] = entry["ts"]
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, path)
+PY
+}
+
+fixed() {  # $1=machine key, $2=human line
+    fixedlines+="✓ $2"$'\n'
+    record_heal "$1" "$2"
+}
 
 # ---------- dedupe state: suppress alerts seen in the last N hours ------
 state_key() { echo "$1" | tr ' /:' '__' | cut -c1-80; }
@@ -116,7 +149,7 @@ check_project() {
         if [ "$ahead" != "0" ]; then
             # SELF-HEAL: push the commits ourselves
             if git -C "$dir" push origin "$branch" >/dev/null 2>&1; then
-                fixed "$name: pushed $ahead stranded commit(s) to $branch"
+                fixed push-stranded-commits "$name: pushed $ahead stranded commit(s) to $branch"
             else
                 alert "$name: $ahead unpushed commit(s) on $branch (push failed - auth or conflict?)"
             fi
@@ -147,7 +180,7 @@ check_project() {
                     # SELF-HEAL attempt: one re-run covers network flakes.
                     # Real code bugs will fail again -> alert (deduped 6h).
                     if retry_run "$slug" >/dev/null 2>&1; then
-                        fixed "$name: CI failure on $sha — re-run queued (flake?)"
+                        fixed ci-rerun-queued "$name: CI failure on $sha — re-run queued (flake?)"
                     elif seen_recently "ci:$name:$sha"; then
                         note "  $name: CI failure on $sha (already reported; fix in progress)"
                     else
@@ -179,7 +212,7 @@ check_project() {
         if ! systemctl is-active --quiet "$timer.timer"; then
             # SELF-HEAL: re-enable the deploy timer
             if sudo -n systemctl enable --now "$timer.timer" >/dev/null 2>&1; then
-                fixed "$name: deploy timer $timer.timer re-enabled"
+                fixed re-enable-deploy-timer "$name: deploy timer $timer.timer re-enabled"
             else
                 alert "$name: deploy timer $timer.timer NOT active (enable failed)"
             fi
@@ -193,7 +226,7 @@ check_project() {
                 if (cd "$dir" && ./deploy/deploy.sh >/dev/null 2>&1); then
                     newmarker=$(cat "$dir/.deployed_commit" 2>/dev/null || echo "")
                     if [ "$newmarker" = "$head" ]; then
-                        fixed "$name: deploy caught up ($m8 -> ${head:0:8})"
+                        fixed deploy-caught-up "$name: deploy caught up ($m8 -> ${head:0:8})"
                     else
                         alert "$name: deploy re-run did not reach HEAD (health gate? see deploy.log)"
                     fi
