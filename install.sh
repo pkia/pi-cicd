@@ -53,6 +53,26 @@ sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now project-guard.timer
 echo "project-guard timer installed and active"
 
+# Prometheus metrics stack, step 1 (Prom stack idea, 2026-09-02): Debian
+# packages, loopback-bound, minimal scrape config. Requires the packages:
+#   sudo apt install prometheus prometheus-node-exporter
+# Grafana dashboard + alerting are step 2 (docs/prometheus.md).
+if command -v prometheus >/dev/null 2>&1; then
+    sudo mkdir -p /etc/prometheus \
+        /etc/systemd/system/prometheus.service.d \
+        /etc/systemd/system/prometheus-node-exporter.service.d
+    sudo cp "$REPO_DIR/prometheus/prometheus.yml" /etc/prometheus/prometheus.yml
+    sudo cp "$REPO_DIR/prometheus/prometheus-bind-local.conf" \
+        /etc/systemd/system/prometheus.service.d/bind-local.conf
+    sudo cp "$REPO_DIR/prometheus/node-exporter-bind-local.conf" \
+        /etc/systemd/system/prometheus-node-exporter.service.d/bind-local.conf
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now prometheus prometheus-node-exporter
+    echo "prometheus + node_exporter enabled (loopback-bound)"
+else
+    echo "note: prometheus not installed - run: sudo apt install prometheus prometheus-node-exporter"
+fi
+
 # loop-heartbeat: dead-man's switch for the scheduled loop. Needs
 # /etc/loop-heartbeat.conf (SEND_TARGET etc.) - see the script's docstring.
 # Install is skipped silently when the config is absent.

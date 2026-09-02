@@ -1,0 +1,16 @@
+# Prometheus scrape config — source of truth for the Pi's metrics stack.
+# Installed to /etc/prometheus/prometheus.yml by install.sh (Prom stack
+# idea, step 1, 2026-09-02). Loopback-only targets: nothing on this box
+# is scraped from the network, and Grafana (step 2) will run locally.
+# Both daemons are loopback-bound via systemd drop-ins in this directory.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
