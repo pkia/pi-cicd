@@ -29,9 +29,12 @@ ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
 ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
 ln -sf "$REPO_DIR/service-probe" "$BIN_DIR/service-probe"
 ln -sf "$REPO_DIR/chaos-drill"   "$BIN_DIR/chaos-drill"
+ln -sf "$REPO_DIR/pipeline-check" "$BIN_DIR/pipeline-check"
+ln -sf "$REPO_DIR/pi-doctor"     "$BIN_DIR/pi-doctor"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
-         "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill"
+         "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
+         "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
