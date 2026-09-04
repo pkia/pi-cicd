@@ -1,11 +1,14 @@
 """install.sh must make every runnable repo tool available on PATH.
 
 Regression test for the 2026-09-03 find: pipeline-check and pi-doctor were
-never symlinked by install.sh (and no systemd unit schedules them), so the
-self-healer's heal ledger could never be written on the live box — the
-09-01 ledger ship was repo-only. A tool that lives in the repo but is not
-linked by the installer is dead code by accident; this test keeps the
-installer honest.
+never symlinked by install.sh, so they were unusable from an interactive
+shell. 09-04 correction: the "no systemd unit schedules them, so the heal
+ledger could never be written" half of that find was wrong — both tools
+are Hermes-cron scheduled per docs/units.md (the cron wrapper execs the
+repo tool by absolute path), so the ledger writes fine whenever a heal
+fires; the only real gap was interactive PATH use. A tool that lives in
+the repo but is not linked by the installer is dead code by accident;
+this test keeps the installer honest.
 """
 import re
 from pathlib import Path

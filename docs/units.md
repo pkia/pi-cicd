@@ -17,8 +17,8 @@ messaging platform via `hermes send`.
 |---|---|---|---|---|---|---|
 | project-guard | systemd | every 10 min | — (scans `$HOME`, `$HOME/apps/*`) | `~/.local/state/project-guard.log` | — (push-only, silent) | `systemctl status project-guard.timer` |
 | deploy.sh (per service) | systemd | every 3 min | unit from `templates/deploy.timer`; marker `.deployed_commit` in service repo | `.deployed_commit` / `.deploy_failed` | — | `systemctl list-timers '*deploy*'` |
-| pipeline-check | Hermes cron (no-agent) | hourly | Hermes job definition | — (prints alerts) | — *(hermes)* | `hermes cron list` |
-| pi-doctor | Hermes cron (agent) | daily 07:00 | Hermes job definition | `pi-doctor-state.json` (untracked) | — *(hermes, deduped)* | `pi-doctor --verbose` |
+| pipeline-check | Hermes cron (no-agent) | 01:00 & 13:00 (cron `0 1,13 * * *`) | Hermes job `pipeline-check-wrapper.sh` (execs repo tool by absolute path) | — (prints alerts) | — *(hermes)* | `hermes cron list` |
+| pi-doctor | Hermes cron (agent) | daily 06:30 (cron `30 6 * * *`) | Hermes job `pi-doctor daily audit` | `pi-doctor-state.json` (untracked) | — *(hermes, deduped)* | `pi-doctor --verbose` |
 | loop-heartbeat | systemd | every 30 min | `/etc/loop-heartbeat.conf` | `~/.local/state/loop-heartbeat/` | `loop-heartbeat` (+ WhatsApp) | `loop-heartbeat --dry-run -v` |
 | ntfy-notify | helper | on demand | `/etc/ntfy-notify.conf` | — | per-job topic argument | `ntfy-notify -t radar -T test hi` |
 | ntfy server | systemd (Debian package) | always on | `/etc/ntfy/server.yml`, `/etc/ntfy/tokens/` | `~/.local/state/ntfy/` | all topics | `systemctl status ntfy` |
