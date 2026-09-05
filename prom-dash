@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""prom-dash — the pinned dashboard the devlogs quote, pi-cicd native.
+
+Prom stack step 2, concretised 2026-09-05: the board's "Grafana from apt"
+premise was false — grafana is NOT in Debian trixie (verified live:
+`apt-cache search grafana` finds no package, and this box runs Debian
+packages only: no third-party repos, no containers). Grafana cannot get
+on this box the box's way, so the graphs get a native answer instead:
+prom-dash ranges the loopback Prometheus (default http://127.0.0.1:9090)
+for the panels the devlogs quote — CPU temperature against load, systemd
+unit health over time — and renders ONE self-contained HTML file with
+inline SVG sparklines. Runs on demand: ~0 MB resident (the scrape layer
+already costs ~102 MB RSS; a Grafana would add its own ~150 MB for the
+same two graphs).
+
+Usage:
+    prom-dash [--out PATH] [--url URL] [--hours N]
+
+Default out: ~/.local/state/prom-dash/dashboard.html (created ev-owned).
+Exit 0 when Prometheus answers (individual panels may be legitimately
+empty); exit 1 when Prometheus is unreachable — the existing dashboard
+file is left untouched in that case.
+
+PANELS is the pin: it is what the devlogs quote, and
+tests/test_prom_dash.py binds it (a fake Prometheus must see exactly
+these queries).
+"""
+import argparse
+import html
+import json
+import math
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+# The pinned panels. Query results are averaged across series per
+# timestamp, so every panel renders one line.
+PANELS = [
+    {
+        "name": "CPU temperature",
+        # hwmon is node_exporter's default collector; thermal_zone is not.
+        # The `or` keeps the dashboard working whichever the kernel exposes.
+        "query": "avg(node_hwmon_temp_celsius or node_thermal_zone_temp)",
+        "unit": "°C",
+        "color": "#ef4444",
+    },
+    {
+        "name": "Load average (1m)",
+        "query": "node_load1",
+        "unit": "",
+        "color": "#3b82f6",
+    },
+    {
+        "name": "Active systemd units",
+        "query": 'count(node_systemd_unit_state{state="active"})',
+        "unit": "",
+        "color": "#22c55e",
+    },
+    {
+        "name": "Failed systemd units",
+        "query": 'count(node_systemd_unit_state{state="failed"})',
+        "unit": "",
+        "color": "#f59e0b",
+    },
+]
+
+W, H, PAD = 600, 110, 6  # sparkline viewBox geometry
+
+
+def fetch_range(url, query, start, end, step, timeout=10):
+    """Run a Prometheus range query; return data.result (list of series)."""
+    qs = urllib.parse.urlencode(
+        {"query": query, "start": start, "end": end, "step": step}
+    )
+    req = urllib.request.Request(
+        f"{url}/api/v1/query_range?{qs}", headers={"Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.load(resp)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"cannot reach Prometheus: {exc}") from exc
+    if payload.get("status") != "success":
+        raise RuntimeError(f"Prometheus error: {payload.get('error', payload)}")
+    return payload["data"]["result"]
+
+
+def series_values(results):
+    """Collapse result series into one time-aligned list (avg per ts)."""
+    buckets = {}
+    for res in results:
+        for ts, val in res.get("values", []):
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(f):
+                continue
+            buckets.setdefault(int(float(ts)), []).append(f)
+    if not buckets:
+        return []
+    return [sum(v) / len(v) for _, v in sorted(buckets.items())]
+
+
+def sparkline(values, color):
+    """Inline SVG for one series; '' when there is nothing to draw."""
+    if len(values) < 2:
+        return ""
+    mn, mx = min(values), max(values)
+    span = (mx - mn) or 1.0
+    n = len(values)
+    dx = (W - 2 * PAD) / (n - 1)
+    pts = [
+        (PAD + i * dx, H - PAD - (v - mn) / span * (H - 2 * PAD))
+        for i, v in enumerate(values)
+    ]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    area = f"{line} {W - PAD:.1f},{H - PAD:.1f} {PAD:.1f},{H - PAD:.1f}"
+    return (
+        f'<svg viewBox="0 0 {W} {H}" preserveAspectRatio="none" '
+        f'aria-hidden="true"><polygon points="{area}" fill="{color}" '
+        f'fill-opacity="0.08"/><polyline points="{line}" fill="none" '
+        f'stroke="{color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>'
+        f"</svg>"
+    )
+
+
+def render(rows, meta):
+    """One self-contained HTML page from [(panel, values), ...]."""
+    cards = []
+    for panel, values in rows:
+        if not values:
+            body = '<div class="nodata">no data in range</div>'
+        else:
+            last = values[-1]
+            body = (
+                f'<div class="latest">{last:.1f}<span class="unit">'
+                f'{html.escape(panel["unit"])}</span></div>'
+                f'<div class="stats">24h min {min(values):.1f}'
+                f" · max {max(values):.1f}</div>"
+                f'{sparkline(values, panel["color"])}'
+            )
+        cards.append(
+            '<div class="card"><h3>' + html.escape(panel["name"]) + "</h3>"
+            + body
+            + "<code>" + html.escape(panel["query"]) + "</code></div>"
+        )
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>pi prom-dash</title>
+<style>
+  body{{font-family:system-ui,sans-serif;margin:2rem;background:#fafafa;color:#111}}
+  h1{{font-size:1.4rem;margin:0 0 .2rem}} h3{{margin:0 0 .4rem;font-size:.95rem}}
+  .meta{{color:#666;font-size:.8rem;margin:0 0 1.5rem}}
+  main{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}}
+  .card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem}}
+  .latest{{font-size:2rem;font-weight:600}} .unit{{font-size:1rem;font-weight:400;color:#666}}
+  .stats{{color:#666;font-size:.8rem;margin:.2rem 0 .6rem}}
+  svg{{width:100%;height:auto;display:block}} .nodata{{color:#999;padding:2rem 0;text-align:center}}
+  code{{font-size:.65rem;color:#999;word-break:break-all}}
+</style></head><body>
+<h1>pi prom-dash</h1>
+<p class="meta">rendered {meta["ts"]} · last {meta["hours"]:.0f} h · {html.escape(meta["url"])}
+ · regenerate: <code>prom-dash</code></p>
+<main>{''.join(cards)}</main>
+</body></html>
+"""
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url", default=os.environ.get("PROM_DASH_URL",
+                                                     "http://127.0.0.1:9090"))
+    ap.add_argument("--out", default=os.path.expanduser(
+        "~/.local/state/prom-dash/dashboard.html"))
+    ap.add_argument("--hours", type=float, default=24)
+    args = ap.parse_args(argv)
+
+    end = int(datetime.now(timezone.utc).timestamp())
+    start = end - int(args.hours * 3600)
+    step = max(60, int(args.hours * 3600 // 96))  # ~96 samples per panel
+
+    rows, failures = [], 0
+    for panel in PANELS:
+        try:
+            results = fetch_range(args.url, panel["query"], start, end, step)
+        except RuntimeError as exc:
+            failures += 1
+            print(f"prom-dash: {panel['name']}: {exc}", file=sys.stderr)
+            results = []
+        rows.append((panel, series_values(results)))
+
+    if failures == len(PANELS):
+        print(f"prom-dash: Prometheus unreachable at {args.url} — "
+              "dashboard left untouched", file=sys.stderr)
+        return 1
+
+    meta = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "hours": args.hours, "url": args.url}
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w") as fh:
+        fh.write(render(rows, meta))
+
+    for panel, values in rows:  # the numbers the devlogs quote
+        if values:
+            print(f'{panel["name"]}: last {values[-1]:.1f}{panel["unit"]}'
+                  f' (24h min {min(values):.1f} max {max(values):.1f})')
+        else:
+            print(f'{panel["name"]}: no data in range')
+    print(f"dashboard: {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -26,6 +26,7 @@ TOOLS = [
     "pi-backup",
     "pi-doctor",
     "pipeline-check",
+    "prom-dash",
     "project-guard",
     "release-watch",
     "service-probe",
