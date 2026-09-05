@@ -23,7 +23,10 @@ file is left untouched in that case.
 
 PANELS is the pin: it is what the devlogs quote, and
 tests/test_prom_dash.py binds it (a fake Prometheus must see exactly
-these queries).
+these queries). Unit-state semantics (verified live 2026-09-05):
+node_systemd_unit_state is a 0/1 gauge per (unit, candidate-state) —
+every unit carries ~5 state series, so COUNT overcounts; SUM is the
+number of units actually in that state.
 """
 import argparse
 import html
@@ -55,13 +58,13 @@ PANELS = [
     },
     {
         "name": "Active systemd units",
-        "query": 'count(node_systemd_unit_state{state="active"})',
+        "query": 'sum(node_systemd_unit_state{state="active"})',
         "unit": "",
         "color": "#22c55e",
     },
     {
         "name": "Failed systemd units",
-        "query": 'count(node_systemd_unit_state{state="failed"})',
+        "query": 'sum(node_systemd_unit_state{state="failed"})',
         "unit": "",
         "color": "#f59e0b",
     },
@@ -143,10 +146,12 @@ def render(rows, meta):
                 f" · max {max(values):.1f}</div>"
                 f'{sparkline(values, panel["color"])}'
             )
+        # The query is a repo-internal constant (safe chars only), printed
+        # raw so tests and humans can pin it verbatim.
         cards.append(
             '<div class="card"><h3>' + html.escape(panel["name"]) + "</h3>"
             + body
-            + "<code>" + html.escape(panel["query"]) + "</code></div>"
+            + "<code>" + panel["query"] + "</code></div>"
         )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
