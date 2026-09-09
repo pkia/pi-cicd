@@ -11,7 +11,7 @@ REPO = Path(__file__).resolve().parent.parent
 CONFIG = REPO / "prometheus" / "prometheus.yml"
 DOC = REPO / "docs" / "prometheus.md"
 
-EXPECTED_JOBS = ("prometheus", "node")
+EXPECTED_JOBS = ("prometheus", "node", "ntfy")
 
 
 def test_config_has_expected_jobs():

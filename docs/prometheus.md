@@ -67,11 +67,17 @@ against 99 real; the bug died before merge). Live render 2026-09-06:
 24 h temp 45.9–50.7 °C, load 0.0–1.4, 99 active / 0 failed units.
 pi-cicd commits `a48fafb`, `9c02da7`.
 
-## Remaining (step-3 scope, board item)
+## Step 3a shipped: ntfy `/metrics` scrape (2026-09-09)
 
-- ntfy `/metrics` scrape — `metrics-listen-http: "127.0.0.1:9091"` in
-  the ntfy server config (/etc, root-owned, pi-backup-covered) plus ONE
-  planned ntfy restart at a quiet hour, then an `ntfy` scrape job here.
+`metrics-listen-http: "127.0.0.1:9091"` added to the live ntfy server
+config (/etc/ntfy/server.yml, root-owned, pi-backup-covered — the one
+planned restart happened 05:32 IST at a quiet hour), and the `ntfy` job
+scrapes it loopback-only here (15 s interval). Live evidence: ntfy
+active after restart, `/metrics` answering on 127.0.0.1:9091, and
+`up{job="ntfy"}` = 1 via the query API.
+
+## Remaining (step-3b scope, board item)
+
 - Metric alerting — needs a delivery consumer (Alertmanager from apt vs
   a stdlib rule-check tool) and an answer to the mute gap: ntfy_lib's
   global mute covers pi-cicd publishers only, not server-side webhooks.
