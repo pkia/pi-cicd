@@ -21,6 +21,7 @@ messaging platform via `hermes send`.
 | pi-doctor | Hermes cron (agent) | daily 06:30 (cron `30 6 * * *`) | Hermes job `pi-doctor daily audit` | `pi-doctor-state.json` (untracked) | — *(hermes, deduped)* | `pi-doctor --verbose` |
 | loop-heartbeat | systemd | every 30 min | `/etc/loop-heartbeat.conf` | `~/.local/state/loop-heartbeat/` | `loop-heartbeat` (+ WhatsApp) | `loop-heartbeat --dry-run -v` |
 | ntfy-notify | helper | on demand | `/etc/ntfy-notify.conf` | — | per-job topic argument | `ntfy-notify -t radar -T test hi` |
+| metric-alert | systemd | every 5 min (offset 4 min) | `/etc/metric-alert.conf` (NTFY keys, PROM_URL, RULE lines) | `~/.local/state/metric-alert/` | `services` (edge-triggered) | `metric-alert --list` |
 | ntfy server | systemd (Debian package) | always on | `/etc/ntfy/server.yml`, `/etc/ntfy/tokens/` | `~/.local/state/ntfy/` | all topics | `systemctl status ntfy` |
 | pi-backup | systemd | daily 03:30 | `/etc/pi-backup.conf` (600, root) | borg repo `/var/backups/pi-borg` | `backups` | `systemctl list-timers pi-backup*` |
 | pi-backup-drill | systemd | Sun 05:30 | same | same | `backups` | `journalctl -u pi-backup-drill` |

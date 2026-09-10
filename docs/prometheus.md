@@ -76,9 +76,33 @@ scrapes it loopback-only here (15 s interval). Live evidence: ntfy
 active after restart, `/metrics` answering on 127.0.0.1:9091, and
 `up{job="ntfy"}` = 1 via the query API.
 
-## Remaining (step-3b scope, board item)
+## Step 3b shipped: `metric-alert` (the stdlib rule-check)
 
-- Metric alerting — needs a delivery consumer (Alertmanager from apt vs
-  a stdlib rule-check tool) and an answer to the mute gap: ntfy_lib's
-  global mute covers pi-cicd publishers only, not server-side webhooks.
-  service-probe keeps covering service health meanwhile.
+The board item asked for a delivery consumer
+(Alertmanager-from-apt vs stdlib rule-check) and an answer to the mute
+gap. Both decided 2026-09-10, in favour of `metric-alert`:
+
+- **Rule-check, not Alertmanager.** A second daemon with its own config
+  language and no apt-pinned surface worth its RAM, for five rules.
+  Prometheus scrapes; `metric-alert` decides (query API only — nothing
+  is written into `/etc/prometheus/`).
+- **Mute gap closed.** Alerts publish through `ntfy_lib`, exactly like
+  every pi-cicd publisher, so `ntfy-notify --mute` silences metric
+  alerts too. An Alertmanager webhook receiver would have sat outside
+  ntfy_lib and stayed un-mutable from the box.
+
+Rules live in `/etc/metric-alert.conf` as `RULE=Name op threshold =
+promql-expression`; a breach must hold for CONFIRM_FAILS sweeps
+(default 2) before it alerts, and alerting is edge-triggered — one
+message when a rule starts breaching, one when it recovers, silence in
+between. Topic is the existing, already-provisioned `services` topic:
+no new ACL grant and no ntfy restart (a dedicated `alerts` topic is a
+later, one-line change if volume ever justifies it —
+docs/notifications.md has the grant recipe).
+
+Shipped rules (templates/metric-alert.conf.example): root filesystem
+used %, SoC temperature, memory used %, failed systemd units, and any
+scrape target down. State + rendered summary in
+`~/.local/state/metric-alert/`. systemd timer every 5 min, offset 4 min
+from service-probe so the two sweeps never stack — probe answers "is it
+up", metric-alert answers "is it healthy".

@@ -1,0 +1,13 @@
+[Unit]
+Description=Evaluate metric alert rules every 5 minutes
+# 5 min like service-probe, but offset (4 min) so the two sweeps never
+# stack: probe answers "is it up", metric-alert answers "is it healthy".
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

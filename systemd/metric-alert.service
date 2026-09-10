@@ -1,0 +1,9 @@
+[Unit]
+Description=Metric rule check (Prometheus -> ntfy alerts + status.json)
+After=network-online.target prometheus.service
+Wants=network-online.target prometheus.service
+
+[Service]
+Type=oneshot
+User=ev
+ExecStart=/home/ev/.local/bin/metric-alert

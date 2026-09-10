@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""metric-alert — stdlib metric alerting for the loopback Prometheus.
+
+Step 3b of the Prom stack (docs/prometheus.md). Prometheus scrapes; this
+tool decides. It queries the loopback Prometheus for a small config-driven
+list of rules, confirms a breach over CONFIRM_FAILS consecutive sweeps
+(one blip is not an incident), and publishes ONE digest per state change
+to the ntfy backbone — never a repeat while a rule stays breached.
+
+    metric-alert [--config FILE] [--state FILE] [--dry-run] [-v]
+    metric-alert --list [--state FILE]      print last-known rule values
+
+Why not Alertmanager: it is not the box's way (a second daemon with its
+own config language and no apt-pinned surface worth the RAM), and the
+mute gap — docs/prometheus.md asks how the ntfy_lib global mute reaches
+metric alerts — is closed for free by publishing through ntfy_lib instead
+of a server-side webhook. Alertmanager's webhook receiver would sit
+outside ntfy_lib and could not be muted from the box.
+
+Rules (config-driven, one per line):
+
+    RULE=Name op threshold = promql-expression
+
+    The leading `Name op threshold =` prefix is what is parsed, then the
+    rest of the line is the expression verbatim — so PromQL may contain
+    `=`, `,`, `{`, `}`, `|` and comparisons without escaping. op is one of
+    > >= < <=. A rule fires when ANY returned series satisfies it; the
+    digest names the worst series (max value for > / >=, min for < / <=).
+
+State: ~/.local/state/metric-alert/state.json (per-rule status, breach
+streak, last value) alongside status.json (the rendered summary, rewritten
+atomically every sweep).
+
+Digests go to ntfy topic 'services' (publisher token, same JSON shape as
+ntfy-notify — see docs/notifications.md). Topic choice is deliberate: the
+topic is already ACL-provisioned and delivered to the owner's phone, so
+metric alerting needs no new grant and no ntfy restart. Subscriptions stay
+meaningful because alert-storm control means a quiet topic, almost always
+silent. Publishing is best-effort: a dead notification path must not fail
+the run. Exit 0 on a normal run (digest or silence), 1 when the run itself
+is broken (no rules configured, state unwritable, or every query failed).
+
+The systemd timer runs this every 5 minutes.
+
+Config: /etc/metric-alert.conf (KEY=VALUE, '#' comments):
+
+    NTFY_URL      base URL, e.g. http://100.122.94.33:6839
+    NTFY_TOKEN    access token of the 'publisher' ntfy user
+    NTFY_TOPIC    default 'services'
+    PROM_URL      default http://127.0.0.1:9090 (loopback only)
+    RULE / CONFIRM_FAILS / TIMEOUT_SECS  as above
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+import ntfy_lib
+
+DEFAULT_CONFIG = "/etc/metric-alert.conf"
+DEFAULT_STATE = "~/.local/state/metric-alert/state.json"
+DEFAULT_TOPIC = "services"
+DEFAULT_PROM = "http://127.0.0.1:9090"
+DEFAULT_TIMEOUT = 10
+DEFAULT_CONFIRM_FAILS = 2
+
+OPS = (">=", "<=", ">", "<")
+
+# RULE prefix: name, comparison operator, numeric threshold, '=', expression.
+# Longest operators first so '>=' never parses as '> ='.
+RE_RULE = re.compile(r"^(\S+)\s*(>=|<=|>|<)\s*([0-9][0-9.eE+-]*)\s*=\s*(.+)$")
+
+
+# ---------------------------------------------------------------- config
+
+def parse_env_lists(path):
+    """KEY=VALUE lines -> dict of lists (repeated keys accumulate)."""
+    cfg: dict[str, list[str]] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg.setdefault(key.strip(), []).append(value.strip())
+    return cfg
+
+
+def parse_rule(entry):
+    """'Name op threshold = expr' -> rule dict, or None if malformed.
+
+    Matched from the left and anchored, so the expression is whatever
+    follows the '=' terminator verbatim — PromQL keeps its own '=', ',' and
+    comparison characters, and '>=' is not mistaken for '> ='.
+    """
+    m = RE_RULE.match(entry.strip())
+    if m is None:
+        return None
+    name, op, threshold, expr = m.groups()
+    expr = expr.strip()
+    if not expr:
+        return None
+    try:
+        return {"name": name, "op": op, "threshold": float(threshold),
+                "expr": expr}
+    except ValueError:
+        return None
+
+
+def load_config(path):
+    """Parse the env-style config into the shape run() expects."""
+    if not Path(path).exists():
+        print(f"metric-alert: no config at {path} — no rules", file=sys.stderr)
+    elif not os.access(path, os.R_OK):
+        # Root-created configs are the classic trap here: the timer runs as
+        # ev, so a 600 root file means a silently empty rule set.
+        print(f"metric-alert: config {path} is not readable by this user "
+              "— no rules (check the file's owner/mode)", file=sys.stderr)
+    raw = parse_env_lists(path)
+
+    rules = []
+    for entry in raw.get("RULE", []):
+        rule = parse_rule(entry)
+        if rule is None:
+            print(f"metric-alert: bad RULE {entry!r} "
+                  "(want 'Name op threshold = expr') — skipped",
+                  file=sys.stderr)
+            continue
+        rules.append(rule)
+
+    try:
+        confirm = int((raw.get("CONFIRM_FAILS", [""])[-1])
+                      or DEFAULT_CONFIRM_FAILS)
+    except ValueError:
+        confirm = DEFAULT_CONFIRM_FAILS
+    try:
+        timeout = float((raw.get("TIMEOUT_SECS", [""])[-1])
+                        or DEFAULT_TIMEOUT)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
+
+    first = lambda key: (raw.get(key, [""])[-1].strip())  # noqa: E731
+    return {
+        "rules": rules,
+        "prom_url": (first("PROM_URL") or DEFAULT_PROM).rstrip("/"),
+        "ntfy_url": first("NTFY_URL").rstrip("/"),
+        "ntfy_token": first("NTFY_TOKEN"),
+        "topic": first("NTFY_TOPIC") or DEFAULT_TOPIC,
+        "timeout": timeout,
+        "confirm_fails": max(confirm, 1),
+    }
+
+
+# --------------------------------------------------------------- metrics
+
+def query(prom_url, expr, timeout, _urlopen=urllib.request.urlopen):
+    """Instant query -> (result-list, error). (None, msg) on any failure."""
+    url = f"{prom_url}/api/v1/query?" + urllib.parse.urlencode({"query": expr})
+    req = urllib.request.Request(url, method="GET",
+                                 headers={"User-Agent": "pi-metric-alert"})
+    try:
+        with _urlopen(req, timeout=timeout) as resp:
+            body = resp.read(1_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, str(exc)[:120]
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        return None, f"bad JSON: {str(exc)[:80]}"
+    if payload.get("status") != "success":
+        return None, f"prometheus: {payload.get('error', 'query failed')}"
+    result = payload.get("data", {}).get("result")
+    if not isinstance(result, list):
+        return None, "unexpected query result shape"
+    return result, None
+
+
+def series_label(metric):
+    """metric label dict -> short human label ('mountpoint=/', 'zone=…')."""
+    if not isinstance(metric, dict):
+        return ""
+    interesting = {k: v for k, v in metric.items()
+                   if k not in ("__name__", "job", "instance")}
+    if not interesting:
+        return metric.get("__name__", "") or ""
+    return ",".join(f"{k}={v}" for k, v in sorted(interesting.items()))
+
+
+def compare(value, op, threshold):
+    if op == ">":
+        return value > threshold
+    if op == ">=":
+        return value >= threshold
+    if op == "<":
+        return value < threshold
+    return value <= threshold
+
+
+def worst(result, op, threshold):
+    """Query result -> (value, label, count_firing, series_seen).
+
+    None value when there is no data at all (no data is never an alert —
+    a rule that cannot be evaluated must not page anyone).
+    """
+    seen = 0
+    firing = []
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        pair = item.get("value")
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        try:
+            value = float(pair[1])
+        except (TypeError, ValueError):
+            continue
+        seen += 1
+        if compare(value, op, threshold):
+            firing.append((value, series_label(item.get("metric"))))
+    if not firing:
+        # keep the extreme value for the record even when nothing fires
+        values = []
+        for item in result:
+            try:
+                values.append(float(item["value"][1]))
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        if not values:
+            return None, "", 0, seen
+        extremum = max(values) if op in (">", ">=") else min(values)
+        return extremum, "", 0, seen
+    extremum = max(firing) if op in (">", ">=") else min(firing)
+    return extremum[0], extremum[1], len(firing), seen
+
+
+# ------------------------------------------------------------------ ntfy
+
+def ntfy_post(cfg, title, message, tags, timeout):
+    """Publish the digest via the shared ntfy_lib; True on any 2xx or
+    muted. Never raises."""
+    if not (cfg["ntfy_url"] and cfg["ntfy_token"]):
+        print("metric-alert: NTFY_URL/NTFY_TOKEN not configured — "
+              "digest not published", file=sys.stderr)
+        return False
+    payload = {"topic": cfg["topic"], "message": message, "title": title,
+               "tags": tags}
+    return ntfy_lib.publish(
+        cfg["ntfy_url"], {"Authorization": f"Bearer {cfg['ntfy_token']}"},
+        payload, timeout=timeout, _urlopen=urllib.request.urlopen)
+
+
+# ----------------------------------------------------------------- state
+
+def load_state(path):
+    """state.json -> {"rules": {...}}. Missing/corrupt -> fresh."""
+    fresh = {"rules": {}}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return fresh
+    except ValueError:
+        print("metric-alert: state file corrupt, starting fresh",
+              file=sys.stderr)
+        return fresh
+    rules = data.get("rules")
+    return {"rules": rules} if isinstance(rules, dict) else fresh
+
+
+def save_json_atomic(path, obj):
+    """Write JSON atomically (tmp + rename). False on failure."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except OSError as exc:
+        print(f"metric-alert: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+
+
+# ------------------------------------------------------------------ core
+
+def apply_result(rule, value, label, count, error, cfg, entry, events, now):
+    """Fold one rule evaluation into state; append breach/recovery events."""
+    name = rule["name"]
+    was = entry.get("status")
+    entry.update({"expr": rule["expr"], "op": rule["op"],
+                  "threshold": rule["threshold"]})
+    if error:
+        entry["error"] = error
+        entry["status"] = "error"
+        return
+    entry["error"] = None
+    numeric = value is not None
+    entry["value"] = value
+    entry["series"] = label
+    entry["firing_series"] = count
+    if not numeric:                      # no data: never an alert
+        entry["status"] = "nodata"
+        entry["breaches"] = 0
+        return
+    if count:
+        breaches = int(entry.get("breaches", 0)) + 1
+        entry["breaches"] = breaches
+        if was == "firing":
+            pass                        # standing breach: stay quiet
+        elif breaches >= cfg["confirm_fails"]:
+            shown = f" ({label})" if label else ""
+            events.append(f"{name} {rule['op']} {rule['threshold']:g}: "
+                          f"{value:g}{shown}")
+            entry["status"] = "firing"
+            entry["last_change"] = now.isoformat(timespec="seconds")
+        else:
+            entry["status"] = "ok"      # breaching but not yet confirmed
+    else:
+        entry["breaches"] = 0
+        if was == "firing":
+            events.append(f"{name} back in range ({value:g})")
+            entry["last_change"] = now.isoformat(timespec="seconds")
+        entry["status"] = "ok"
+
+
+def build_digest(events):
+    """Events -> (title, message, tags)."""
+    breaches = [e for e in events if " back in range" not in e]
+    lines = list(events)
+    if breaches:
+        n = len(breaches)
+        title = f"metric-alert: {n} metric" + ("s" if n != 1 else "") + \
+                " breaching"
+        tags = ["rotating_light"]
+    else:
+        title = f"metric-alert: {len(events)} recovery" + \
+                ("ies" if len(events) != 1 else "")
+        tags = ["white_check_mark"]
+    return title, "\n".join(lines), tags
+
+
+def status_document(state, now):
+    """state -> the status.json the portal can render."""
+    rules = {}
+    for name, e in state["rules"].items():
+        rules[name] = {
+            "status": e.get("status", "?"),
+            "value": e.get("value"),
+            "op": e.get("op"),
+            "threshold": e.get("threshold"),
+            "expr": e.get("expr"),
+            "series": e.get("series"),
+            "firing_series": e.get("firing_series"),
+            "breaches": e.get("breaches", 0),
+            "error": e.get("error"),
+            "last_change": e.get("last_change"),
+        }
+    return {"generated": now.isoformat(timespec="seconds"), "rules": rules}
+
+
+def run(cfg, state_path, dry_run=False, verbose=False):
+    """One sweep: evaluate every rule, update state, maybe publish, persist."""
+    if not cfg["rules"]:
+        print("metric-alert: no rules configured (RULE lines)",
+              file=sys.stderr)
+        return 1
+
+    state = load_state(state_path)
+    entries = state["rules"]
+    events: list[str] = []
+    now = datetime.now(timezone.utc)
+    failures = 0
+
+    for rule in cfg["rules"]:
+        name = rule["name"]
+        entry = entries.setdefault(name, {})
+        result, error = query(cfg["prom_url"], rule["expr"], cfg["timeout"])
+        if error:
+            failures += 1
+            value, label, count = None, "", 0
+            print(f"metric-alert: query failed for {name}: {error}",
+                  file=sys.stderr)
+        else:
+            value, label, count, seen = worst(result, rule["op"],
+                                              rule["threshold"])
+            if verbose:
+                state_word = "FIRING" if count else ("no data" if value is None
+                                                     else "ok")
+                shown = "n/a" if value is None else f"{value:g}"
+                print(f"  {name}: {shown} {rule['op']} "
+                      f"{rule['threshold']:g} -> {state_word}"
+                      + (f" ({label})" if label else "")
+                      + (f" [{seen} series]" if verbose and seen else ""))
+        apply_result(rule, value, label, count, error, cfg, entry, events, now)
+
+    firing = sum(1 for e in entries.values() if e.get("status") == "firing")
+    ok = sum(1 for e in entries.values() if e.get("status") == "ok")
+    print(f"✓ {ok} ok, {firing} firing"
+          + (f", {failures} query error(s)" if failures else "")
+          + (f" — {len(events)} alert(s)" if events else ""))
+
+    published = False
+    if events:
+        title, message, tags = build_digest(events)
+        if dry_run:
+            print(f"[dry-run] would publish to {cfg['ntfy_url'] or '(ntfy)'} "
+                  f"topic '{cfg['topic']}':\n{message}")
+        else:
+            published = ntfy_post(cfg, title, message, tags, cfg["timeout"])
+            print(("✓ published" if published else "✗ could not publish")
+                  + f" {len(events)} alert(s) to topic '{cfg['topic']}'")
+
+    if dry_run:
+        return 0
+    status_path = Path(state_path).parent / "status.json"
+    if not save_json_atomic(state_path, state):
+        return 1
+    save_json_atomic(status_path, status_document(state, now))
+    if events and not published:
+        print("metric-alert: digest was NOT delivered — say this loudly "
+              "in the journal; state saved anyway", file=sys.stderr)
+    if failures == len(cfg["rules"]):
+        print("metric-alert: every query failed — Prometheus unreachable?",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def print_state(state_path):
+    state = load_state(state_path)
+    rules = state["rules"]
+    if not rules:
+        print(f"(no state at {state_path} — nothing evaluated yet)")
+        return 0
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"# state at {state_path}  (listed {now})")
+    for name in sorted(rules):
+        e = rules[name]
+        value = e.get("value")
+        shown = "n/a" if value is None else f"{value:g}"
+        thr = e.get("threshold")
+        cmp = f" {e.get('op')} {thr:g}" if thr is not None else ""
+        err = f" — {e['error']}" if e.get("error") else ""
+        breaches = f" [breaches: {e['breaches']}]" if e.get("breaches") else ""
+        print(f"  {name}: {e.get('status', '?')} {shown}{cmp}"
+              f"{breaches}{err}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="evaluate metric rules against Prometheus, alert via ntfy")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"config file (default {DEFAULT_CONFIG})")
+    ap.add_argument("--state", default=DEFAULT_STATE,
+                    help=f"state file (default {DEFAULT_STATE})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the digest, publish and persist nothing")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="per-rule detail")
+    ap.add_argument("--list", action="store_true",
+                    help="print last-known rule status and exit")
+    args = ap.parse_args(argv)
+
+    state_path = Path(args.state).expanduser()
+    if args.list:
+        return print_state(state_path)
+    return run(load_config(args.config), state_path,
+               dry_run=args.dry_run, verbose=args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -32,11 +32,12 @@ ln -sf "$REPO_DIR/chaos-drill"   "$BIN_DIR/chaos-drill"
 ln -sf "$REPO_DIR/pipeline-check" "$BIN_DIR/pipeline-check"
 ln -sf "$REPO_DIR/pi-doctor"     "$BIN_DIR/pi-doctor"
 ln -sf "$REPO_DIR/prom-dash"     "$BIN_DIR/prom-dash"
+ln -sf "$REPO_DIR/metric-alert" "$BIN_DIR/metric-alert"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
          "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
          "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
-         "$REPO_DIR/prom-dash"
+         "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -135,6 +136,20 @@ if [ -f /etc/service-probe.conf ]; then
     echo "service-probe timer installed and active"
 else
     echo "note: /etc/service-probe.conf not found - service-probe not installed"
+fi
+
+# metric-alert: metric rules against the loopback Prometheus.
+# Needs /etc/metric-alert.conf (NTFY keys, PROM_URL, RULE lines) —
+# see the script docstring, templates/metric-alert.conf.example and
+# docs/prometheus.md (step 3b). Skipped silently when absent.
+if [ -f /etc/metric-alert.conf ]; then
+    sudo cp "$REPO_DIR/systemd/metric-alert.service" \
+            "$REPO_DIR/systemd/metric-alert.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now metric-alert.timer
+    echo "metric-alert timer installed and active"
+else
+    echo "note: /etc/metric-alert.conf not found - metric-alert not installed"
 fi
 
 # chaos-drill: nightly deliberate-failure drills (dead-port detection,

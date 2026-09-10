@@ -21,6 +21,7 @@ INSTALL_SH = (REPO / "install.sh").read_text()
 TOOLS = [
     "chaos-drill",
     "loop-heartbeat",
+    "metric-alert",
     "new-project",
     "ntfy-notify",
     "pi-backup",

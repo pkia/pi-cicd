@@ -1,0 +1,36 @@
+# metric-alert — example config (copy to /etc/metric-alert.conf, 600).
+# See the script docstring and docs/prometheus.md (step 3b).
+#
+# Rules are checked every CONFIRM_FAILS sweeps before they alert, and
+# alert ONCE per state change (edge-triggered), so a standing breach is
+# quiet and a recovery gets its own message.
+
+# ntfy backbone (publisher user token — never a subscriber token).
+NTFY_URL=http://100.122.94.33:6839
+NTFY_TOKEN=replace-me
+# Existing, already-provisioned topic: no new ACL grant, no ntfy restart.
+NTFY_TOPIC=services
+
+# Prometheus is loopback-only on this box (docs/prometheus.md).
+PROM_URL=http://127.0.0.1:9090
+CONFIRM_FAILS=2
+TIMEOUT_SECS=10
+
+# RULE=Name op threshold = promql-expression
+# The expression is everything after the first '=' following the
+# threshold, taken verbatim.
+
+# Root filesystem filling up (percent used).
+RULE=DiskRootPct > 90 = 100 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100
+
+# Pi SoC temperature (node_exporter reports one series per thermal zone).
+RULE=CpuTempC > 80 = node_thermal_zone_temp
+
+# Memory pressure (percent used).
+RULE=MemUsedPct > 90 = 100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# Any systemd unit in the failed state.
+RULE=FailedUnits > 0 = sum(node_systemd_unit_state{state="failed"})
+
+# Any scrape target down (min over all 'up' series).
+RULE=ScrapeTargetDown < 1 = min(up)
