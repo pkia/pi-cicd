@@ -3,7 +3,7 @@
 #
 #   ram-mode status          what's paused, live-capture state, RAM, loaded LLM models
 #   ram-mode focus           pause the leisure stack (maritime / AIS / SDR / sat / shelf, kiosk display, HLTV scraper)
-#   ram-mode focus --deep    also: ai-town containers, unload loaded LLM models
+#   ram-mode focus --deep    also: any DEEP_UNITS entries (none configured here)
 #   ram-mode restore         start back exactly what focus stopped; re-enable timers + probes
 #   ram-mode config          show the editable unit lists (~/.config/ram-mode/units.conf)
 #   ram-mode focus --dry-run show what would happen, change nothing
@@ -27,8 +27,6 @@ STATE_DIR="$HOME/.local/state/ram-mode"
 STATE="$STATE_DIR/stopped"
 LOG="$STATE_DIR/ram-mode.log"
 NOAA_STATE="$HOME/maritime-dashboard/noaa_state.json"
-AITOWN_COMPOSE="$HOME/apps/ai-town/docker-compose.pi.yml"
-AITOWN_PROJECT="/home/ev/apps/ai-town"
 PROBE_CONF="/etc/service-probe.conf"
 PROBE_BAK="$PROBE_CONF.ram-mode.bak"
 
@@ -47,7 +45,7 @@ LEISURE_UNITS=(
 )
 # Paused too, but only when no satellite capture is in flight.
 GUARDED_UNITS=(noaa-scheduler)
-# Only with --deep (ai-town containers + LLM model unload are handled in code).
+# Only with --deep. Empty here: ai-town and the local Ollama models were removed.
 DEEP_UNITS=()
 # unit:probe-name — these probe entries are suspended while the unit is paused.
 PROBE_MAP=(
@@ -214,30 +212,6 @@ do_focus() {
         [ "$DRY" = 1 ] && say "    would: suspend probes [$names]" || log "$(suspend_probes "$names")"
     fi
 
-    if [ "$DEEP" = 1 ]; then
-        # ai-town: stop is sticky, restart=unless-stopped will not bring it back
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ai-town-'; then
-            run docker compose -f "$AITOWN_COMPOSE" --project-directory "$AITOWN_PROJECT" stop >/dev/null 2>&1
-            echo "aitown:stopped" >> "$STATE.tmp"
-            say "  stop  ai-town containers (~340 MB) — 'ram-mode restore' or compose start brings them back"
-            log "stopped ai-town containers"
-        fi
-        # loaded LLM models: 684 MB embedding + 2.9 GB llama3.2 when warm
-        local busy
-        busy=$(journalctl -u ollama --since "-90s" --no-pager 2>/dev/null | grep -cE 'POST /(api|v1)/(chat|embed|generate|completions)')
-        if [ "${busy:-0}" -gt 0 ] && [ "$FORCE" != 1 ]; then
-            say "  keep  ollama models — a request was in flight in the last 90s (use --force)"
-            log "guard: kept ollama models, request in flight"
-        else
-            while read -r m; do
-                [ -n "$m" ] || continue
-                run ollama stop "$m" >/dev/null 2>&1
-                say "  unload $m (reloads on demand)"
-                echo "ollama:$m" >> "$STATE.tmp"
-                log "unloaded ollama model $m"
-            done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
-        fi
-    fi
 
     if [ "$DRY" = 1 ]; then
         rm -f "$STATE.tmp"
@@ -294,12 +268,6 @@ do_restore() {
         sudo mv -f "$PROBE_BAK" "$PROBE_CONF" && say "  probe config restored"
         log "probe config restored"
     fi
-    if grep -q '^aitown:stopped' "$STATE"; then
-        say "  ai-town containers left stopped (start on demand: docker compose -f $AITOWN_COMPOSE start)"
-    fi
-    if grep -q '^ollama:' "$STATE"; then
-        say "  LLM models left unloaded (ollama reloads them on the next request)"
-    fi
     : > "$STATE"
     say ""
     mem_line
@@ -343,24 +311,13 @@ for unit, mb in tot.items():
 PY
     )
     printf '%-24s %-10s %s\n' UNIT STATE MEM
-    for u in "${LEISURE_UNITS[@]}" "${GUARDED_UNITS[@]}" "${DEEP_UNITS[@]}" ai-town; do
-        if [ "$u" = "ai-town" ]; then
-            local s=stopped m="-"
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ai-town-'; then
-                s=running
-                m=$(docker stats --no-stream --format '{{.MemUsage}}' $(docker ps -q --filter name=ai-town) 2>/dev/null | awk -F'/' '{gsub(/MiB|GiB/,"",$1); s+=($1 ~ /G/ ? $1*1024 : $1)} END {printf "%.0f MB", s}')
-            fi
-            printf '%-24s %-10s %s\n' "$u" "$s" "$([ -n "${m:-}" ] && echo "$m" || echo -)"
-            continue
-        fi
+    for u in "${LEISURE_UNITS[@]}" "${GUARDED_UNITS[@]}" "${DEEP_UNITS[@]}"; do
         if systemctl is-active --quiet "$u.service"; then s=active; else s=inactive; fi
         local m="${UNIT_MEM[$u]:-}"
         [ -n "$m" ] && m="$m MB" || m="-"
         printf '%-24s %-10s %s\n' "$u" "$s" "$m"
     done
     say ""
-    local ps_out; ps_out=$(ollama ps 2>/dev/null | awk 'NR>1 {printf "%s (%s) ", $1, $3}')
-    say "loaded LLM models: ${ps_out:-none}"
     if [ -s "$STATE" ]; then say ""; say "paused (from $STATE):"; sed 's/^/  /' "$STATE"; fi
     say ""
 }

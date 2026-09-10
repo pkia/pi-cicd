@@ -32,9 +32,8 @@ messaging platform via `hermes send`.
 
 ## Notes
 
-- **ram-mode** parks the always-on hobby stack (maritime/AIS/SDR/sat,
-  kiosk display, HLTV scraper, and with `--deep` the ai-town containers
-  and loaded LLM models) so a work session gets the RAM back. It never
+- **ram-mode** parks the always-on hobby stack (maritime/AIS/SDR/sat, kiosk
+  display, HLTV scraper) so a work session gets the RAM back. It never
   pauses `noaa-scheduler` mid-capture, pauses each app's deploy timer so
   a GitHub poll cannot restart it, and temporarily drops the affected
   service-probe rows so a focus session fires no DOWN/UP alerts. Units in
@@ -46,10 +45,7 @@ messaging platform via `hermes send`.
   config and timers back if the box reboots while focused.
 - **Host-local resource drop-ins** (not tracked here — they live in
   `/etc/systemd/system/*.service.d/`, so editing the parent unit cannot
-  lose them): `ollama.service.d/keepalive.conf` sets
-  `OLLAMA_KEEP_ALIVE=60s` so a warm model hands its RAM back a minute
-  after the last request instead of holding ~3.4 GB indefinitely, and
-  `ais-catcher.service.d/restart-guard.conf` sets
+  lose them): `ais-catcher.service.d/restart-guard.conf` sets
   `RestartPreventExitStatus=255` + `RestartSec=30` +
   `StartLimitIntervalSec=300`/`StartLimitBurst=3`, because losing the
   single RTL-SDR to a satellite pass used to respawn AIS-catcher every
