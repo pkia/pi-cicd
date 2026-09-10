@@ -44,6 +44,17 @@ messaging platform via `hermes send`.
   RTL-SDR. An
   `@reboot ram-mode restore` entry in the user crontab puts the probe
   config and timers back if the box reboots while focused.
+- **Host-local resource drop-ins** (not tracked here — they live in
+  `/etc/systemd/system/*.service.d/`, so editing the parent unit cannot
+  lose them): `ollama.service.d/keepalive.conf` sets
+  `OLLAMA_KEEP_ALIVE=60s` so a warm model hands its RAM back a minute
+  after the last request instead of holding ~3.4 GB indefinitely, and
+  `ais-catcher.service.d/restart-guard.conf` sets
+  `RestartPreventExitStatus=255` + `RestartSec=30` +
+  `StartLimitIntervalSec=300`/`StartLimitBurst=3`, because losing the
+  single RTL-SDR to a satellite pass used to respawn AIS-catcher every
+  5s forever (38 restarts on 2026-09-10; the default 10s start-limit
+  window is shorter than `RestartSec`, so the limiter never fires).
 - **Portal panels** (project-hub) render from the state files above:
   `/api/probes` → Uptime Scoreboard, `/api/chaos` → Chaos Drills panel.
 - **Deploy layer**: every service repo carries its own
