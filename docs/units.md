@@ -37,7 +37,11 @@ messaging platform via `hermes send`.
   and loaded LLM models) so a work session gets the RAM back. It never
   pauses `noaa-scheduler` mid-capture, pauses each app's deploy timer so
   a GitHub poll cannot restart it, and temporarily drops the affected
-  service-probe rows so a focus session fires no DOWN/UP alerts. An
+  service-probe rows so a focus session fires no DOWN/UP alerts. Units in
+  a `Restart=always` crash loop are stopped too (`is-active` says "no"
+  between respawns while systemd keeps burning CPU), and on restore
+  dongle-dependent units stay down while a capture still holds the
+  RTL-SDR. An
   `@reboot ram-mode restore` entry in the user crontab puts the probe
   config and timers back if the box reboots while focused.
 - **Portal panels** (project-hub) render from the state files above:

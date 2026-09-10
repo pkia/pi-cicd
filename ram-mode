@@ -15,6 +15,9 @@
 #   * service-probe entries for paused apps are suspended, so a focus session
 #     does not fire DOWN-then-UP ntfy spam
 #   * --deep refuses to unload LLM models while a request is in flight
+#   * units stuck in a Restart=always crash loop are stopped too (is-active
+#     reports "no" between respawns), and on restore such units stay down while
+#     a satellite capture still holds the single RTL-SDR, instead of fighting it
 #   * a reboot self-heals everything: units are enabled, so they come back at boot,
 #     and `@reboot ram-mode restore` puts the probe config and timers back
 #   * restore only starts what focus actually stopped
@@ -108,6 +111,19 @@ sys.exit(0 if d.get("capture_in_progress") else 1)
 PY
 }
 
+# active = running; looping = Restart=always thrashing (is-active reports "no"
+# between respawns, but systemd keeps restarting it and burns CPU); - = stopped.
+unit_pause_kind() {
+    local u="$1" st sub nr
+    st=$(systemctl show -p ActiveState --value "$u.service" 2>/dev/null)
+    [ "$st" = active ] && { echo active; return; }
+    sub=$(systemctl show -p SubState --value "$u.service" 2>/dev/null)
+    [ "$sub" = auto-restart ] && { echo looping; return; }
+    nr=$(systemctl show -p NRestarts --value "$u.service" 2>/dev/null)
+    if [ "${nr:-0}" -gt 0 ] 2>/dev/null && [ "$st" = failed ]; then echo looping; return; fi
+    echo -
+}
+
 # ---------------------------------------------------------------- focus
 suspend_probes() {
     local names="$1"
@@ -156,14 +172,21 @@ do_focus() {
 
     local stopped_probe_units="" timers=""
     for u in "${pausable[@]}"; do
-        if ! systemctl is-active --quiet "$u.service"; then
+        local kind
+        kind=$(unit_pause_kind "$u")
+        if [ "$kind" = "-" ]; then
             say "  skip  $u — already inactive"
             continue
         fi
         if run sudo -n systemctl stop "$u.service"; then
-            echo "unit:$u" >> "$STATE.tmp"
-            say "  stop  $u"
-            log "stopped $u"
+            if [ "$kind" = looping ]; then
+                echo "loopunit:$u" >> "$STATE.tmp"
+                say "  stop  $u — crash-looping, systemd kept respawning it"
+            else
+                echo "unit:$u" >> "$STATE.tmp"
+                say "  stop  $u"
+            fi
+            log "stopped $u (kind=$kind)"
             stopped_probe_units="$stopped_probe_units $u"
             # a GitHub-poll deploy job would restart it on the next new commit
             local t="$u-deploy.timer"
@@ -233,11 +256,12 @@ do_restore() {
     if [ ! -s "$STATE" ]; then say "nothing to restore ($STATE empty or missing)."; exit 0; fi
     say ""
     say "== ram-mode restore =="
-    local units="" units_seen="" timers=""
+    local units="" loopunits="" timers=""
     while IFS=: read -r kind val; do
         case "$kind" in
-            unit)  units="$units $val" ;;
-            timer) timers="$timers $val" ;;
+            unit)     units="$units $val" ;;
+            loopunit) loopunits="$loopunits $val" ;;
+            timer)    timers="$timers $val" ;;
         esac
     done < "$STATE"
 
@@ -250,6 +274,18 @@ do_restore() {
         # noaa-scheduler: safe to start back regardless; it exits on its own between passes
         if run sudo -n systemctl start "$u.service" 2>/dev/null; then
             say "  start $u"
+        else
+            say "  FAIL  $u — start failed"
+        fi
+    done
+    for u in $loopunits; do
+        # these were crash-looping because the single RTL-SDR was busy — do not
+        # put them back into a fight with a capture that is still running
+        if capture_running; then
+            say "  defer $u — satellite capture still running (later: sudo systemctl start $u)"
+            log "deferred restart of $u, capture in progress"
+        elif run sudo -n systemctl start "$u.service" 2>/dev/null; then
+            say "  start $u (was crash-looping)"
         else
             say "  FAIL  $u — start failed"
         fi
