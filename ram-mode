@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# ram-mode — pause the Pi's always-on hobby stack so a work session gets its RAM back.
+#
+#   ram-mode status          what's paused, live-capture state, RAM, loaded LLM models
+#   ram-mode focus           pause the leisure stack (maritime / AIS / SDR / sat / shelf, kiosk display, HLTV scraper)
+#   ram-mode focus --deep    also: ai-town containers, unload loaded LLM models
+#   ram-mode restore         start back exactly what focus stopped; re-enable timers + probes
+#   ram-mode config          show the editable unit lists (~/.config/ram-mode/units.conf)
+#   ram-mode focus --dry-run show what would happen, change nothing
+#
+# Guards built in:
+#   * noaa-scheduler is never paused while a satellite pass is being captured
+#     (that would abort a live IQ recording) — checked against noaa_state.json
+#   * deploy timers for paused apps are stopped, so a GitHub poll can't restart them
+#   * service-probe entries for paused apps are suspended, so a focus session
+#     does not fire DOWN-then-UP ntfy spam
+#   * --deep refuses to unload LLM models while a request is in flight
+#   * a reboot self-heals everything: units are enabled, so they come back at boot,
+#     and `@reboot ram-mode restore` puts the probe config and timers back
+#   * restore only starts what focus actually stopped
+set -uo pipefail
+
+STATE_DIR="$HOME/.local/state/ram-mode"
+STATE="$STATE_DIR/stopped"
+LOG="$STATE_DIR/ram-mode.log"
+NOAA_STATE="$HOME/maritime-dashboard/noaa_state.json"
+AITOWN_COMPOSE="$HOME/apps/ai-town/docker-compose.pi.yml"
+AITOWN_PROJECT="/home/ev/apps/ai-town"
+PROBE_CONF="/etc/service-probe.conf"
+PROBE_BAK="$PROBE_CONF.ram-mode.bak"
+
+# Units that get paused by `focus` (only if currently active). All of them are
+# background hook/hobby services — nothing an interactive work session needs.
+# Override any of these lists in ~/.config/ram-mode/units.conf (`ram-mode config`).
+LEISURE_UNITS=(
+    ais-kiosk              # Weston + Chromium kiosk display, ~180-310 MB
+    maritime-dashboard
+    ais-catcher
+    online-ships
+    sdr-monitor
+    sat-audio
+    shelfmate
+    cs2-hltv               # camoufox/playwright HLTV scraper, ~300 MB - 1 GB
+)
+# Paused too, but only when no satellite capture is in flight.
+GUARDED_UNITS=(noaa-scheduler)
+# Only with --deep (ai-town containers + LLM model unload are handled in code).
+DEEP_UNITS=()
+# unit:probe-name — these probe entries are suspended while the unit is paused.
+PROBE_MAP=(
+    "maritime-dashboard:maritime"
+    "sat-audio:sat-audio"
+    "shelfmate:funnel-shelfmate"
+)
+
+CFG="$HOME/.config/ram-mode/units.conf"
+ensure_config() {
+    mkdir -p "$(dirname "$CFG")"
+    if [ ! -f "$CFG" ]; then
+        cat > "$CFG" <<'EOF'
+# ram-mode unit lists — edit freely, delete the file to get the defaults back.
+#
+# Stopped by `ram-mode focus` (only units that are actually active get stopped):
+LEISURE_UNITS=(ais-kiosk maritime-dashboard ais-catcher online-ships sdr-monitor sat-audio shelfmate cs2-hltv)
+# Stopped too, but never while a satellite capture is in flight:
+GUARDED_UNITS=(noaa-scheduler)
+# Stopped only with `ram-mode focus --deep`:
+DEEP_UNITS=()
+# unit:probe-name pairs suspended from service-probe while paused, so a focus
+# session does not fire DOWN-then-UP ntfy alerts:
+PROBE_MAP=("maritime-dashboard:maritime" "sat-audio:sat-audio" "shelfmate:funnel-shelfmate")
+EOF
+    fi
+    # shellcheck disable=SC1090
+    . "$CFG"
+}
+
+DRY=0; DEEP=0; FORCE=0
+for a in "$@"; do
+    case "$a" in
+        focus|restore|status|config) CMD="$a" ;;
+        --deep) DEEP=1 ;;
+        --force) FORCE=1 ;;
+        --dry-run) DRY=1 ;;
+        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "ram-mode: unknown argument '$a' (try --help)" >&2; exit 2 ;;
+    esac
+done
+mkdir -p "$STATE_DIR"
+log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"; }
+say() { echo "$*"; }
+run() { if [ "$DRY" = 1 ]; then say "    would: $*"; return 0; else "$@"; fi; }
+
+mem_line() {
+    free -m | awk '/^Mem:/ {printf "RAM: %d MB used, %d MB free, %d MB available (of %d MB)", $3, $4, $7, $2}'
+    free -m | awk '/^Swap:/ {printf "  |  swap: %d MB used\n", $3}'
+}
+
+capture_running() {
+    [ -f "$NOAA_STATE" ] || return 1
+    python3 - "$NOAA_STATE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("capture_in_progress") else 1)
+PY
+}
+
+# ---------------------------------------------------------------- focus
+suspend_probes() {
+    local names="$1"
+    [ -n "$names" ] || return 0
+    [ -f "$PROBE_BAK" ] || { run sudo cp -a "$PROBE_CONF" "$PROBE_BAK" || return 1; }
+    [ "$DRY" = 1 ] && { say "    would: drop probes [$names] from $PROBE_CONF"; return 0; }
+    sudo python3 - "$PROBE_CONF" $names <<'PY' || return 1
+import sys
+conf, names = sys.argv[1], set(sys.argv[2:])
+out, dropped = [], []
+for line in open(conf):
+    if line.startswith("PROBE_HTTP="):
+        entries = [e for e in line.strip().split("=", 1)[1].split(",") if e]
+        keep = [e for e in entries if e.split("=", 1)[0] not in names]
+        dropped = [e.split("=", 1)[0] for e in entries if e.split("=", 1)[0] in names]
+        if keep:
+            line = "PROBE_HTTP=" + ",".join(keep) + "\n"
+        else:
+            line = "# ram-mode: no probes left\n"
+    out.append(line)
+open(conf, "w").write("".join(out))
+print("suspended probes: " + (", ".join(dropped) or "none matched"))
+PY
+}
+
+do_focus() {
+    if [ -s "$STATE" ] && [ "$FORCE" != 1 ]; then
+        say "already focused (state: $STATE). Use 'ram-mode restore' first, or --force."
+        exit 1
+    fi
+    say ""
+    say "== ram-mode focus$([ "$DEEP" = 1 ] && echo " --deep") =="
+    mem_line
+    : > "$STATE.tmp"
+
+    local pausable=("${LEISURE_UNITS[@]}")
+    for u in "${GUARDED_UNITS[@]}"; do
+        if capture_running; then
+            say "  keep  $u — satellite pass capturing NOW (not touching it)"
+            log "guard: kept $u, capture in progress"
+            continue
+        fi
+        pausable+=("$u")
+    done
+    if [ "$DEEP" = 1 ]; then pausable+=("${DEEP_UNITS[@]}"); fi
+
+    local stopped_probe_units="" timers=""
+    for u in "${pausable[@]}"; do
+        if ! systemctl is-active --quiet "$u.service"; then
+            say "  skip  $u — already inactive"
+            continue
+        fi
+        if run sudo -n systemctl stop "$u.service"; then
+            echo "unit:$u" >> "$STATE.tmp"
+            say "  stop  $u"
+            log "stopped $u"
+            stopped_probe_units="$stopped_probe_units $u"
+            # a GitHub-poll deploy job would restart it on the next new commit
+            local t="$u-deploy.timer"
+            if systemctl list-unit-files --no-legend "$t" 2>/dev/null | grep -q "$t"; then
+                if systemctl is-enabled --quiet "$t" 2>/dev/null; then
+                    run sudo -n systemctl stop "$t" && run sudo -n systemctl disable "$t" >/dev/null 2>&1
+                    echo "timer:$t" >> "$STATE.tmp"
+                    timers="$timers $t"
+                fi
+            fi
+        else
+            say "  FAIL  $u — stop failed, left running"
+            log "FAILED to stop $u"
+        fi
+    done
+
+    # suspend only the probes belonging to units we actually paused
+    local names=""
+    for pair in "${PROBE_MAP[@]}"; do
+        local unit="${pair%%:*}" probe="${pair##*:}"
+        case " $stopped_probe_units " in *" $unit "*) names="$names $probe" ;; esac
+    done
+    if [ -n "${names// /}" ]; then
+        echo "probes:suspended" >> "$STATE.tmp"
+        [ "$DRY" = 1 ] && say "    would: suspend probes [$names]" || log "$(suspend_probes "$names")"
+    fi
+
+    if [ "$DEEP" = 1 ]; then
+        # ai-town: stop is sticky, restart=unless-stopped will not bring it back
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ai-town-'; then
+            run docker compose -f "$AITOWN_COMPOSE" --project-directory "$AITOWN_PROJECT" stop >/dev/null 2>&1
+            echo "aitown:stopped" >> "$STATE.tmp"
+            say "  stop  ai-town containers (~340 MB) — 'ram-mode restore' or compose start brings them back"
+            log "stopped ai-town containers"
+        fi
+        # loaded LLM models: 684 MB embedding + 2.9 GB llama3.2 when warm
+        local busy
+        busy=$(journalctl -u ollama --since "-90s" --no-pager 2>/dev/null | grep -cE 'POST /(api|v1)/(chat|embed|generate|completions)')
+        if [ "${busy:-0}" -gt 0 ] && [ "$FORCE" != 1 ]; then
+            say "  keep  ollama models — a request was in flight in the last 90s (use --force)"
+            log "guard: kept ollama models, request in flight"
+        else
+            while read -r m; do
+                [ -n "$m" ] || continue
+                run ollama stop "$m" >/dev/null 2>&1
+                say "  unload $m (reloads on demand)"
+                echo "ollama:$m" >> "$STATE.tmp"
+                log "unloaded ollama model $m"
+            done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
+        fi
+    fi
+
+    if [ "$DRY" = 1 ]; then
+        rm -f "$STATE.tmp"
+        say ""
+        say "(dry run — nothing changed, state not written)"
+        exit 0
+    fi
+    mv -f "$STATE.tmp" "$STATE"
+    say ""
+    mem_line
+    log "focus complete (deep=$DEEP)"
+}
+
+# ---------------------------------------------------------------- restore
+do_restore() {
+    if [ ! -s "$STATE" ]; then say "nothing to restore ($STATE empty or missing)."; exit 0; fi
+    say ""
+    say "== ram-mode restore =="
+    local units="" units_seen="" timers=""
+    while IFS=: read -r kind val; do
+        case "$kind" in
+            unit)  units="$units $val" ;;
+            timer) timers="$timers $val" ;;
+        esac
+    done < "$STATE"
+
+    for t in $timers; do
+        run sudo -n systemctl enable --quiet "$t" 2>/dev/null
+        run sudo -n systemctl start "$t" 2>/dev/null
+        say "  timer $t re-enabled"
+    done
+    for u in $units; do
+        # noaa-scheduler: safe to start back regardless; it exits on its own between passes
+        if run sudo -n systemctl start "$u.service" 2>/dev/null; then
+            say "  start $u"
+        else
+            say "  FAIL  $u — start failed"
+        fi
+    done
+    if grep -q '^probes:suspended' "$STATE" && [ "$DRY" != 1 ] && [ -f "$PROBE_BAK" ]; then
+        sudo mv -f "$PROBE_BAK" "$PROBE_CONF" && say "  probe config restored"
+        log "probe config restored"
+    fi
+    if grep -q '^aitown:stopped' "$STATE"; then
+        say "  ai-town containers left stopped (start on demand: docker compose -f $AITOWN_COMPOSE start)"
+    fi
+    if grep -q '^ollama:' "$STATE"; then
+        say "  LLM models left unloaded (ollama reloads them on the next request)"
+    fi
+    : > "$STATE"
+    say ""
+    mem_line
+    log "restore complete"
+}
+
+# ---------------------------------------------------------------- status
+do_status() {
+    say ""
+    say "== ram-mode status =="
+    mem_line
+    if capture_running; then say "satellite capture: RUNNING (noaa-scheduler protected)"; else say "satellite capture: idle"; fi
+    say ""
+    # per-unit memory: sum every process in the unit (PSS where readable, else RSS)
+    declare -A UNIT_MEM
+    while read -r n m; do UNIT_MEM["$n"]="$m"; done < <(sudo python3 - <<'PY' 2>/dev/null
+import os, re, collections
+tot = collections.defaultdict(float)
+for pid in [d for d in os.listdir('/proc') if d.isdigit()]:
+    try:
+        cg = open(f'/proc/{pid}/cgroup').read()
+        m = re.search(r'/([^/\n]+)\.service', cg)
+        if not m:
+            continue
+        kb = 0
+        try:
+            for line in open(f'/proc/{pid}/smaps_rollup'):
+                if line.startswith('Pss:'):
+                    kb = int(line.split()[1]); break
+        except PermissionError:
+            pass
+        if not kb:
+            for line in open(f'/proc/{pid}/status'):
+                if line.startswith('VmRSS:'):
+                    kb = int(line.split()[1]); break
+        tot[m.group(1)] += kb / 1024
+    except Exception:
+        pass
+for unit, mb in tot.items():
+    print(unit, int(mb))
+PY
+    )
+    printf '%-24s %-10s %s\n' UNIT STATE MEM
+    for u in "${LEISURE_UNITS[@]}" "${GUARDED_UNITS[@]}" "${DEEP_UNITS[@]}" ai-town; do
+        if [ "$u" = "ai-town" ]; then
+            local s=stopped m="-"
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ai-town-'; then
+                s=running
+                m=$(docker stats --no-stream --format '{{.MemUsage}}' $(docker ps -q --filter name=ai-town) 2>/dev/null | awk -F'/' '{gsub(/MiB|GiB/,"",$1); s+=($1 ~ /G/ ? $1*1024 : $1)} END {printf "%.0f MB", s}')
+            fi
+            printf '%-24s %-10s %s\n' "$u" "$s" "$([ -n "${m:-}" ] && echo "$m" || echo -)"
+            continue
+        fi
+        if systemctl is-active --quiet "$u.service"; then s=active; else s=inactive; fi
+        local m="${UNIT_MEM[$u]:-}"
+        [ -n "$m" ] && m="$m MB" || m="-"
+        printf '%-24s %-10s %s\n' "$u" "$s" "$m"
+    done
+    say ""
+    local ps_out; ps_out=$(ollama ps 2>/dev/null | awk 'NR>1 {printf "%s (%s) ", $1, $3}')
+    say "loaded LLM models: ${ps_out:-none}"
+    if [ -s "$STATE" ]; then say ""; say "paused (from $STATE):"; sed 's/^/  /' "$STATE"; fi
+    say ""
+}
+
+ensure_config
+case "${CMD:-}" in
+    focus)   do_focus ;;
+    restore) do_restore ;;
+    status|"") do_status ;;
+    config)  echo "config: $CFG"; sed 's/^/  /' "$CFG" ;;
+    esac

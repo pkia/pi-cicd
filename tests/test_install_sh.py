@@ -29,6 +29,7 @@ TOOLS = [
     "pipeline-check",
     "prom-dash",
     "project-guard",
+    "ram-mode",
     "release-watch",
     "service-probe",
 ]

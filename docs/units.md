@@ -28,9 +28,18 @@ messaging platform via `hermes send`.
 | release-watch | systemd | 10:12 / 22:12 | sources in code | `~/.local/state/release-watch/state.json` | `releases` | `release-watch --list` |
 | service-probe | systemd | every 5 min | probe list in code (chaos-drill drives a shadow copy) | `~/.local/state/service-probe/status.json` | `services` | `service-probe --list` |
 | chaos-drill | systemd | nightly 04:45 | drill manifest in code | `~/.local/state/chaos-drill/status.json` | `chaos` | `chaos-drill --list` |
+| ram-mode | helper | on demand (`ram-mode focus` / `restore`) | `~/.config/ram-mode/units.conf` (unit lists, auto-created) | `~/.local/state/ram-mode/stopped` + `ram-mode.log` | — (suspends service-probe rows instead) | `ram-mode status` |
 
 ## Notes
 
+- **ram-mode** parks the always-on hobby stack (maritime/AIS/SDR/sat,
+  kiosk display, HLTV scraper, and with `--deep` the ai-town containers
+  and loaded LLM models) so a work session gets the RAM back. It never
+  pauses `noaa-scheduler` mid-capture, pauses each app's deploy timer so
+  a GitHub poll cannot restart it, and temporarily drops the affected
+  service-probe rows so a focus session fires no DOWN/UP alerts. An
+  `@reboot ram-mode restore` entry in the user crontab puts the probe
+  config and timers back if the box reboots while focused.
 - **Portal panels** (project-hub) render from the state files above:
   `/api/probes` → Uptime Scoreboard, `/api/chaos` → Chaos Drills panel.
 - **Deploy layer**: every service repo carries its own

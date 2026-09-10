@@ -27,6 +27,7 @@ EXPECTED_UNITS = {
     "release-watch",
     "service-probe",
     "chaos-drill",
+    "ram-mode",
 }
 
 REQUIRED_COLUMNS = {"Unit", "Kind", "Schedule", "Config", "State", "Topic", "Verify"}
