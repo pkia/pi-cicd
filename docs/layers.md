@@ -30,6 +30,19 @@ an `autosave` branch via a private git index — the working tree, real
 index and HEAD are never touched. Additive only: it pushes, never
 pulls, merges or resets. Log: `~/.local/state/project-guard.log`.
 
+**Adopt deny-list.** Adoption is filtered by an explicit, owner-editable
+file — `~/.config/project-guard/deny-list` (override:
+`$GUARD_DENY_LIST`), one glob pattern per line, `#` comments allowed,
+matched against both the directory's basename and its full path. A
+directory the list names is left exactly as it is and reported in one
+log line; the report is deduplicated through
+`~/.local/state/project-guard-denied.state` so a standing exclusion
+costs one line, not one every 10 minutes. The filter applies to
+*adoption only*: directories that are already git repos keep going
+through push + autosave, and the built-in `EXCLUDE` names (upstream
+sources, binary dists) still apply. Read at adopt time, so editing the
+file needs no restart.
+
 ## pipeline-check — the compliance layer
 
 Hourly Hermes cron job (no-agent). For every project: is it versioned,

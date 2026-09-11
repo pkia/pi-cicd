@@ -42,7 +42,7 @@ flowchart TB
 
 | Component | What it does |
 |---|---|
-| **`project-guard`** | Watches `$HOME` every 10 min. Adopts unversioned project directories (git init + .gitignore + CI + private GitHub repo). Pushes unpushed commits. Snapshots uncommitted work to an `autosave` branch via a private git index — the working tree is never touched. |
+| **`project-guard`** | Watches `$HOME` every 10 min. Adopts unversioned project directories (git init + .gitignore + CI + private GitHub repo) — except anything the adopt deny-list names (`~/.config/project-guard/deny-list`, glob per line, matched on basename or path; a skip is reported once per directory so the filter is visible). Pushes unpushed commits. Snapshots uncommitted work to an `autosave` branch via a private git index — the working tree is never touched. |
 | **`new-project`** | Scaffolds a project with the full pipeline from the first commit: Flask app, pytest suite, CI workflow, badge, GitHub repo, and with `--port` a systemd service plus CD wiring. |
 | **`templates/`** | The pull-based deploy script every service carries: byte-compile and import gates before restart, health check after, automatic rollback to the previously running commit, flap guard, dirty-tree guard. Plus the standard CI workflow. |
 | **`systemd/` units** | Timers driving the guard and per-service deploys. |
