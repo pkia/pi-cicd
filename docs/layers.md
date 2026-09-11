@@ -62,7 +62,14 @@ not flapping, healthz answers, running commit matches `origin/main`
 as the fix), CI green, tree clean. System layer: disk, CPU temp,
 memory, failed units, the watchers' own state. Safe fixes are applied
 automatically (restart a dead service, re-run a deploy); everything
-else escalates. Alert state lives in `pi-doctor-state.json` (untracked)
+else escalates. Deliberate states are *reported, never fixed*: units the
+owner parked with `ram-mode focus` (read live from
+`~/.local/state/ram-mode/stopped`, so `ram-mode restore` is picked up at
+once) and `ais-catcher` idling while a NOAA capture owns the single
+RTL-SDR. Revives shell out through `sudo -n` — the doctor runs
+unattended, and a bare `systemctl start` of a system unit fails as `ev`
+with "Interactive authentication required" (which had quietly disabled
+dead-service revival entirely). Alert state lives in `pi-doctor-state.json` (untracked)
 so a persistent issue re-alerts at most every few hours. All-green runs
 are silent.
 

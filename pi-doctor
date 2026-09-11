@@ -17,6 +17,10 @@ Per-project checks:
   4. CI on origin/main is green
   5. git tree clean (no mystery local edits)
 
+Deliberate states are reported, never "fixed":
+  * units stopped by `ram-mode focus` (owner park) -> left stopped, listed
+  * ais-catcher idling while a NOAA capture owns the RTL-SDR -> left alone
+
 Safe fixes applied automatically:
   F1 service dead/not-found-but-unit-exists -> systemctl reset-failed + start
   F2 deploy drift (running != HEAD)         -> run deploy.sh once
@@ -83,6 +87,30 @@ def _sat_capture_running() -> bool:
         return False
 
 
+RAM_PARK_STATE = os.path.expanduser("~/.local/state/ram-mode/stopped")
+
+
+def _ram_parked() -> set:
+    """Units the owner deliberately stopped with `ram-mode focus`.
+
+    ram-mode already suspends the service-probe rows and the deploy timers
+    of these units; without this check the daily audit "revives" them (which
+    undoes the owner's RAM-saving session) and re-alerts on them forever.
+    Read the ledger on every call so a `ram-mode restore` is picked up
+    immediately.
+    """
+    parked = set()
+    try:
+        with open(RAM_PARK_STATE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("unit:"):
+                    parked.add(line.split(":", 1)[1].strip())
+    except OSError:
+        pass
+    return parked
+
+
 def run(cmd, timeout=60):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -120,14 +148,30 @@ def http_json(url, timeout=8):
 def check_project(svc, pdir, ui, healthz, has_deploy, has_ci):
     findings = []
     fixes = []
+    info = []
+    parked = svc in _ram_parked()
 
     # 1. service state + flap detection
     rc, active = run(["systemctl", "is-active", svc])
     if rc != 0:
+        if parked:
+            # Owner-initiated park (ram-mode focus): expected state, and it
+            # must never be "revived" — that would fight the RAM-saving
+            # session and the pre-empted probe rows would then flap.
+            info.append(f"parked:{svc} — stopped by ram-mode focus")
+            return findings, fixes, info
+        if svc == "ais-catcher" and _sat_capture_running():
+            # One RTL-SDR: a live NOAA capture owns the dongle, and
+            # noaa-scheduler/sdr-monitor start ais-catcher back themselves.
+            info.append(f"yielded:{svc} — satellite capture holds the RTL-SDR")
+            return findings, fixes, info
         # F1: unit exists but dead -> try revive
+        # (sudo -n: the doctor runs unattended, and plain `systemctl start`
+        # of a system unit fails as ev with "Interactive authentication
+        # required" — which silently disabled F1 for every dead service.)
         if os.path.exists(f"/etc/systemd/system/{svc}.service"):
-            run(["systemctl", "reset-failed", svc])
-            rc2, _ = run(["systemctl", "start", svc], timeout=90)
+            run(["sudo", "-n", "systemctl", "reset-failed", svc])
+            rc2, _ = run(["sudo", "-n", "systemctl", "start", svc], timeout=90)
             time.sleep(3)
             rc3, _ = run(["systemctl", "is-active", svc])
             if rc3 != 0:
@@ -171,7 +215,11 @@ def check_project(svc, pdir, ui, healthz, has_deploy, has_ci):
             if running and running != head:
                 # F2: deploy pipeline stalled -> run deploy.sh once
                 dsh = os.path.join(gdir, "deploy", "deploy.sh")
-                if os.path.exists(dsh):
+                if parked:
+                    # Its deploy timer is paused on purpose; report only.
+                    info.append(f"parked:{svc} — {running[:7]} deployed, "
+                                f"HEAD {head[:7]}, deploy timer paused")
+                elif os.path.exists(dsh):
                     rc, out = run(["bash", dsh], timeout=300)
                     running2 = open(marker).read().strip() if os.path.exists(marker) else ""
                     if running2 == run(["git", "-C", gdir, "rev-parse", "HEAD"])[1]:
@@ -193,12 +241,14 @@ def check_project(svc, pdir, ui, healthz, has_deploy, has_ci):
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
 
-    return findings, fixes
+    return findings, fixes, info
 
 
 def st_ok(url):
     st, _ = http_json(url)
-    return None if st is None else st == 200
+    # Unreachable (st is None) is NOT ok: `is False` on a None return used to
+    # mean a fully down UI (connection refused) was never reported at all.
+    return st == 200
 
 
 # ---------------------------------------------------------------- system
@@ -420,14 +470,15 @@ def check_rtk():
 def main():
     verbose = "--verbose" in sys.argv
     now = datetime.now()
-    all_findings, all_fixes = [], []
+    all_findings, all_fixes, all_info = [], [], []
 
     for entry in PROJECTS:
         svc, pdir, ui, healthz, has_deploy, has_ci = entry[:6]
         try:
-            f, x = check_project(svc, pdir, ui, healthz, has_deploy, has_ci)
+            f, x, i = check_project(svc, pdir, ui, healthz, has_deploy, has_ci)
             all_findings += f
             all_fixes += x
+            all_info += i
         except Exception as e:
             all_findings.append(f"doctor:{svc}:check-error {type(e).__name__}: {e}")
     try:
@@ -449,7 +500,7 @@ def main():
     except Exception as e:
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
 
-    report = format_report(all_findings, all_fixes, now)
+    report = format_report(all_findings, all_fixes, now, all_info)
     heals = _recent_heals(now)
     if heals:
         report += f"\nSelf-healed in the last 24h: {heals} thing(s)"
@@ -508,7 +559,7 @@ def _key(finding):
     return finding.split(" — ")[0].split(" (")[0].strip()
 
 
-def format_report(findings, fixes, now):
+def format_report(findings, fixes, now, info=None):
     now = now or datetime.now()
     lines = [f"pi-doctor daily audit — {now:%Y-%m-%d %H:%M}", ""]
     if fixes:
@@ -517,8 +568,13 @@ def format_report(findings, fixes, now):
     if findings:
         lines.append("Needs attention:")
         lines += [f"  ⚠ {f}" for f in findings]
+    if info:
+        # Deliberate states, not faults: reported, never alerted.
+        lines.append("Parks / hand-offs (expected):")
+        lines += [f"  ⏸ {x}" for x in info]
     if not fixes and not findings:
-        lines.append("All projects healthy.")
+        lines.append("All projects healthy." if not info else
+                     "All projects healthy (parks as above).")
     return "\n".join(lines)
 
 

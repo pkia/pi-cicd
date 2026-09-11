@@ -143,7 +143,8 @@ pipeline-check         hourly compliance audit (run via Hermes cron, alerts-only
                        now self-healing: re-runs flakes, pushes stranded commits,
                        re-enables stopped deploy timers before paging
 pi-doctor              morning self-audit of every project + system (Hermes cron 06:30):
-                       repo drift, wedged SDR, disk/temperature, agent token savings (rtk)
+                       repo drift, wedged SDR, disk/temperature, agent token savings (rtk);
+                       honours ram-mode parks and NOAA SDR hand-offs (report, never revive)
 loop-heartbeat          dead-man's switch for the scheduled loop (systemd timer)
 ntfy-notify             publish to the ntfy backbone (one topic per job)
 templates/ci-flask.yml     standard CI workflow for adopted/scaffolded projects

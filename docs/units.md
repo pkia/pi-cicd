@@ -36,7 +36,9 @@ messaging platform via `hermes send`.
   display, HLTV scraper) so a work session gets the RAM back. It never
   pauses `noaa-scheduler` mid-capture, pauses each app's deploy timer so
   a GitHub poll cannot restart it, and temporarily drops the affected
-  service-probe rows so a focus session fires no DOWN/UP alerts. Units in
+  service-probe rows so a focus session fires no DOWN/UP alerts. The
+  daily pi-doctor audit reads `~/.local/state/ram-mode/stopped` too, so
+  it reports parked units instead of "reviving" them. Units in
   a `Restart=always` crash loop are stopped too (`is-active` says "no"
   between respawns while systemd keeps burning CPU), and on restore
   dongle-dependent units stay down while a capture still holds the
