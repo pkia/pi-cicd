@@ -15,6 +15,10 @@ developed **directly on the Pi** as often as from a laptop, the repos
 on GitHub are **public** (portfolio), and there is no inbound access to
 the Pi from the internet. Those four facts drive every design decision.
 
+> For the system as it runs today — every unit, its schedule, config
+> file, state and notification topic — see [units.md](units.md); one
+> page per operational layer: [layers.md](layers.md).
+
 ## The pipeline, end to end
 
 ```mermaid

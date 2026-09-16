@@ -152,6 +152,17 @@ docstring; inspect live state with `service-probe --list`):
     sudo ntfy access publisher services write-only
     sudo ntfy access subscriber services read-only
 
+Grant for the `chaos` topic (chaos-drill — see the script docstring;
+inspect live state with `chaos-drill --list`):
+
+    sudo ntfy access publisher chaos write-only
+    sudo ntfy access subscriber chaos read-only
+
+The `chaos` topic is deliberately in the drill's own blast radius: the
+ntfy fail-closed drill publishes its probe messages there, and a drill
+receipt lands there every night — so a broken ACL on the notification
+backbone is caught by the drills themselves, not by silence.
+
 The server survives reboots (systemd `WantedBy=multi-user.target`,
 `Restart=on-failure`). Restarting ntfy does not touch any other service;
 messages published while it is down are simply not delivered (no

@@ -13,6 +13,10 @@
 # Safety rules:
 #   - never pulls, merges or resets anything (deploy is a separate concern)
 #   - never touches excluded directories (upstream sources, binary dists)
+#   - never adopts a directory the deny-list names: patterns are read from
+#     $GUARD_DENY_LIST (default ~/.config/project-guard/deny-list) at adopt
+#     time, and a skip is reported once per (directory, pattern) so the
+#     filter is visible in the log without repeating every 10 minutes
 #   - skips autosaving anything that looks like a secret (filename or
 #     content heuristics) and logs a warning instead
 set -u
@@ -22,6 +26,8 @@ HOME_DIR="${GUARD_HOME:-/home/ev}"
 LOG_DIR="$HOME_DIR/.local/state"
 LOG="$LOG_DIR/project-guard.log"
 EXCLUDE=(AIS-catcher-src AdGuardHome)
+DENY_LIST="${GUARD_DENY_LIST:-$HOME_DIR/.config/project-guard/deny-list}"
+DENY_STATE="$LOG_DIR/project-guard-denied.state"
 MAX_FILE_BYTES=20971520          # 20 MB - larger files get gitignored
 SECRET_NAME_RE='(^|/)([^/]*key[^/]*\.(txt|json|pem)|[^/]*secret[^/]*|[^/]*token[^/]*|.*\.env|.*\.pem|.*\.p12|id_rsa.*|id_ed25519.*|[^/]*credential[^/]*)$'
 SECRET_CONTENT_RE='(ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
@@ -68,6 +74,38 @@ excluded() {
     local name; name=$(basename "$1")
     for e in "${EXCLUDE[@]}"; do [ "$name" = "$e" ] && return 0; done
     return 1
+}
+
+# --- adopt deny-list -------------------------------------------------------
+# One glob pattern per line, `#` starts a comment, blank lines ignored. A
+# pattern is matched against both the directory's basename and its full
+# path, so `vendor-*` and `*/vendor-src` both work. The list only ever
+# filters ADOPTION; directories that are already git repos keep being
+# backed up (autosave is the whole point of the guard).
+
+deny_match() {   # $1 = directory; prints the matching pattern, exit 1 if none
+    local pat name path
+    [ -r "$DENY_LIST" ] || return 1
+    name=$(basename "$1"); path=${1%/}
+    while IFS= read -r pat || [ -n "$pat" ]; do
+        pat=${pat%%#*}
+        pat=$(printf '%s' "$pat" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [ -z "$pat" ] && continue
+        case "$name" in $pat) echo "$pat"; return 0;; esac
+        case "$path" in $pat) echo "$pat"; return 0;; esac
+    done < "$DENY_LIST"
+    return 1
+}
+
+deny_note() {   # $1 = directory, $2 = pattern: report the skip once, not 144x/day
+    local dir=${1%/} key
+    key="$dir|$2"
+    if [ -f "$DENY_STATE" ] && grep -Fxq "$key" "$DENY_STATE" 2>/dev/null; then
+        return 0
+    fi
+    log "adopt $(basename "$1") SKIPPED: deny-list pattern '$2' matched ($DENY_LIST) - nothing versioned"
+    mkdir -p "$(dirname "$DENY_STATE")"
+    printf '%s\n' "$key" >> "$DENY_STATE"
 }
 
 looks_secret() {
@@ -265,8 +303,14 @@ for d in "$HOME_DIR"/*/ "$HOME_DIR"/apps/*/; do
         fi
     elif is_project_dir "$d"; then
         found=1
-        log "discovered unversioned project: $d"
-        adopt "$d"
+        # Read the deny-list at adopt time: a directory the owner says must
+        # not be versioned is reported and left exactly as it is.
+        if hit=$(deny_match "$d"); then
+            deny_note "$d" "$hit"
+        else
+            log "discovered unversioned project: $d"
+            adopt "$d"
+        fi
     fi
 done
 [ "$found" = 0 ] && log "no project directories found (unexpected)"

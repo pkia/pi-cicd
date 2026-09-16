@@ -42,7 +42,7 @@ flowchart TB
 
 | Component | What it does |
 |---|---|
-| **`project-guard`** | Watches `$HOME` every 10 min. Adopts unversioned project directories (git init + .gitignore + CI + private GitHub repo). Pushes unpushed commits. Snapshots uncommitted work to an `autosave` branch via a private git index — the working tree is never touched. |
+| **`project-guard`** | Watches `$HOME` every 10 min. Adopts unversioned project directories (git init + .gitignore + CI + private GitHub repo) — except anything the adopt deny-list names (`~/.config/project-guard/deny-list`, glob per line, matched on basename or path; a skip is reported once per directory so the filter is visible). Pushes unpushed commits. Snapshots uncommitted work to an `autosave` branch via a private git index — the working tree is never touched. |
 | **`new-project`** | Scaffolds a project with the full pipeline from the first commit: Flask app, pytest suite, CI workflow, badge, GitHub repo, and with `--port` a systemd service plus CD wiring. |
 | **`templates/`** | The pull-based deploy script every service carries: byte-compile and import gates before restart, health check after, automatic rollback to the previously running commit, flap guard, dirty-tree guard. Plus the standard CI workflow. |
 | **`systemd/` units** | Timers driving the guard and per-service deploys. |
@@ -52,6 +52,7 @@ flowchart TB
 | **`pi-backup`** | Deduplicated, encrypted borg backups of the /etc state git cannot hold (ntfy server, loop configs, units), daily at 03:30, pruned to 7 daily / 4 weekly / 6 monthly. A **weekly restore drill** extracts a fresh archive and byte-compares it against the live sources — PASS/FAIL published to the ntfy `backups` topic. See [docs/backups.md](docs/backups.md). |
 | **`release-watch`** | Upstream release watcher, twice daily: polls the GitHub releases API (and sha256-hashed pages) of every piece of software this machine runs, digests changes to the ntfy `releases` topic. First observation is a baseline, not an alert. |
 | **`service-probe`** | Uptime scoreboard, every 5 min: one stdlib probe per long-running service — HTTP checks for the dashboards, portal and public funnel endpoints (JSON `healthy:false` counts as down), a real DNS query for AdGuardHome — with DOWN confirmation after 2 consecutive failures, recovery notices, alerts to the ntfy `services` topic, and a `status.json` the portal renders. Inspect live state with `service-probe --list`. |
+| **`chaos-drill`** | Nightly deliberate-failure drills at 04:45, one per night on rotation: a dead-port probe through a *shadow* service-probe config proves the real DOWN→recovery detection path end to end (alerts re-targeted to the drill's topic, live scoreboard untouched); an ntfy fail-closed drill (anonymous publish must be DENIED, publisher accepted, receipt read back); a probe-timer liveness check (timezone-proof, monotonic). PASS/FAIL receipt to the ntfy `chaos` topic — inheriting the global mute — and `status.json` the portal renders. Inspect with `chaos-drill --list`. |
 
 ## Why it is built this way
 
@@ -138,7 +139,12 @@ ntfy-notify -t radar -T "radar shipped" --tag rocket "idea X landed"
 ```
 project-guard           adoption + autosave backup engine (bash, systemd-driven)
 new-project             project scaffolder with pipeline from birth
-pipeline-check          hourly compliance audit (run via Hermes cron, alerts-only)
+pipeline-check         hourly compliance audit (run via Hermes cron, alerts-only) —
+                       now self-healing: re-runs flakes, pushes stranded commits,
+                       re-enables stopped deploy timers before paging
+pi-doctor              morning self-audit of every project + system (Hermes cron 06:30):
+                       repo drift, wedged SDR, disk/temperature, agent token savings (rtk);
+                       honours ram-mode parks and NOAA SDR hand-offs (report, never revive)
 loop-heartbeat          dead-man's switch for the scheduled loop (systemd timer)
 ntfy-notify             publish to the ntfy backbone (one topic per job)
 templates/ci-flask.yml     standard CI workflow for adopted/scaffolded projects
@@ -146,6 +152,8 @@ templates/deploy.sh        parameterised pull-based deploy script (__NAME__/__PO
 templates/deploy.timer     matching systemd timer
 systemd/                guard + heartbeat units
 docs/architecture.md    design decisions and the incident log
+docs/layers.md          one page per operational layer (deploy, guard, heartbeat, …)
+docs/units.md           the unit index — every running unit → config, timer, topic
 docs/notifications.md   ntfy backbone: topics, auth model, runbook
 install.sh              fresh-host installer
 tests/                  loop-heartbeat + ntfy-notify suites (fixtures from real hermes output)

@@ -29,9 +29,16 @@ ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
 ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
 ln -sf "$REPO_DIR/service-probe" "$BIN_DIR/service-probe"
 ln -sf "$REPO_DIR/chaos-drill"   "$BIN_DIR/chaos-drill"
+ln -sf "$REPO_DIR/pipeline-check" "$BIN_DIR/pipeline-check"
+ln -sf "$REPO_DIR/pi-doctor"     "$BIN_DIR/pi-doctor"
+ln -sf "$REPO_DIR/prom-dash"     "$BIN_DIR/prom-dash"
+ln -sf "$REPO_DIR/metric-alert" "$BIN_DIR/metric-alert"
+ln -sf "$REPO_DIR/ram-mode" "$BIN_DIR/ram-mode"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
-         "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill"
+         "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
+         "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
+         "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -52,6 +59,26 @@ sudo cp "$REPO_DIR/systemd/project-guard.service" "$REPO_DIR/systemd/project-gua
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now project-guard.timer
 echo "project-guard timer installed and active"
+
+# Prometheus metrics stack, step 1 (Prom stack idea, 2026-09-02): Debian
+# packages, loopback-bound, minimal scrape config. Requires the packages:
+#   sudo apt install prometheus prometheus-node-exporter
+# Grafana dashboard + alerting are step 2 (docs/prometheus.md).
+if command -v prometheus >/dev/null 2>&1; then
+    sudo mkdir -p /etc/prometheus \
+        /etc/systemd/system/prometheus.service.d \
+        /etc/systemd/system/prometheus-node-exporter.service.d
+    sudo cp "$REPO_DIR/prometheus/prometheus.yml" /etc/prometheus/prometheus.yml
+    sudo cp "$REPO_DIR/prometheus/prometheus-bind-local.conf" \
+        /etc/systemd/system/prometheus.service.d/bind-local.conf
+    sudo cp "$REPO_DIR/prometheus/node-exporter-bind-local.conf" \
+        /etc/systemd/system/prometheus-node-exporter.service.d/bind-local.conf
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now prometheus prometheus-node-exporter
+    echo "prometheus + node_exporter enabled (loopback-bound)"
+else
+    echo "note: prometheus not installed - run: sudo apt install prometheus prometheus-node-exporter"
+fi
 
 # loop-heartbeat: dead-man's switch for the scheduled loop. Needs
 # /etc/loop-heartbeat.conf (SEND_TARGET etc.) - see the script's docstring.
@@ -110,6 +137,20 @@ if [ -f /etc/service-probe.conf ]; then
     echo "service-probe timer installed and active"
 else
     echo "note: /etc/service-probe.conf not found - service-probe not installed"
+fi
+
+# metric-alert: metric rules against the loopback Prometheus.
+# Needs /etc/metric-alert.conf (NTFY keys, PROM_URL, RULE lines) —
+# see the script docstring, templates/metric-alert.conf.example and
+# docs/prometheus.md (step 3b). Skipped silently when absent.
+if [ -f /etc/metric-alert.conf ]; then
+    sudo cp "$REPO_DIR/systemd/metric-alert.service" \
+            "$REPO_DIR/systemd/metric-alert.timer" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet --now metric-alert.timer
+    echo "metric-alert timer installed and active"
+else
+    echo "note: /etc/metric-alert.conf not found - metric-alert not installed"
 fi
 
 # chaos-drill: nightly deliberate-failure drills (dead-port detection,
