@@ -23,6 +23,14 @@ spec.loader.exec_module(doc)
 FIX = HERE / "fixtures"
 
 
+def _verb(cmd):
+    """systemctl verb, even when the call is wrapped in `sudo -n`."""
+    if "systemctl" not in cmd:
+        return None
+    i = cmd.index("systemctl")
+    return cmd[i + 1] if i + 1 < len(cmd) else None
+
+
 # ------------------------------------------------------------ DNS check
 
 def test_dns_resolves_live():
@@ -69,7 +77,7 @@ def test_report_findings_and_fixes():
 
 def test_nounit_static_ok(tmp_path):
     # static projects (book-app) must NOT raise the nounit finding
-    f, x = doc.check_project("book-app", str(tmp_path), None, None, False, False)
+    f, x, i = doc.check_project("book-app", str(tmp_path), None, None, False, False)
     assert not any("nounit" in s for s in f)
 
 
@@ -78,9 +86,12 @@ def test_revive_dead_service(tmp_path):
     state = {"started": 0, "active": False}
 
     def fake_run(cmd, timeout=60):
-        if cmd[:2] == ["systemctl", "is-active"]:
+        v = _verb(cmd)
+        if v == "is-active":
             return (0, "active") if state["active"] else (3, "inactive")
-        if cmd[:2] == ["systemctl", "start"]:
+        if v == "is-enabled":
+            return 0, "enabled"
+        if v == "start":
             state["started"] += 1
             state["active"] = True
             return 0, ""
@@ -90,7 +101,7 @@ def test_revive_dead_service(tmp_path):
          mock.patch("os.path.exists",
                     side_effect=lambda p: p == "/etc/systemd/system/fakesvc.service"), \
          mock.patch("time.sleep"):
-        f, x = doc.check_project("fakesvc", str(tmp_path), None, None, False, False)
+        f, x, i = doc.check_project("fakesvc", str(tmp_path), None, None, False, False)
     assert state["started"] == 1
     assert any("revived" in s for s in x), x
 
@@ -119,7 +130,7 @@ def test_deploy_drift_triggers_deploy(tmp_path, monkeypatch):
         return real_run(cmd, timeout=timeout)   # git + bash run for real
 
     monkeypatch.setattr(doc, "run", fake_run)
-    f, x = doc.check_project("r", str(repo), None, None, True, False)
+    f, x, i = doc.check_project("r", str(repo), None, None, True, False)
     assert any("re-ran deploy" in s for s in x), (f, x)
 
 
@@ -140,7 +151,7 @@ def test_deploy_healthy_no_drift(tmp_path, monkeypatch):
                         lambda cmd, timeout=60: (0, "active")
                         if cmd[:2] == ["systemctl", "is-active"]
                         else (0, ""))
-    f, x = doc.check_project("r2", str(repo), None, None, True, False)
+    f, x, i = doc.check_project("r2", str(repo), None, None, True, False)
     assert not any("deploy" in s for s in f), f
     assert x == []
 
@@ -188,3 +199,64 @@ def test_check_rtk_silent_without_binary(monkeypatch):
     import shutil
     monkeypatch.setattr(shutil, "which", lambda *a: None)
     assert doc.check_rtk() == []
+
+
+# ------------------------------------------------------- retired units
+
+def test_retired_unit_is_never_revived(tmp_path, monkeypatch):
+    # owner did `systemctl disable` + stop: report it, never start it again
+    started = []
+
+    def fake_run(cmd, timeout=60):
+        v = _verb(cmd)
+        if v == "is-active":
+            return 3, "inactive"
+        if v == "is-enabled":
+            return 1, "disabled"
+        if v == "start":
+            started.append(cmd)
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(doc, "run", fake_run)
+    monkeypatch.setattr("time.sleep", lambda *a: None)
+    f, x, i = doc.check_project("cs2-tracker", str(tmp_path), None, None, True, True)
+    assert started == []                                   # no revive attempt
+    assert f == [] and x == []                             # not a fault either
+    assert any(s.startswith("retired:cs2-tracker") for s in i), i
+
+
+def test_enabled_dead_unit_still_revived(tmp_path, monkeypatch):
+    # regression guard: the retire rule must not disarm F1 for live units
+    state = {"active": False, "started": 0}
+
+    def fake_run(cmd, timeout=60):
+        v = _verb(cmd)
+        if v == "is-active":
+            return (0, "active") if state["active"] else (3, "inactive")
+        if v == "is-enabled":
+            return 0, "enabled"
+        if v == "start":
+            state["started"] += 1
+            state["active"] = True
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(doc, "run", fake_run)
+    monkeypatch.setattr("time.sleep", lambda *a: None)
+    with mock.patch("os.path.exists",
+                    side_effect=lambda p: p == "/etc/systemd/system/fakesvc.service"):
+        f, x, i = doc.check_project("fakesvc", str(tmp_path), None, None, False, False)
+    assert state["started"] == 1
+    assert any("revived" in s for s in x), x
+
+
+def test_report_separates_retired_from_parks():
+    r = doc.format_report([], [], None,
+                          ["retired:x — unit disabled by owner, not reviving",
+                           "parked:y — stopped by ram-mode focus"])
+    assert "Retired (owner-disabled, not revived):" in r
+    assert "\u23f9 retired:x" in r
+    assert "Parks / hand-offs (expected):" in r
+    assert "\u23f8 parked:y" in r
+    assert "All projects healthy (expected states above)." in r

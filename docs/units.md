@@ -45,6 +45,14 @@ messaging platform via `hermes send`.
   RTL-SDR. An
   `@reboot ram-mode restore` entry in the user crontab puts the probe
   config and timers back if the box reboots while focused.
+- **Retired units** are the mirror image of a park: the doctor treats a
+  unit the owner `systemctl disable`d as *retired* — it reports
+  `retired:<unit>` under "Retired (owner-disabled, not revived)" and
+  never starts it. cs2-tracker, cs2-dashboard and mark-site were retired
+  on 2026-09-15 (units **and** their deploy timers disabled, code kept),
+  and the daily audit used to revive all three every morning. Dropping a
+  probe from `PROBE_HTTP`/`PROBE_DNS` now also prunes its row from the
+  scoreboard state, so a retired endpoint stops reading "down" forever.
 - **Host-local resource drop-ins** (not tracked here — they live in
   `/etc/systemd/system/*.service.d/`, so editing the parent unit cannot
   lose them): `ais-catcher.service.d/restart-guard.conf` sets
@@ -58,7 +66,8 @@ messaging platform via `hermes send`.
 - **Deploy layer**: every service repo carries its own
   `deploy/deploy.sh` (from `templates/`) plus a `*-deploy.timer`. Live
   services today: maritime-dashboard, project-hub, sat-audio, shelfmate,
-  book-app, kiosk-home, cs2-dashboard, cs2-tracker.
+  book-app, kiosk-home. cs2-dashboard and cs2-tracker (with mark-site)
+  were retired 2026-09-15 — code kept, deploy timers disabled.
 - **Mute**: every ntfy publisher routes through `ntfy_lib.py` — the
   global kill switch (`ntfy-notify --mute REASON`) suppresses all topics
   above at once; see [notifications.md](notifications.md).

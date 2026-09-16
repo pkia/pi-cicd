@@ -111,6 +111,19 @@ def _ram_parked() -> set:
     return parked
 
 
+def _unit_retired(svc) -> bool:
+    """Owner de-registered the unit: `systemctl disable`d and stopped.
+
+    A disabled unit does not come back at boot, so reviving it yields a
+    half-alive service that dies at the next reboot — and it fights the
+    owner's decision. cs2-tracker, cs2-dashboard and mark-site were retired
+    on 2026-09-15 (units + deploy timers disabled, code kept) and the daily
+    audit used to revive them every morning. Report the state; never revive.
+    """
+    rc, out = run(["systemctl", "is-enabled", svc])
+    return out.strip() in ("disabled", "masked")
+
+
 def run(cmd, timeout=60):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -164,6 +177,12 @@ def check_project(svc, pdir, ui, healthz, has_deploy, has_ci):
             # One RTL-SDR: a live NOAA capture owns the dongle, and
             # noaa-scheduler/sdr-monitor start ais-catcher back themselves.
             info.append(f"yielded:{svc} — satellite capture holds the RTL-SDR")
+            return findings, fixes, info
+        if _unit_retired(svc):
+            # Retired on purpose: its deploy timer is disabled too, so a
+            # revive would leave a fake-alive service and a stalled-deploy
+            # finding behind. Report as an expected state instead.
+            info.append(f"retired:{svc} — unit disabled by owner, not reviving")
             return findings, fixes, info
         # F1: unit exists but dead -> try revive
         # (sudo -n: the doctor runs unattended, and plain `systemctl start`
@@ -568,13 +587,19 @@ def format_report(findings, fixes, now, info=None):
     if findings:
         lines.append("Needs attention:")
         lines += [f"  ⚠ {f}" for f in findings]
-    if info:
-        # Deliberate states, not faults: reported, never alerted.
+    info = info or []
+    # Deliberate states, not faults: reported, never alerted.
+    parks = [x for x in info if not x.startswith("retired:")]
+    retired = [x for x in info if x.startswith("retired:")]
+    if parks:
         lines.append("Parks / hand-offs (expected):")
-        lines += [f"  ⏸ {x}" for x in info]
+        lines += [f"  ⏸ {x}" for x in parks]
+    if retired:
+        lines.append("Retired (owner-disabled, not revived):")
+        lines += [f"  ⏹ {x}" for x in retired]
     if not fixes and not findings:
         lines.append("All projects healthy." if not info else
-                     "All projects healthy (parks as above).")
+                     "All projects healthy (expected states above).")
     return "\n".join(lines)
 
 

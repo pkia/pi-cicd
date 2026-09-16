@@ -440,3 +440,25 @@ def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sp.urllib.request, "urlopen", boom)
     assert sp.ntfy_post(make_cfg(), "t", "m", [], 5) is True
     assert "muted" in capsys.readouterr().err
+
+
+def test_run_prunes_rows_for_removed_probes(state_file, monkeypatch, capsys):
+    # a retired probe's row must not outlive its PROBE_HTTP entry
+    rc, _ = run_sweep(make_cfg(), state_file, monkeypatch,
+                      pages={"http://127.0.0.1:8090/": "ok"})
+    state = sp.load_state(state_file)
+    state["probes"]["http:cs2-tracker"] = {
+        "kind": "http", "target": "http://127.0.0.1:8092/healthz",
+        "status": "down", "latency_ms": 1,
+        "error": "<urlopen error [Errno 111] Connection refused>",
+        "failures": 79, "last_change": "2026-09-15T23:03:41+00:00",
+        "down_since": "2026-09-15T23:03:41+00:00"}
+    sp.save_json_atomic(state_file, state)
+
+    rc, _ = run_sweep(make_cfg(), state_file, monkeypatch,
+                      pages={"http://127.0.0.1:8090/": "ok"}, verbose=True)
+    assert rc == 0
+    assert "http:cs2-tracker" not in sp.load_state(state_file)["probes"]
+    status = json.loads((state_file.parent / "status.json").read_text())
+    assert "cs2-tracker" not in status["probes"]
+    assert "pruned 1 retired probe row(s): http:cs2-tracker" in capsys.readouterr().out

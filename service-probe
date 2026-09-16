@@ -388,6 +388,19 @@ def run(cfg, state_path, dry_run=False, verbose=False):
         apply_result(name, "dns", target, ok, latency, error, cfg, entry,
                      events, now)
 
+    # Retired probes must not linger. When a probe is dropped from
+    # PROBE_HTTP/PROBE_DNS (owner disabled the unit — cs2-tracker,
+    # cs2-dashboard, mark-site on 2026-09-15) its state row would otherwise
+    # keep its last status forever and inflate the "N up, N down" count and
+    # the portal scoreboard, with no way to clear it.
+    configured = ({f"http:{n}" for n, _ in cfg["http"]}
+                  | {f"dns:{n}" for n, _, _ in cfg["dns"]})
+    stale = sorted(k for k in entries if k not in configured)
+    for k in stale:
+        del entries[k]
+    if stale and verbose:
+        print(f"  pruned {len(stale)} retired probe row(s): " + ", ".join(stale))
+
     up = sum(1 for e in entries.values() if e.get("status") == "up")
     down = sum(1 for e in entries.values() if e.get("status") == "down")
     print(f"✓ {up} up, {down} down"
