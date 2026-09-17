@@ -28,6 +28,7 @@ EXPECTED_UNITS = {
     "service-probe",
     "chaos-drill",
     "ram-mode",
+    "mission-control",
 }
 
 REQUIRED_COLUMNS = {"Unit", "Kind", "Schedule", "Config", "State", "Topic", "Verify"}
@@ -87,3 +88,38 @@ def test_layers_doc_has_every_layer_section():
     text = LAYERS_DOC.read_text()
     for layer in EXPECTED_LAYERS:
         assert f"## {layer}" in text, f"layers.md missing section '## {layer}'"
+
+
+PROBE_EXAMPLE = REPO / "templates" / "service-probe.conf.example"
+
+# Owner-retired 2026-09-15 (units + deploy timers disabled, code kept).
+# They must not come back as live index rows or as probe targets.
+RETIRED_UNITS = {"cs2-dashboard", "cs2-tracker", "mark-site"}
+# Probe rows use shorter names than the units do (`cs2-dash`, funnel-side
+# `cs2trk`), so the probe check matches on every spelling that has been
+# used rather than only the unit name.
+RETIRED_PROBE_TOKENS = RETIRED_UNITS | {"cs2-dash", "cs2trk"}
+
+
+def test_retired_units_are_not_indexed_as_live_units():
+    indexed = {row[0] for row in _table_rows(UNITS_DOC.read_text())[1:]}
+    stale = RETIRED_UNITS & indexed
+    assert not stale, f"retired units still indexed as live: {sorted(stale)}"
+
+
+def test_probe_example_targets_no_retired_endpoint():
+    """The shipped probe example must not resurrect a retired endpoint.
+
+    The live /etc/service-probe.conf is host-local and uncommitted, so the
+    example is the only copy a runner can check; a retired name reappearing
+    in it would seed a probe row that reads DOWN forever.
+    """
+    probed = {}
+    for line in PROBE_EXAMPLE.read_text().splitlines():
+        if line.startswith(("PROBE_HTTP=", "PROBE_DNS=")):
+            for item in line.split("=", 1)[1].split(","):
+                probed[item.split("=", 1)[0].strip()] = item
+    assert len(probed) >= 5, f"probe example parsed only {sorted(probed)}"
+    for unit in RETIRED_PROBE_TOKENS:
+        hits = [v for k, v in probed.items() if unit in k or unit in v]
+        assert not hits, f"probe example still targets retired {unit!r}: {hits}"

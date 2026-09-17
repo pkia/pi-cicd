@@ -23,6 +23,7 @@ messaging platform via `hermes send`.
 | ntfy-notify | helper | on demand | `/etc/ntfy-notify.conf` | — | per-job topic argument | `ntfy-notify -t radar -T test hi` |
 | metric-alert | systemd | every 5 min (offset 4 min) | `/etc/metric-alert.conf` (NTFY keys, PROM_URL, RULE lines) | `~/.local/state/metric-alert/` | `services` (edge-triggered) | `metric-alert --list` |
 | ntfy server | systemd (Debian package) | always on | `/etc/ntfy/server.yml`, `/etc/ntfy/tokens/` | `~/.local/state/ntfy/` | all topics | `systemctl status ntfy` |
+| mission-control | systemd (host-local unit) | always on | `/etc/systemd/system/mission-control.service` (`MC_PORT=8788`, `HERMES_HOME`) | Hermes board under `$HERMES_HOME` | — (read-only Kanban UI) | `systemctl status mission-control` |
 | pi-backup | systemd | daily 03:30 | `/etc/pi-backup.conf` (600, root) | borg repo `/var/backups/pi-borg` | `backups` | `systemctl list-timers pi-backup*` |
 | pi-backup-drill | systemd | Sun 05:30 | same | same | `backups` | `journalctl -u pi-backup-drill` |
 | release-watch | systemd | 10:12 / 22:12 | sources in code | `~/.local/state/release-watch/state.json` | `releases` | `release-watch --list` |
@@ -53,6 +54,14 @@ messaging platform via `hermes send`.
   and the daily audit used to revive all three every morning. Dropping a
   probe from `PROBE_HTTP`/`PROBE_DNS` now also prunes its row from the
   scoreboard state, so a retired endpoint stops reading "down" forever.
+- **Host-local web services**: mission-control (:8788, the Hermes
+  AI-workload Kanban board, `/home/ev/apps/mission-control`) runs from a
+  host-local unit in `/etc/systemd/system` — no repo of ours, no deploy
+  timer, no probe row. It is indexed above because the loop reads it. The
+  portal registry (project-hub `app.py`, `PROJECTS`/`SERVICES`) is the
+  sibling list, and the same 2026-09-16 sync dropped its now-dead CS2
+  Dashboard card and unit row — a registry that still lists a retired
+  service is a card that never comes back.
 - **Host-local resource drop-ins** (not tracked here — they live in
   `/etc/systemd/system/*.service.d/`, so editing the parent unit cannot
   lose them): `ais-catcher.service.d/restart-guard.conf` sets
