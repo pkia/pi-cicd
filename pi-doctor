@@ -61,7 +61,9 @@ PROJECTS = [
     ("mark-site",           "/home/ev/apps/mark-site",      "http://127.0.0.1:8089/", None,                           True,  False),
     ("shelfmate",           "/home/ev/apps/shelfmate",      "http://127.0.0.1:8086/", None,                           True,  True),
     ("book-app",            "/home/ev/book-app",            None,                    None,                           True,  True, "static"),
-    ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/stream.mp3", None,                True,  False),
+    # /stream.mp3 is an endless encoder output: an 8s probe read 8KB then
+    # closed, which used to strand an ffmpeg (and now burns CPU for nothing).
+    ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/status.json", None,               True,  False),
     ("online-ships",        "/home/ev/maritime-dashboard",  None,                    None,                           False, False),
     ("AdGuardHome",         "/home/ev/apps/AdGuardHome",    "http://127.0.0.1:3001/", None,                          False, False),
     ("ais-catcher",         "/home/ev",                     None,                    None,                           False, False),

@@ -260,3 +260,19 @@ def test_report_separates_retired_from_parks():
     assert "Parks / hand-offs (expected):" in r
     assert "\u23f8 parked:y" in r
     assert "All projects healthy (expected states above)." in r
+
+
+# ------------------------------------------------- probe target sanity
+
+def test_probe_targets_are_bounded():
+    """No project may be probed on an endless stream.
+
+    sat-audio's /stream.mp3 never ends by design; the 8s probe read 8KB and
+    hung up mid-encode, which is how one leaked ffmpeg per day (756MB RSS by
+    2026-09-19) was discovered. Bounded endpoints only.
+    """
+    endless = ("/stream.mp3",)
+    for entry in doc.PROJECTS:
+        svc, ui = entry[0], entry[2]
+        if ui:
+            assert not ui.endswith(endless), f"{svc} probes an endless response"
