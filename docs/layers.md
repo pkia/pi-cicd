@@ -121,10 +121,16 @@ escalation for failing sources. State:
 
 ## Service probing — service-probe
 
-Every 5 minutes. One stdlib probe per long-running service: HTTP for
-the seven local services (including cs2-tracker's JSON `healthy` gate),
-the three public funnel endpoints, an ntfy self-check, and a
-hand-built-UDP DNS query for AdGuardHome (12 probes total). DOWN is
+Every 5 minutes. One stdlib probe per long-running thing this box
+serves: HTTP probes for the live local dashboards and the public funnel
+endpoints, an ntfy self-check, and a hand-built-UDP DNS query for
+AdGuardHome. The probe set itself lives in `/etc/service-probe.conf`
+(host-local, never committed; `templates/service-probe.conf.example`
+shows the shape) — count it live with `service-probe --list` rather
+than trusting prose. **Retired endpoints are not probed:** cs2-dashboard,
+cs2-tracker and mark-site were retired 2026-09-15 and their probes left
+the list in the 2026-09-16 sync, so no scoreboard row can read "down"
+forever for a service nobody runs. DOWN is
 confirmed only after 2 consecutive failures (anti-flap); recovery
 notices carry the downtime duration. Alerts to the `services` topic;
 atomic state at `~/.local/state/service-probe/status.json`, which the

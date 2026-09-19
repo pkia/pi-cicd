@@ -45,6 +45,7 @@ import urllib.request
 from datetime import datetime, timedelta
 
 import ntfy_lib
+import retired_units
 
 # --------------------------------------------------------------------------
 # project registry — the source of truth for what "healthy" means here.
@@ -120,6 +121,11 @@ def _unit_retired(svc) -> bool:
     on 2026-09-15 (units + deploy timers disabled, code kept) and the daily
     audit used to revive them every morning. Report the state; never revive.
     """
+    if retired_units.is_retired(svc):
+        # The shared list (./retired-units) is the owner's decision;
+        # `systemctl disable` is only its derived signal, and it is how
+        # this knowledge ended up in three places in the first place.
+        return True
     rc, out = run(["systemctl", "is-enabled", svc])
     return out.strip() in ("disabled", "masked")
 

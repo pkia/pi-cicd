@@ -440,3 +440,60 @@ def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sp.urllib.request, "urlopen", boom)
     assert sp.ntfy_post(make_cfg(), "t", "m", [], 5) is True
     assert "muted" in capsys.readouterr().err
+
+
+def test_run_prunes_rows_for_removed_probes(state_file, monkeypatch, capsys):
+    # a retired probe's row must not outlive its PROBE_HTTP entry
+    rc, _ = run_sweep(make_cfg(), state_file, monkeypatch,
+                      pages={"http://127.0.0.1:8090/": "ok"})
+    state = sp.load_state(state_file)
+    state["probes"]["http:cs2-tracker"] = {
+        "kind": "http", "target": "http://127.0.0.1:8092/healthz",
+        "status": "down", "latency_ms": 1,
+        "error": "<urlopen error [Errno 111] Connection refused>",
+        "failures": 79, "last_change": "2026-09-15T23:03:41+00:00",
+        "down_since": "2026-09-15T23:03:41+00:00"}
+    sp.save_json_atomic(state_file, state)
+
+    rc, _ = run_sweep(make_cfg(), state_file, monkeypatch,
+                      pages={"http://127.0.0.1:8090/": "ok"}, verbose=True)
+    assert rc == 0
+    assert "http:cs2-tracker" not in sp.load_state(state_file)["probes"]
+    status = json.loads((state_file.parent / "status.json").read_text())
+    assert "cs2-tracker" not in status["probes"]
+    assert "pruned 1 retired probe row(s): http:cs2-tracker" in capsys.readouterr().out
+
+
+# ------------------------------------------------ long-dead probe nag
+
+def _long_dead_row(fails):
+    return {"kind": "http", "target": "https://pi.example.ts.net:8443/mark/",
+            "status": "down", "failures": fails, "error": "HTTP 404",
+            "last_change": "2026-09-15T23:03:41+00:00",
+            "down_since": "2026-09-15T23:03:41+00:00"}
+
+
+def test_print_state_marks_a_long_dead_probe(state_file, capsys):
+    # funnel-mark's real shape: 4379 failed sweeps, HTTP 404, silently
+    # sitting in the scoreboard because the DOWN alert only fires once
+    state = {"probes": {"http:funnel-mark": _long_dead_row(4379),
+                        "http:portal": _long_dead_row(1)}}
+    state["probes"]["http:portal"].update(status="up", failures=1,
+                                          error=None)
+    sp.save_json_atomic(state_file, state)
+    assert sp.print_state(state_file) == 0
+    out = capsys.readouterr().out
+    assert "http:funnel-mark: down [fails: 4379] — HTTP 404" in out
+    assert out.count("stale — probe looks retired; drop from PROBE_HTTP/PROBE_DNS") == 1
+
+
+def test_run_names_a_long_dead_configured_probe_without_alerting(
+        state_file, monkeypatch, capsys):
+    sp.save_json_atomic(state_file,
+                        {"probes": {"http:portal": _long_dead_row(4379)}})
+    rc, router = run_sweep(make_cfg(), state_file, monkeypatch,
+                           fail_urls=("http://127.0.0.1:8090",))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1 probe(s) long-dead" in out and "http:portal" in out
+    assert router.published == []       # a config fact, not a fresh outage

@@ -58,9 +58,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ntfy_lib
+import retired_units
 
 DEFAULT_CONFIG = "/etc/service-probe.conf"
 DEFAULT_STATE = "~/.local/state/service-probe/state.json"
+# A probe that has failed this many sweeps in a row is not having an
+# outage, it is a config leftover: alerts here are edge-triggered, so once
+# the first DOWN digest fires a hopelessly dead endpoint goes quiet for
+# ever and looks exactly like a fresh outage. funnel-mark / funnel-root
+# sat at 4379 failed sweeps (found by hand on 2026-09-18, HTTP 404 — their
+# endpoints were retired) — the sweep and --list name such probes now.
+DEFAULT_STALE_FAILS = 1000
 DEFAULT_TOPIC = "services"
 DEFAULT_TIMEOUT = 10
 DEFAULT_CONFIRM_FAILS = 2
@@ -388,6 +396,50 @@ def run(cfg, state_path, dry_run=False, verbose=False):
         apply_result(name, "dns", target, ok, latency, error, cfg, entry,
                      events, now)
 
+    # Retired probes must not linger. When a probe is dropped from
+    # PROBE_HTTP/PROBE_DNS (owner disabled the unit — cs2-tracker,
+    # cs2-dashboard, mark-site on 2026-09-15) its state row would otherwise
+    # keep its last status forever and inflate the "N up, N down" count and
+    # the portal scoreboard, with no way to clear it.
+    configured = ({f"http:{n}" for n, _ in cfg["http"]}
+                  | {f"dns:{n}" for n, _, _ in cfg["dns"]})
+    stale = sorted(k for k in entries if k not in configured)
+    for k in stale:
+        del entries[k]
+    if stale and verbose:
+        print(f"  pruned {len(stale)} retired probe row(s): " + ", ".join(stale))
+
+    # Long-dead configured probes: name them every sweep so a leftover
+    # endpoint is found by reading the journal instead of by hand. This
+    # publishes nothing — it is a config fact, not a new outage.
+    long_dead = sorted(
+        k for k, e in entries.items()
+        if int(e.get("failures", 0) or 0) >= DEFAULT_STALE_FAILS)
+    if long_dead:
+        print(f"! {len(long_dead)} probe(s) long-dead (>= "
+              f"{DEFAULT_STALE_FAILS} failed sweeps) — probably a retired "
+              "endpoint, drop from PROBE_HTTP/PROBE_DNS: "
+              + ", ".join(long_dead))
+
+    # A probe row named after a retired unit is a config leftover the
+    # moment it is written, not 1000 sweeps later. Name it every sweep
+    # so the next reader of the journal drops the row. Publishes
+    # nothing, exactly like the long-dead list above.
+    retired_rows = {}
+    for name, url in cfg["http"]:
+        hit = retired_units.hits(f"{name} {url}")
+        if hit:
+            retired_rows[name] = ",".join(hit)
+    for name, server, domain in cfg["dns"]:
+        hit = retired_units.hits(f"{name} {server} {domain}")
+        if hit:
+            retired_rows[name] = ",".join(hit)
+    if retired_rows:
+        print("! probe(s) target a retired unit — drop from "
+              "PROBE_HTTP/PROBE_DNS: "
+              + ", ".join(f"{n} ({h})"
+                          for n, h in sorted(retired_rows.items())))
+
     up = sum(1 for e in entries.values() if e.get("status") == "up")
     down = sum(1 for e in entries.values() if e.get("status") == "down")
     print(f"✓ {up} up, {down} down"
@@ -432,7 +484,15 @@ def print_state(state_path):
             else ""
         err = f" — {e['error']}" if e.get("error") else ""
         fails = f" [fails: {e['failures']}]" if e.get("failures") else ""
-        print(f"  {key}: {status}{lat}{fails}{err}")
+        stale = (" (stale — probe looks retired; drop from PROBE_HTTP/"
+                 "PROBE_DNS)" if int(e.get("failures", 0) or 0)
+                 >= DEFAULT_STALE_FAILS else "")
+        if not stale:
+            hit = retired_units.hits(key)
+            if hit:
+                stale = (" (retired unit " + "/".join(hit) + "; drop "
+                         "from PROBE_HTTP/PROBE_DNS)")
+        print(f"  {key}: {status}{lat}{fails}{err}{stale}")
     return 0
 
 

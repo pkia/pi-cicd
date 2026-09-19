@@ -1,0 +1,21 @@
+# Retired units — the one list every reader consults.
+#
+# Owner-disabled units and endpoints. Read at run time by pi-doctor
+# (never revive), service-probe (drop the probe row) and
+# tests/test_units_doc.py + tests/test_retired_units.py (the index and
+# the conflict guard). Retiring a unit means editing this file and
+# nothing else.
+#
+# Format: one line per retired unit, first token is the unit name, any
+# further tokens are the other spellings that have been used in probe
+# configs and docs (`cs2-dash` in a probe row, `cs2trk` in the funnel
+# hostname). `#` starts a comment.
+#
+# A name may not be both retired and live: tests/test_retired_units.py
+# reddens CI when a token here also appears in docs/units.md's live index
+# or in systemd/.
+#
+# Retired 2026-09-15 (units + deploy timers disabled, code kept):
+cs2-tracker cs2trk
+cs2-dashboard cs2-dash
+mark-site

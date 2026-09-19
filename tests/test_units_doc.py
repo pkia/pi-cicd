@@ -8,6 +8,8 @@ need a test, or they rot.
 
 from pathlib import Path
 
+import retired_units
+
 REPO = Path(__file__).resolve().parent.parent
 UNITS_DOC = REPO / "docs" / "units.md"
 LAYERS_DOC = REPO / "docs" / "layers.md"
@@ -28,6 +30,7 @@ EXPECTED_UNITS = {
     "service-probe",
     "chaos-drill",
     "ram-mode",
+    "mission-control",
 }
 
 REQUIRED_COLUMNS = {"Unit", "Kind", "Schedule", "Config", "State", "Topic", "Verify"}
@@ -87,3 +90,39 @@ def test_layers_doc_has_every_layer_section():
     text = LAYERS_DOC.read_text()
     for layer in EXPECTED_LAYERS:
         assert f"## {layer}" in text, f"layers.md missing section '## {layer}'"
+
+
+PROBE_EXAMPLE = REPO / "templates" / "service-probe.conf.example"
+
+# Owner-retired 2026-09-15 (units + deploy timers disabled, code kept),
+# names kept in ./retired-units — the one list pi-doctor, service-probe
+# and this file read through `retired_units.py`, so a retirement is one
+# edit and probe rows keep matching on every spelling the list carries
+# (`cs2-dash`, funnel-side `cs2trk`).
+RETIRED = retired_units.load()
+RETIRED_UNITS = set(RETIRED.units)
+RETIRED_PROBE_TOKENS = set(RETIRED.tokens)
+
+
+def test_retired_units_are_not_indexed_as_live_units():
+    indexed = {row[0] for row in _table_rows(UNITS_DOC.read_text())[1:]}
+    stale = RETIRED_UNITS & indexed
+    assert not stale, f"retired units still indexed as live: {sorted(stale)}"
+
+
+def test_probe_example_targets_no_retired_endpoint():
+    """The shipped probe example must not resurrect a retired endpoint.
+
+    The live /etc/service-probe.conf is host-local and uncommitted, so the
+    example is the only copy a runner can check; a retired name reappearing
+    in it would seed a probe row that reads DOWN forever.
+    """
+    probed = {}
+    for line in PROBE_EXAMPLE.read_text().splitlines():
+        if line.startswith(("PROBE_HTTP=", "PROBE_DNS=")):
+            for item in line.split("=", 1)[1].split(","):
+                probed[item.split("=", 1)[0].strip()] = item
+    assert len(probed) >= 5, f"probe example parsed only {sorted(probed)}"
+    for unit in RETIRED_PROBE_TOKENS:
+        hits = [v for k, v in probed.items() if unit in k or unit in v]
+        assert not hits, f"probe example still targets retired {unit!r}: {hits}"
