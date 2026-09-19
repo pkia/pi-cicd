@@ -8,6 +8,8 @@ need a test, or they rot.
 
 from pathlib import Path
 
+import retired_units
+
 REPO = Path(__file__).resolve().parent.parent
 UNITS_DOC = REPO / "docs" / "units.md"
 LAYERS_DOC = REPO / "docs" / "layers.md"
@@ -92,13 +94,14 @@ def test_layers_doc_has_every_layer_section():
 
 PROBE_EXAMPLE = REPO / "templates" / "service-probe.conf.example"
 
-# Owner-retired 2026-09-15 (units + deploy timers disabled, code kept).
-# They must not come back as live index rows or as probe targets.
-RETIRED_UNITS = {"cs2-dashboard", "cs2-tracker", "mark-site"}
-# Probe rows use shorter names than the units do (`cs2-dash`, funnel-side
-# `cs2trk`), so the probe check matches on every spelling that has been
-# used rather than only the unit name.
-RETIRED_PROBE_TOKENS = RETIRED_UNITS | {"cs2-dash", "cs2trk"}
+# Owner-retired 2026-09-15 (units + deploy timers disabled, code kept),
+# names kept in ./retired-units — the one list pi-doctor, service-probe
+# and this file read through `retired_units.py`, so a retirement is one
+# edit and probe rows keep matching on every spelling the list carries
+# (`cs2-dash`, funnel-side `cs2trk`).
+RETIRED = retired_units.load()
+RETIRED_UNITS = set(RETIRED.units)
+RETIRED_PROBE_TOKENS = set(RETIRED.tokens)
 
 
 def test_retired_units_are_not_indexed_as_live_units():

@@ -51,7 +51,11 @@ messaging platform via `hermes send`.
   `retired:<unit>` under "Retired (owner-disabled, not revived)" and
   never starts it. cs2-tracker, cs2-dashboard and mark-site were retired
   on 2026-09-15 (units **and** their deploy timers disabled, code kept),
-  and the daily audit used to revive all three every morning. Dropping a
+  and the daily audit used to revive all three every morning. The names
+  live in one file, [`retired-units`](../retired-units), read through
+  `retired_units.py` by the doctor, the prober and the index tests —
+  retiring a unit is one edit, and a name that is retired and still
+  listed as live fails CI instead of disagreeing quietly. Dropping a
   probe from `PROBE_HTTP`/`PROBE_DNS` now also prunes its row from the
   scoreboard state, so a retired endpoint stops reading "down" forever.
 - **Host-local web services**: mission-control (:8788, the Hermes

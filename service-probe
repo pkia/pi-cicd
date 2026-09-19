@@ -58,6 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ntfy_lib
+import retired_units
 
 DEFAULT_CONFIG = "/etc/service-probe.conf"
 DEFAULT_STATE = "~/.local/state/service-probe/state.json"
@@ -420,6 +421,25 @@ def run(cfg, state_path, dry_run=False, verbose=False):
               "endpoint, drop from PROBE_HTTP/PROBE_DNS: "
               + ", ".join(long_dead))
 
+    # A probe row named after a retired unit is a config leftover the
+    # moment it is written, not 1000 sweeps later. Name it every sweep
+    # so the next reader of the journal drops the row. Publishes
+    # nothing, exactly like the long-dead list above.
+    retired_rows = {}
+    for name, url in cfg["http"]:
+        hit = retired_units.hits(f"{name} {url}")
+        if hit:
+            retired_rows[name] = ",".join(hit)
+    for name, server, domain in cfg["dns"]:
+        hit = retired_units.hits(f"{name} {server} {domain}")
+        if hit:
+            retired_rows[name] = ",".join(hit)
+    if retired_rows:
+        print("! probe(s) target a retired unit — drop from "
+              "PROBE_HTTP/PROBE_DNS: "
+              + ", ".join(f"{n} ({h})"
+                          for n, h in sorted(retired_rows.items())))
+
     up = sum(1 for e in entries.values() if e.get("status") == "up")
     down = sum(1 for e in entries.values() if e.get("status") == "down")
     print(f"✓ {up} up, {down} down"
@@ -467,6 +487,11 @@ def print_state(state_path):
         stale = (" (stale — probe looks retired; drop from PROBE_HTTP/"
                  "PROBE_DNS)" if int(e.get("failures", 0) or 0)
                  >= DEFAULT_STALE_FAILS else "")
+        if not stale:
+            hit = retired_units.hits(key)
+            if hit:
+                stale = (" (retired unit " + "/".join(hit) + "; drop "
+                         "from PROBE_HTTP/PROBE_DNS)")
         print(f"  {key}: {status}{lat}{fails}{err}{stale}")
     return 0
 
