@@ -19,6 +19,7 @@ messaging platform via `hermes send`.
 | deploy.sh (per service) | systemd | every 3 min | unit from `templates/deploy.timer`; marker `.deployed_commit` in service repo | `.deployed_commit` / `.deploy_failed` | — | `systemctl list-timers '*deploy*'` |
 | pipeline-check | Hermes cron (no-agent) | 01:00 & 13:00 (cron `0 1,13 * * *`) | Hermes job `pipeline-check-wrapper.sh` (execs repo tool by absolute path) | — (prints alerts) | — *(hermes)* | `hermes cron list` |
 | pi-doctor | Hermes cron (agent) | daily 06:30 (cron `30 6 * * *`) | Hermes job `pi-doctor daily audit` | `pi-doctor-state.json` (untracked) | — *(hermes, deduped)* | `pi-doctor --verbose` |
+| pi-doctor-boot | systemd | 20 s after boot (`OnBootSec`) | `/var/lib/systemd/timesync/clock` + `/proc/uptime` | `pi-doctor-state.json` (`dark_window`, `dark_windows`) | — *(ntfy, once per window)* | `journalctl -u pi-doctor-boot` |
 | loop-heartbeat | systemd | every 30 min | `/etc/loop-heartbeat.conf` | `~/.local/state/loop-heartbeat/` | `loop-heartbeat` (+ WhatsApp) | `loop-heartbeat --dry-run -v` |
 | ntfy-notify | helper | on demand | `/etc/ntfy-notify.conf` | — | per-job topic argument | `ntfy-notify -t radar -T test hi` |
 | metric-alert | systemd | every 5 min (offset 4 min) | `/etc/metric-alert.conf` (NTFY keys, PROM_URL, RULE lines) | `~/.local/state/metric-alert/` | `services` (edge-triggered) | `metric-alert --list` |

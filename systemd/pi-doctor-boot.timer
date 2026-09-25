@@ -1,0 +1,15 @@
+[Unit]
+Description=Run pi-doctor's dark-window check shortly after boot (no RTC battery on this Pi)
+Documentation=https://github.com/pkia/pi-cicd
+
+[Timer]
+# 20 s after boot: systemd-timesyncd has by then restored the clock from its
+# saved file, and the first NTP sync — which rewrites that file with the
+# corrected time — is typically tens of seconds further away. On the
+# 2026-09-23 boot the restore was at +4 s and the first sync at +79 s.
+OnBootSec=20s
+AccuracySec=2s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

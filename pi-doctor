@@ -409,9 +409,15 @@ def _sdr_usb_reset() -> bool:
 
 # ---------------------------------------------------------------- reporting
 
+def _state_path():
+    # $PI_DOCTOR_STATE points the ledger elsewhere — used by the tests and
+    # by a manual replay, so neither can touch the live state file.
+    return os.environ.get("PI_DOCTOR_STATE") or STATE_PATH
+
+
 def load_state():
     try:
-        with open(STATE_PATH) as f:
+        with open(_state_path()) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -419,7 +425,7 @@ def load_state():
 
 def save_state(s):
     try:
-        with open(STATE_PATH, "w") as f:
+        with open(_state_path(), "w") as f:
             json.dump(s, f, indent=1)
     except OSError:
         pass
@@ -494,8 +500,130 @@ def check_rtk():
     return []
 
 
+# ------------------------------------------------------- dark window (boot)
+# This Pi 5 has no RTC battery: after a power cut the clock comes back at
+# whatever systemd-timesyncd last saved in its clock file — which is the
+# moment the box lost power. The monotonic uptime knows nothing about the
+# wrong clock, so `now - /proc/uptime` is the real boot instant and the
+# difference between the two is how long the box was dark. The 2026-09-23
+# outage was reconstructable only because the owner happened to remember
+# where to look; this records it.
+#
+# It is only observable early: timesyncd rewrites that clock file with the
+# corrected time shortly after its first NTP sync, and from then on the
+# comparison is negative. Hence the boot unit
+# (`systemd/pi-doctor-boot.service` -> `pi-doctor --dark-window`) plus the
+# first-run-since-boot gate below, which is also what makes a long uptime
+# unable to mistake a stale clock file for an outage.
+CLOCK_FILE = "/var/lib/systemd/timesync/clock"
+UPTIME_FILE = "/proc/uptime"
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+DARK_THRESHOLD_S = 300          # 5 min: a clean reboot is seconds
+DARK_MAX_S = 7 * 86400          # older than this is a stale file, not a window
+DARK_LEDGER_MAX = 20
+
+
+def _env_path(var, default):
+    return os.environ.get(var) or default
+
+
+def _read_uptime(path=None):
+    try:
+        with open(path or _env_path("PI_DOCTOR_UPTIME_FILE", UPTIME_FILE)) as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _clock_saved(path=None):
+    """Timestamp of timesyncd's clock file = the clock value it last saved."""
+    try:
+        return os.path.getmtime(
+            path or _env_path("PI_DOCTOR_CLOCK_FILE", CLOCK_FILE))
+    except OSError:
+        return None
+
+
+def _boot_id(path=None):
+    try:
+        with open(path or _env_path("PI_DOCTOR_BOOT_ID_FILE", BOOT_ID_FILE)) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def dark_window(now, uptime_s, saved_ts, threshold_s=DARK_THRESHOLD_S,
+                max_s=DARK_MAX_S):
+    """The window the box was dark, or None when there is nothing to say.
+
+    None covers three cases that must not be confused with an outage: a
+    piece of evidence missing (no timesyncd, no uptime file), a gap under
+    the threshold (an ordinary reboot), and a gap beyond `max_s` — that is
+    not a seven-day blackout but a clock file nobody touched since an
+    earlier boot.
+    """
+    if uptime_s is None or saved_ts is None:
+        return None
+    boot_wall = now.timestamp() - uptime_s
+    gap = boot_wall - saved_ts
+    if gap < threshold_s or gap > max_s:
+        return None
+    return {
+        "dark_since": datetime.fromtimestamp(saved_ts).isoformat(timespec="seconds"),
+        "dark_until": datetime.fromtimestamp(boot_wall).isoformat(timespec="seconds"),
+        "gap_s": int(gap),
+        "minutes": int(round(gap / 60)),
+    }
+
+
+def check_dark_window(now=None, state=None, threshold_s=DARK_THRESHOLD_S,
+                      alert=True, save=True):
+    """Record this boot's dark window; alert exactly once per window.
+
+    Returns (line, window). `line` is the human one-liner whenever a window
+    is *observed* (the boot run prints it); `window` is set only on the run
+    that records it. Observation is gated on the state's boot id, so a run
+    on an unrelated long uptime can never read a stale clock file as an
+    outage, and only the first run after a boot does the comparison at all.
+    """
+    now = now or datetime.now()
+    st = load_state() if state is None else state
+    boot = _boot_id()
+    first_run_since_boot = bool(boot) and st.get("boot_id") != boot
+
+    window = None
+    if first_run_since_boot:
+        window = dark_window(now, _read_uptime(), _clock_saved(), threshold_s)
+    st["boot_id"] = boot
+
+    line = None
+    if window:
+        line = (f"dark window {window['dark_since']} -> "
+                f"{window['dark_until']} ({window['minutes']}m without power)")
+        seen = [e.get("dark_since") for e in st.get("dark_windows", [])]
+        if window["dark_since"] not in seen:
+            record = dict(window,
+                          detected_at=now.isoformat(timespec="seconds"))
+            st["dark_window"] = record
+            ledger = st.setdefault("dark_windows", [])
+            ledger.append(record)
+            del ledger[:-DARK_LEDGER_MAX]
+            if alert:
+                send_alert("pi-doctor", line)
+    if save:
+        save_state(st)
+    return line, window
+
+
 def main():
     verbose = "--verbose" in sys.argv
+    if "--dark-window" in sys.argv:
+        # Boot path (systemd/pi-doctor-boot.service): one cheap check, no
+        # project sweep, and silent unless there really was a dark window.
+        line, _ = check_dark_window(alert="--no-alert" not in sys.argv)
+        if line:
+            print(line)
+        return 0
     now = datetime.now()
     all_findings, all_fixes, all_info = [], [], []
 
@@ -526,6 +654,13 @@ def main():
         all_fixes += x
     except Exception as e:
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
+    try:
+        # Only the first run after a boot can see it — see check_dark_window.
+        line, _ = check_dark_window(now)
+        if line:
+            all_info.append(f"dark:{line}")
+    except Exception as e:
+        all_findings.append(f"doctor:dark:check-error {type(e).__name__}: {e}")
 
     report = format_report(all_findings, all_fixes, now, all_info)
     heals = _recent_heals(now)
@@ -597,7 +732,8 @@ def format_report(findings, fixes, now, info=None):
         lines += [f"  ⚠ {f}" for f in findings]
     info = info or []
     # Deliberate states, not faults: reported, never alerted.
-    parks = [x for x in info if not x.startswith("retired:")]
+    dark = [x for x in info if x.startswith("dark:")]
+    parks = [x for x in info if not x.startswith(("retired:", "dark:"))]
     retired = [x for x in info if x.startswith("retired:")]
     if parks:
         lines.append("Parks / hand-offs (expected):")
@@ -605,6 +741,9 @@ def format_report(findings, fixes, now, info=None):
     if retired:
         lines.append("Retired (owner-disabled, not revived):")
         lines += [f"  ⏹ {x}" for x in retired]
+    if dark:
+        lines.append("Dark windows (box had no power):")
+        lines += [f"  🕳 {x.split(':', 1)[1].strip()}" for x in dark]
     if not fixes and not findings:
         lines.append("All projects healthy." if not info else
                      "All projects healthy (expected states above).")
