@@ -501,26 +501,46 @@ def check_rtk():
 
 
 # ------------------------------------------------------- dark window (boot)
-# This Pi 5 has no RTC battery: after a power cut the clock comes back at
-# whatever systemd-timesyncd last saved in its clock file — which is the
-# moment the box lost power. The monotonic uptime knows nothing about the
-# wrong clock, so `now - /proc/uptime` is the real boot instant and the
-# difference between the two is how long the box was dark. The 2026-09-23
-# outage was reconstructable only because the owner happened to remember
-# where to look; this records it.
+# This Pi 5 has no RTC battery: after a power cut systemd advances the clock
+# to what timesyncd last saved in its clock file — the moment the box lost
+# power. The monotonic uptime knows nothing about the wrong clock, so
+# `now - /proc/uptime` is the real boot instant and the difference from the
+# saved value is how long the box was dark. The 2026-09-23 outage was
+# reconstructable only because the owner happened to remember where to look;
+# this records it.
 #
-# It is only observable early: timesyncd rewrites that clock file with the
-# corrected time shortly after its first NTP sync, and from then on the
-# comparison is negative. Hence the boot unit
-# (`systemd/pi-doctor-boot.service` -> `pi-doctor --dark-window`) plus the
-# first-run-since-boot gate below, which is also what makes a long uptime
-# unable to mistake a stale clock file for an outage.
+# There are two timelines here and the first version of this check conflated
+# them (found in the 2026-09-26/27 outage — see below). While the clock is
+# *still restored*, `now` and the clock file's mtime are the same instant, so
+# `now - uptime` lands on the restored timeline and the subtraction collapses
+# to `-uptime`: a 20-hour blackout was recorded as nothing. Once NTP corrects
+# the clock, timesyncd rewrites that file, so the death time is gone. Neither
+# reading is enough on its own — the *pair* is, taken at different times:
+#
+#   * boot run, clock still restored -> write the reading down
+#     (`dark_window_pending`: boot id + restored value) and stop. Nothing is
+#     alertable yet, because the real boot instant does not exist until the
+#     correction lands.
+#   * a later run in the same boot -> `real_boot = corrected now - uptime`,
+#     `gap = real_boot - restored value`, i.e. how long the box was dark.
+#     Resolved here: alerted once, recorded in the ledger, reading cleared.
+#
+# The old single-shot path is kept for the *sliver* where the clock has been
+# corrected but the file has not been rewritten yet — there the mtime is still
+# the death time and both readings are on one timeline. It cannot be relied
+# on; it is what happens to be available.
+#
+# Hence the boot unit (`systemd/pi-doctor-boot.service` ->
+# `pi-doctor --dark-window`) plus the first-run-since-boot gate below, which
+# is also what makes a long uptime unable to mistake a stale clock file for
+# an outage.
 CLOCK_FILE = "/var/lib/systemd/timesync/clock"
 UPTIME_FILE = "/proc/uptime"
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 DARK_THRESHOLD_S = 300          # 5 min: a clean reboot is seconds
 DARK_MAX_S = 7 * 86400          # older than this is a stale file, not a window
 DARK_LEDGER_MAX = 20
+DARK_PENDING_KEY = "dark_window_pending"
 
 
 def _env_path(var, default):
@@ -552,9 +572,27 @@ def _boot_id(path=None):
         return ""
 
 
+def _window(dark_since_ts, boot_wall, gap, source):
+    """One window record. `source` names the evidence it came from."""
+    return {
+        "dark_since": datetime.fromtimestamp(dark_since_ts).isoformat(timespec="seconds"),
+        "dark_until": datetime.fromtimestamp(boot_wall).isoformat(timespec="seconds"),
+        "gap_s": int(gap),
+        "minutes": int(round(gap / 60)),
+        "source": source,
+    }
+
+
 def dark_window(now, uptime_s, saved_ts, threshold_s=DARK_THRESHOLD_S,
                 max_s=DARK_MAX_S):
     """The window the box was dark, or None when there is nothing to say.
+
+    This is the single-shot path: `now` is the *corrected* clock and
+    `saved_ts` is the last value timesyncd saved — one timeline, so
+    `now - uptime` is the real boot instant. It only holds while the clock
+    file has not been rewritten yet (see the block comment above); the
+    restored-clock path is `resolve_dark_window`, which is what the boot unit
+    relies on.
 
     None covers three cases that must not be confused with an outage: a
     piece of evidence missing (no timesyncd, no uptime file), a gap under
@@ -568,35 +606,99 @@ def dark_window(now, uptime_s, saved_ts, threshold_s=DARK_THRESHOLD_S,
     gap = boot_wall - saved_ts
     if gap < threshold_s or gap > max_s:
         return None
-    return {
-        "dark_since": datetime.fromtimestamp(saved_ts).isoformat(timespec="seconds"),
-        "dark_until": datetime.fromtimestamp(boot_wall).isoformat(timespec="seconds"),
-        "gap_s": int(gap),
-        "minutes": int(round(gap / 60)),
-    }
+    return _window(saved_ts, boot_wall, gap, "clock-file-mtime")
+
+
+def resolve_dark_window(now, uptime_s, pending, threshold_s=DARK_THRESHOLD_S,
+                        max_s=DARK_MAX_S):
+    """Resolve a boot run's pre-sync reading. Returns (status, window).
+
+    `pending` is what `check_dark_window` wrote down while the clock was still
+    the restored value: the *pair* is what makes the gap measurable — the
+    restored value is the moment the box lost power, and the corrected `now`
+    minus the monotonic uptime is the real boot instant.
+
+    status is one of:
+      "unresolved" — `now` is still on the restored timeline (the correction
+                     has not landed), so the boot instant does not exist yet;
+                     the reading is kept and the next run tries again.
+      "none"       — measured, and not a window: an ordinary reboot, or a
+                     reading too old to be a blackout.
+      "window"     — measured: the box was dark for `gap`.
+    """
+    if not pending or uptime_s is None:
+        return "unresolved", None
+    restored = pending.get("restored_ts")
+    if restored is None:
+        return "none", None
+    boot_wall = now.timestamp() - uptime_s
+    gap = boot_wall - restored
+    if gap < 0:
+        # `now - uptime` still lands before the saved value: the clock is
+        # (still) the restored one, so there is nothing to measure yet.
+        return "unresolved", None
+    if gap < threshold_s or gap > max_s:
+        return "none", None
+    return "window", _window(restored, boot_wall, gap, "restored-clock")
 
 
 def check_dark_window(now=None, state=None, threshold_s=DARK_THRESHOLD_S,
                       alert=True, save=True):
     """Record this boot's dark window; alert exactly once per window.
 
-    Returns (line, window). `line` is the human one-liner whenever a window
-    is *observed* (the boot run prints it); `window` is set only on the run
-    that records it. Observation is gated on the state's boot id, so a run
-    on an unrelated long uptime can never read a stale clock file as an
-    outage, and only the first run after a boot does the comparison at all.
+    Two runs, one measurement — see the block comment above. The boot run
+    writes the pre-sync reading down (`dark_window_pending`); a later run in
+    the same boot resolves it once the clock has been corrected. The run that
+    resolves it is the one that alerts. A reading whose boot is over and was
+    never resolved cannot be measured any more, and is reported as such
+    instead of leaving the boot looking quiet.
+
+    `line` is the human one-liner for anything worth saying (a resolved
+    window, or an unmeasurable reading); `window` is set only on the run that
+    records one. Observation is gated on the state's boot id, so a run on an
+    unrelated long uptime can never read a stale clock file as an outage.
     """
     now = now or datetime.now()
     st = load_state() if state is None else state
     boot = _boot_id()
     first_run_since_boot = bool(boot) and st.get("boot_id") != boot
+    pending = st.get(DARK_PENDING_KEY) or None
+
+    note = None
+    if pending and pending.get("boot_id") != boot:
+        # never resolved while that boot was up (the correction never landed,
+        # or the box went down first) — the evidence for that window is gone.
+        st.pop(DARK_PENDING_KEY, None)
+        note = (f"dark window unmeasured for boot "
+                f"{(pending.get('boot_id') or '?')[:8]} — the clock was never "
+                "corrected while that boot was up")
+        pending = None
 
     window = None
     if first_run_since_boot:
-        window = dark_window(now, _read_uptime(), _clock_saved(), threshold_s)
-    st["boot_id"] = boot
+        st["boot_id"] = boot
+        saved = _clock_saved()
+        if saved is not None and abs(now.timestamp() - saved) <= threshold_s:
+            # pre-sync: `now` is still the clock restored from that file, i.e.
+            # the same instant as its mtime. Write the reading down; the real
+            # boot instant arrives with the correction.
+            st[DARK_PENDING_KEY] = {
+                "boot_id": boot,
+                "restored_ts": now.timestamp(),
+                "clock_mtime": saved,
+                "recorded_at": now.isoformat(timespec="seconds"),
+            }
+        else:
+            window = dark_window(now, _read_uptime(), saved, threshold_s)
+    elif pending:
+        status, window = resolve_dark_window(now, _read_uptime(), pending,
+                                             threshold_s)
+        if status != "unresolved":
+            st.pop(DARK_PENDING_KEY, None)
 
-    line = None
+    line = note
+    if note and alert:
+        send_alert("pi-doctor", note)
     if window:
         line = (f"dark window {window['dark_since']} -> "
                 f"{window['dark_until']} ({window['minutes']}m without power)")
