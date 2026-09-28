@@ -449,27 +449,67 @@ def read_uptime(path="/proc/uptime"):
         return None
 
 
+def systemctl_value(unit, prop):
+    """systemctl show <unit> -p <prop> --value -> first line, stripped.
+
+    Empty string when the property cannot be read. Only MONOTONIC stamps
+    are compared against /proc/uptime, so this is clock-jump proof.
+    """
+    rc, out = run_cmd("systemctl", "show", unit, "--property", prop,
+                      "--value")
+    return out.splitlines()[0].strip() if out else ""
+
+
 def drill_probe_timer_alive(ctx):
     """The detection layer is only as good as its timer: service-probe's
     timer must be active and its last sweep recent enough that a dead
     service cannot go unnoticed for long. Timezone-proof: compares
-    systemd's monotonic timestamp against /proc/uptime."""
+    systemd's monotonic timestamp against /proc/uptime.
+
+    An IN-FLIGHT sweep has no exit stamp: systemd reports 0 for
+    ExecMainExitTimestampMonotonic from the moment a new invocation starts
+    until that invocation exits (seen 2026-09-28 — the timer grid slid onto
+    the drill's own minute, the drill read 0 mid-sweep and called a
+    perfectly healthy probe "never run"). A sweep running right now is
+    proof of life, so it is accepted first; only an over-long (wedged)
+    sweep is a failure.
+    """
     rc, active = run_cmd("systemctl", "is-active", "service-probe.timer")
     if rc != 0 or active != "active":
         return "fail", f"service-probe.timer not active (rc={rc}, {active!r})"
 
-    rc, mono = run_cmd("systemctl", "show", "service-probe.service",
-                       "--property", "ExecMainExitTimestampMonotonic",
-                       "--value")
-    mono = (mono or "").splitlines()[0].strip() if mono else ""
+    if systemctl_value("service-probe.service", "ActiveState") in (
+            "activating", "active"):
+        mono = systemctl_value("service-probe.service",
+                               "ExecMainStartTimestampMonotonic")
+        uptime = read_uptime()
+        age = None
+        try:
+            start_us = int(mono)  # 0 = systemd has no start stamp to give
+            if uptime is not None and start_us > 0:
+                age = uptime - start_us / 1e6
+        except (TypeError, ValueError):
+            age = None
+        if age is not None and age > ctx.get("max_sweep_age", 1800):
+            return "fail", (
+                f"service-probe sweep in flight for {int(age // 60)}m "
+                "(timer active but the sweep is wedged)")
+        return "pass", (
+            "service-probe.timer active; sweep in flight right now "
+            "(monotonic check)")
+
+    mono = systemctl_value("service-probe.service",
+                           "ExecMainExitTimestampMonotonic")
     try:
         mono_us = int(mono)
     except (TypeError, ValueError):
-        return "fail", f"no/invalid last-sweep timestamp ({mono!r}) — " \
-                       "has service-probe ever run?"
+        return "fail", (
+            f"no/invalid last-sweep timestamp ({mono!r}) — "
+            "has service-probe ever run?")
     if mono_us <= 0:  # systemd's value when the unit never ran
-        return "fail", "no last-sweep timestamp — service-probe has " \
-                       "never run under this timer"
+        return "fail", (
+            "no last-sweep timestamp — service-probe has "
+            "never run under this timer")
     mono_s = mono_us / 1e6  # systemd prints microseconds
     uptime = read_uptime()
     if uptime is None:
@@ -478,10 +518,12 @@ def drill_probe_timer_alive(ctx):
     if age < 0:
         return "skip", "last sweep timestamp in the future (clock jump?)"
     if age > ctx.get("max_sweep_age", 1800):
-        return "fail", f"last service-probe sweep {int(age // 60)}m ago " \
-                       f"(timer active but not sweeping)"
-    return "pass", f"service-probe.timer active; last sweep " \
-                   f"{int(age // 60)}m ago (monotonic check)"
+        return "fail", (
+            f"last service-probe sweep {int(age // 60)}m ago "
+            "(timer active but not sweeping)")
+    return "pass", (
+        f"service-probe.timer active; last sweep {int(age // 60)}m ago "
+        "(monotonic check)")
 
 
 MANIFEST = [
