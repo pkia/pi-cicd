@@ -534,6 +534,74 @@ def check_rtk():
 # `pi-doctor --dark-window`) plus the first-run-since-boot gate below, which
 # is also what makes a long uptime unable to mistake a stale clock file for
 # an outage.
+# ------------------------------------------------- boot timer armed?
+# The dark-window check only exists if pi-doctor-boot.timer was installed
+# and enabled: a re-image or a failed copy leaves it silently absent, which
+# looks exactly like "no outages have happened".
+
+BOOT_TIMER_UNIT = "pi-doctor-boot.timer"
+
+
+def parse_unit_props(out):
+    """`systemctl show -p …` Key=Value output -> {property: value}."""
+    props = {}
+    for line in (out or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key.strip()] = value.strip()
+    return props
+
+
+def _next_elapse(props):
+    """The timer's next elapse, in whichever clock it is anchored to."""
+    real = (props.get("NextElapseUSecRealtime") or "").strip()
+    if real and real not in ("n/a", "never"):
+        return real
+    mono = (props.get("NextElapseUSecMonotonic") or "").strip()
+    if mono in ("", "0", "infinity"):
+        # OnBootSec-only timer, measured live 2026-09-29: realtime empty,
+        # monotonic `infinity` — it fired and has no next elapse.
+        return "already fired this boot, nothing scheduled"
+    if mono.isdigit():
+        return f"in +{int(mono) / 1e6:.0f}s (monotonic)"
+    return "unknown"
+
+
+def boot_timer_state(props):
+    """Is the dark-window boot timer armed? -> (finding, info).
+
+    (None, None) means the question cannot be asked here at all: a host with
+    no systemd answering (a CI runner) has no such unit and must not be
+    flagged. On a host that does answer, `not-found` is a fault — the
+    dark-window check is silently gone, which is indistinguishable from a
+    quiet box. Findings name the unit, so the alert dedupes on it.
+    """
+    if not props.get("LoadState"):
+        return None, None
+    load = props["LoadState"]
+    unit_state = props.get("UnitFileState") or "unknown"
+    active = props.get("ActiveState") or "unknown"
+    unit = BOOT_TIMER_UNIT
+    if load == "not-found":
+        return (f"boot-timer:{unit} missing — the dark-window check cannot "
+                f"fire (re-image, or the unit copy failed)"), None
+    if unit_state in ("masked", "disabled") or active != "active":
+        return (f"boot-timer:{unit} not armed (UnitFileState={unit_state}, "
+                f"ActiveState={active}) — the dark-window check cannot "
+                f"fire"), None
+    return None, (f"timer:{unit} armed (UnitFileState={unit_state}, "
+                  f"ActiveState={active}, next elapse: {_next_elapse(props)})")
+
+
+def check_boot_timer():
+    rc, out = run(["systemctl", "show", BOOT_TIMER_UNIT, "-p", "LoadState",
+                   "-p", "UnitFileState", "-p", "ActiveState",
+                   "-p", "NextElapseUSecRealtime",
+                   "-p", "NextElapseUSecMonotonic"], timeout=20)
+    finding, info = boot_timer_state(parse_unit_props(out))
+    return ([finding] if finding else []), ([info] if info else [])
+
+
 CLOCK_FILE = "/var/lib/systemd/timesync/clock"
 UPTIME_FILE = "/proc/uptime"
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
@@ -757,6 +825,15 @@ def main():
     except Exception as e:
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
     try:
+        # The dark-window check is only worth anything if its unit is armed:
+        # a re-image or a failed install leaves it absent and silent.
+        f, i = check_boot_timer()
+        all_findings += f
+        all_info += i
+    except Exception as e:
+        all_findings.append(
+            f"doctor:boot-timer:check-error {type(e).__name__}: {e}")
+    try:
         # Only the first run after a boot can see it — see check_dark_window.
         line, _ = check_dark_window(now)
         if line:
@@ -835,7 +912,8 @@ def format_report(findings, fixes, now, info=None):
     info = info or []
     # Deliberate states, not faults: reported, never alerted.
     dark = [x for x in info if x.startswith("dark:")]
-    parks = [x for x in info if not x.startswith(("retired:", "dark:"))]
+    timer = [x for x in info if x.startswith("timer:")]
+    parks = [x for x in info if not x.startswith(("retired:", "dark:", "timer:"))]
     retired = [x for x in info if x.startswith("retired:")]
     if parks:
         lines.append("Parks / hand-offs (expected):")
@@ -846,6 +924,9 @@ def format_report(findings, fixes, now, info=None):
     if dark:
         lines.append("Dark windows (box had no power):")
         lines += [f"  🕳 {x.split(':', 1)[1].strip()}" for x in dark]
+    if timer:
+        lines.append("Boot timer (dark-window guard):")
+        lines += [f"  ⏱ {x.split(':', 1)[1].strip()}" for x in timer]
     if not fixes and not findings:
         lines.append("All projects healthy." if not info else
                      "All projects healthy (expected states above).")

@@ -534,3 +534,88 @@ def test_probe_targets_are_bounded():
         svc, ui = entry[0], entry[2]
         if ui:
             assert not ui.endswith(endless), f"{svc} probes an endless response"
+
+
+# ------------------------------------------------ boot timer armed? (dark window)
+
+HEALTHY_TIMER = {
+    "LoadState": "loaded",
+    "UnitFileState": "enabled",
+    "ActiveState": "active",
+    "NextElapseUSecRealtime": "Tue 2026-09-30 06:30:00 IST",
+}
+
+
+def _fake_show(props):
+    """Stand in for `run` on the one `systemctl show` call the check makes."""
+    def _run(cmd, timeout=60):
+        assert "systemctl" in cmd and "show" in cmd, cmd
+        return 0, "\n".join(f"{k}={v}" for k, v in props.items())
+    return _run
+
+
+def _with_show(props):
+    return mock.patch.object(doc, "run", side_effect=_fake_show(props))
+
+
+def test_boot_timer_armed_is_reported_healthy():
+    with _with_show(HEALTHY_TIMER):
+        findings, infos = doc.check_boot_timer()
+    assert findings == []
+    assert len(infos) == 1 and infos[0].startswith("timer:")
+    assert doc.BOOT_TIMER_UNIT in infos[0]
+    r = doc.format_report([], [], None, infos)
+    assert "Boot timer (dark-window guard):" in r
+    assert "armed" in r and "enabled" in r
+    assert "Tue 2026-09-30 06:30:00 IST" in r      # the next elapse is named
+    assert "Needs attention" not in r              # healthy is not a fault
+
+
+def test_boot_timer_masked_is_a_fault_naming_the_unit():
+    with _with_show(dict(HEALTHY_TIMER, UnitFileState="masked",
+                         ActiveState="inactive")):
+        findings, infos = doc.check_boot_timer()
+    assert infos == []
+    assert len(findings) == 1
+    f = findings[0]
+    assert doc._key(f) == f"boot-timer:{doc.BOOT_TIMER_UNIT} not armed"
+    assert doc.BOOT_TIMER_UNIT in f and "masked" in f
+    r = doc.format_report(findings, [], None)
+    assert "Needs attention:" in r and doc.BOOT_TIMER_UNIT in r
+
+
+def test_boot_timer_disabled_is_a_fault():
+    with _with_show(dict(HEALTHY_TIMER, UnitFileState="disabled",
+                         ActiveState="inactive")):
+        findings, infos = doc.check_boot_timer()
+    assert infos == []
+    assert len(findings) == 1
+    assert "disabled" in findings[0] and doc.BOOT_TIMER_UNIT in findings[0]
+
+
+def test_boot_timer_enabled_but_stopped_is_a_fault():
+    with _with_show(dict(HEALTHY_TIMER, ActiveState="inactive")):
+        findings, infos = doc.check_boot_timer()
+    assert infos == [] and len(findings) == 1
+    assert "ActiveState=inactive" in findings[0]
+
+
+def test_boot_timer_missing_is_a_fault():
+    """The unit is gone while the host still has systemd: the dark-window
+    check is silently absent, which looks exactly like 'no outages'."""
+    with _with_show({"LoadState": "not-found", "UnitFileState": "",
+                     "ActiveState": "inactive"}):
+        findings, infos = doc.check_boot_timer()
+    assert infos == [] and len(findings) == 1
+    assert doc.BOOT_TIMER_UNIT in findings[0] and "missing" in findings[0]
+
+
+def test_boot_timer_silent_where_no_unit_can_exist():
+    """A machine with no systemd answering is not flagged — a CI runner has
+    no such unit, and 'missing' must mean this box lost it, not that the
+    host was never the Pi."""
+    with _with_show({}):
+        findings, infos = doc.check_boot_timer()
+    assert findings == [] and infos == []
+    r = doc.format_report([], [], None, infos)
+    assert "Boot timer" not in r and "All projects healthy" in r
