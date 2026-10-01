@@ -30,8 +30,8 @@ Config: /etc/pi-backup.conf (KEY=VALUE, '#' comments), root-readable only:
     EXCLUDE           optional space-separated borg --exclude patterns
     SNAPSHOT_DIR      where consistent copies of the live SQLite DBs in
                       BACKUP_PATHS are written before archiving
-                      (default /var/backups/pi-sqlite). Any file in
-                      BACKUP_PATHS with the SQLite header is dumped
+                      (default /var/backups/pi-sqlite). Any file the
+                      BACKUP_PATHS cover that carries the SQLite header is dumped
                       through sqlite3's backup API and the live file is
                       excluded from the archive: borg aborts on a file
                       that changes while it reads it ("file changed
@@ -179,8 +179,21 @@ def snapshot_path(snapshot_dir, live_path):
     return Path(snapshot_dir) / str(live_path).lstrip("/")
 
 
+def iter_backup_files(paths):
+    """Every file the archive would cover: file entries themselves, and
+    the files inside directory entries (a live DB can be either)."""
+    for entry in paths:
+        p = Path(entry)
+        if p.is_file():
+            yield str(p)
+        elif p.is_dir():
+            for child in p.rglob("*"):
+                if child.is_file():
+                    yield str(child)
+
+
 def snapshot_live_dbs(cfg):
-    """Consistent copies of the live SQLite DBs in BACKUP_PATHS.
+    """Consistent copies of the live SQLite DBs BACKUP_PATHS covers.
 
     Returns (ok, live_paths, snapshot_paths, error). The copies come from
     sqlite3's own backup API, which reads a transactionally consistent
@@ -190,8 +203,8 @@ def snapshot_live_dbs(cfg):
     """
     live, snapshots = [], []
     snap_dir = cfg.get("snapshot_dir", DEFAULT_SNAPSHOT_DIR)
-    for path in cfg["paths"]:
-        if not Path(path).is_file() or not is_sqlite_file(path):
+    for path in iter_backup_files(cfg["paths"]):
+        if not is_sqlite_file(path):
             continue
         dest = snapshot_path(snap_dir, path)
         try:

@@ -507,6 +507,7 @@ def test_create_archive_fails_loudly_when_a_db_cannot_be_snapshotted(tmp_path):
     conf = write_config(tmp_path, tmp_path / "repo", [str(src)],
                         extra=f"SNAPSHOT_DIR={tmp_path}/snaps")
     cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
     ok, name, stats = pb.create_archive(cfg, datetime.now())
     assert not ok
     assert "sqlite snapshot" in stats["error"]

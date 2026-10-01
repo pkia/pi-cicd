@@ -57,6 +57,22 @@ def test_load_config_defaults(tmp_path):
     assert cfg["enabled"] == set()
 
 
+def test_load_config_heal_targets_parses_and_falls_back(tmp_path):
+    conf = tmp_path / "c.conf"
+    conf.write_text("HEAL_TARGET=http://127.0.0.1:8090/\n"
+                    "HEAL_TARGETS=http://127.0.0.1:8090/,"
+                    "http://127.0.0.1:8100/\n")
+    cfg = cd.load_config(conf)
+    assert cfg["heal_targets"] == ["http://127.0.0.1:8090/",
+                                   "http://127.0.0.1:8100/"]
+    single = tmp_path / "single.conf"
+    single.write_text("HEAL_TARGET=http://127.0.0.1:9999/\n")
+    assert cd.load_config(single)["heal_targets"] == ["http://127.0.0.1:9999/"]
+    bare = tmp_path / "bare.conf"
+    bare.write_text("NTFY_URL=http://x\n")
+    assert cd.load_config(bare)["heal_targets"] == [cd.DEFAULT_HEAL_TARGET]
+
+
 def test_load_config_missing_file_gives_empty():
     cfg = cd.load_config("/nonexistent/chaos-drill.conf")
     assert cfg["ntfy_url"] == ""
@@ -167,6 +183,23 @@ def test_http_request_gets_real_answer():
     assert "ok" in body
 
 
+def test_first_live_target_prefers_the_first_one_that_answers():
+    live = LiveServer(persistent=True)
+    try:
+        url, report = cd.first_live_target(
+            ["http://127.0.0.1:1/", f"http://127.0.0.1:{live.port}/"], 3)
+        assert url == f"http://127.0.0.1:{live.port}/"
+        assert "no answer" in report or "-> None" in report
+    finally:
+        live.close()
+
+
+def test_first_live_target_empty_when_nothing_answers():
+    url, report = cd.first_live_target(["http://127.0.0.1:1/"], 1)
+    assert url == ""
+    assert "http://127.0.0.1:1/" in report
+
+
 def test_read_sub_token_direct_read(tmp_path):
     f = tmp_path / "sub.txt"
     f.write_text("tok_sub\n")
@@ -210,6 +243,33 @@ def test_dead_port_drill_passes_end_to_end(shadow_env):
     result, detail = cd.drill_service_probe_dead_port(ctx)
     assert result == "pass", detail
     assert "DOWN detected by real pipeline" in detail
+    assert "recovery noticed after heal" in detail
+
+
+def test_dead_port_drill_skips_when_no_heal_target_answers(shadow_env):
+    """A parked portal must not read as a broken detection chain: with no
+    heal candidate alive the drill SKIPs and says so (2026-10-01: the
+    portal was parked by ram-mode focus and the nightly drill failed
+    'no recovery after heal' for the environment's reasons)."""
+    base_conf, heal = shadow_env
+    ctx = make_ctx(probe_conf=str(base_conf),
+                   heal_target="http://127.0.0.1:1/",
+                   heal_targets=["http://127.0.0.1:1/",
+                                 "http://127.0.0.1:2/"])
+    result, detail = cd.drill_service_probe_dead_port(ctx)
+    assert result == "skip", detail
+    assert "no heal candidate answered" in detail
+
+
+def test_dead_port_drill_heals_onto_the_first_live_candidate(shadow_env):
+    """Portal parked -> the second candidate carries the recovery leg."""
+    base_conf, heal = shadow_env
+    ctx = make_ctx(probe_conf=str(base_conf),
+                   heal_target="http://127.0.0.1:1/",
+                   heal_targets=["http://127.0.0.1:1/",
+                                 f"http://127.0.0.1:{heal.port}/"])
+    result, detail = cd.drill_service_probe_dead_port(ctx)
+    assert result == "pass", detail
     assert "recovery noticed after heal" in detail
 
 
