@@ -13,5 +13,10 @@ NTFY_SUB_TOKEN=/etc/ntfy/tokens/subscriber.txt
 SUBSCRIBER_ALLOWED_TOPICS=backups,chaos,releases,services,radar
 # what a dead probe is healed to, to simulate recovery (the portal)
 HEAL_TARGET=http://127.0.0.1:8090/
+# ...and where to heal when the portal is parked (ram-mode focus stops it
+# for long stretches, which is not a fault in the detection pipeline):
+# candidates in preference order, the first that ANSWERS is used, none
+# alive -> the drill SKIPs with the reason in the receipt.
+HEAL_TARGETS=http://127.0.0.1:8090/ http://127.0.0.1:8100/ http://100.122.94.33:6839/
 # optional: restrict to specific drills (default: all)
 # DRILL=ntfy-auth

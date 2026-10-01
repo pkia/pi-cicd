@@ -26,6 +26,30 @@ BACKUP_PATHS in the config is the single source of truth; `pi-backup
 list` shows what archives exist, `pi-backup restore ARCHIVE` extracts
 one.
 
+The agent's own state rides along (`~/.hermes`: the state db, auth and
+config files, profiles, cron and skills) — it is host state too, and
+nothing else backs it up.
+
+## Live databases
+
+Some of that state is **being written while the backup runs**: the
+agent's `state.db`, the ntfy user db. Borg fails on a file that changes
+under it (`file changed while we backed it up`) and a database copied
+mid-commit may be torn, so `pi-backup` snapshots first: every file
+carrying the SQLite header — a `BACKUP_PATHS` file entry or a match
+inside a directory entry — goes through sqlite3's **backup API**, which
+reads a transactionally consistent database even while another process
+commits. The dump is archived under `SNAPSHOT_DIR` (default
+`/var/backups/pi-sqlite`) mirroring the source path, and the live file
+is excluded from the archive, so a restore of it lands at
+`restore/var/backups/pi-sqlite/home/ev/.hermes/state.db` — unambiguous,
+not mixed in with a torn copy. A database that cannot be dumped (torn
+file, unreadable) fails the run loudly instead of archiving something
+unusable.
+
+Seen 2026-09-30 and 2026-10-01: two nightly runs in a row failed on
+exactly this, with the archive holding a mid-write `state.db`.
+
 ## The restore drill
 
 `pi-backup drill` does the full loop weekly and on demand:
