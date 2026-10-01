@@ -28,6 +28,16 @@ Config: /etc/pi-backup.conf (KEY=VALUE, '#' comments), root-readable only:
                       is enough to restore anywhere.
     BACKUP_PATHS      space-separated absolute paths to archive
     EXCLUDE           optional space-separated borg --exclude patterns
+    SNAPSHOT_DIR      where consistent copies of the live SQLite DBs in
+                      BACKUP_PATHS are written before archiving
+                      (default /var/backups/pi-sqlite). Any file in
+                      BACKUP_PATHS with the SQLite header is dumped
+                      through sqlite3's backup API and the live file is
+                      excluded from the archive: borg aborts on a file
+                      that changes while it reads it ("file changed
+                      while we backed it up") and a DB copied mid-commit
+                      may be torn. The dump is archived under its
+                      mirrored path, so restores stay unambiguous.
     PRUNE_KEEP_DAILY   default 7
     PRUNE_KEEP_WEEKLY  default 4
     PRUNE_KEEP_MONTHLY default 6
@@ -60,6 +70,12 @@ import ntfy_lib
 
 DEFAULT_CONFIG = "/etc/pi-backup.conf"
 
+#: Where live-DB snapshots are staged. Overridable with SNAPSHOT_DIR.
+DEFAULT_SNAPSHOT_DIR = "/var/backups/pi-sqlite"
+
+#: First bytes of every SQLite database file.
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
 
 # ------------------------------------------------------------- config
 
@@ -89,6 +105,8 @@ def load_config(path):
         "keep_weekly": int(raw.get("PRUNE_KEEP_WEEKLY", 4) or 4),
         "keep_monthly": int(raw.get("PRUNE_KEEP_MONTHLY", 6) or 6),
         "prefix": raw.get("ARCHIVE_PREFIX", "pi").strip() or "pi",
+        "snapshot_dir": (raw.get("SNAPSHOT_DIR", DEFAULT_SNAPSHOT_DIR)
+                         .strip() or DEFAULT_SNAPSHOT_DIR),
         "drill_max_files": int(raw.get("DRILL_MAX_FILES", 60) or 60),
         "ntfy_url": raw.get("NTFY_URL", "").strip().rstrip("/"),
         "ntfy_token": raw.get("NTFY_TOKEN", "").strip(),
@@ -107,6 +125,9 @@ def validate(cfg):
     for p in cfg["paths"]:
         if not p.startswith("/"):
             problems.append(f"BACKUP_PATHS entry not absolute: {p}")
+    snap = cfg.get("snapshot_dir", DEFAULT_SNAPSHOT_DIR)
+    if snap and not snap.startswith("/"):
+        problems.append(f"SNAPSHOT_DIR not absolute: {snap}")
     return problems
 
 
@@ -143,18 +164,94 @@ def archive_name(cfg, now):
     return f"{cfg['prefix']}-{now.strftime('%Y-%m-%dT%H%M%S')}"
 
 
+def is_sqlite_file(path):
+    """True when `path` is a file starting with the SQLite header."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+def snapshot_path(snapshot_dir, live_path):
+    """Mirror a live path under the snapshot dir so the archived copy
+    keeps its identity: <dir>/home/ev/.hermes/state.db."""
+    return Path(snapshot_dir) / str(live_path).lstrip("/")
+
+
+def snapshot_live_dbs(cfg):
+    """Consistent copies of the live SQLite DBs in BACKUP_PATHS.
+
+    Returns (ok, live_paths, snapshot_paths, error). The copies come from
+    sqlite3's own backup API, which reads a transactionally consistent
+    database even while another process commits — the thing borg cannot
+    do for a file that changes under it. Stale dumps left by an earlier
+    run are removed so renames and removals do not accumulate.
+    """
+    live, snapshots = [], []
+    snap_dir = cfg.get("snapshot_dir", DEFAULT_SNAPSHOT_DIR)
+    for path in cfg["paths"]:
+        if not Path(path).is_file() or not is_sqlite_file(path):
+            continue
+        dest = snapshot_path(snap_dir, path)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _dump_sqlite(path, dest)
+        except Exception as exc:  # sqlite3.Error / OSError
+            return False, live, snapshots, \
+                f"sqlite snapshot of {path} failed: {exc}"
+        live.append(path)
+        snapshots.append(str(dest))
+    if snapshots:
+        keep = set(snapshots)
+        for stale in Path(snap_dir).rglob("*"):
+            if stale.is_file() and str(stale) not in keep:
+                stale.unlink(missing_ok=True)
+    return True, live, snapshots, ""
+
+
+def _dump_sqlite(src_path, dest_path):
+    """sqlite3 backup API: live DB -> dest, consistent, no CLI needed."""
+    import sqlite3
+    dest_path.unlink(missing_ok=True)
+    try:
+        src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        src = sqlite3.connect(str(src_path))
+    try:
+        dst = sqlite3.connect(str(dest_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
 def create_archive(cfg, now):
-    """borg create one archive; returns (ok, archive_name, stats_dict)."""
+    """borg create one archive; returns (ok, archive_name, stats_dict).
+
+    Live SQLite DBs are snapshotted first and the live files excluded (see
+    snapshot_live_dbs), so the archive carries a transactionally
+    consistent copy instead of borg aborting on a file that changed
+    while it was being read.
+    """
     name = archive_name(cfg, now)
+    ok, live, snapshots, err = snapshot_live_dbs(cfg)
+    if not ok:
+        return False, name, {"error": err}
     argv = ["borg", "create"]
     for pat in cfg["exclude"]:
         argv += ["--exclude", pat]
+    for path in live:
+        argv += ["--exclude", f"pp:{path}"]
     argv.append(f"{cfg['repo']}::{name}")
-    argv += cfg["paths"]
+    argv += cfg["paths"] + snapshots
     code, _, err = run_cmd(argv, cfg)
     if code != 0:
         return False, name, {"error": err.strip().splitlines()[-1] if err.strip() else "borg create failed"}
     stats = archive_stats(cfg, name)
+    stats["snapshots"] = snapshots
     return True, name, stats
 
 
@@ -320,6 +417,8 @@ def act_run(cfg, now, dry_run=False):
            f"{human(stats.get('original_size', 0))} original / "
            f"{human(stats.get('deduplicated_size', 0))} deduped "
            f"— archive {name}")
+    if stats.get("snapshots"):
+        msg += f" ({len(stats['snapshots'])} live DB snapshot(s))"
     notify(cfg, "pi-backup ok", msg, dry_run=dry_run)
     print(f"✓ {msg}")
     return 0

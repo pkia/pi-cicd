@@ -61,7 +61,9 @@ PROJECTS = [
     ("mark-site",           "/home/ev/apps/mark-site",      "http://127.0.0.1:8089/", None,                           True,  False),
     ("shelfmate",           "/home/ev/apps/shelfmate",      "http://127.0.0.1:8086/", None,                           True,  True),
     ("book-app",            "/home/ev/book-app",            None,                    None,                           True,  True, "static"),
-    ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/stream.mp3", None,                True,  False),
+    # /stream.mp3 is an endless encoder output: an 8s probe read 8KB then
+    # closed, which used to strand an ffmpeg (and now burns CPU for nothing).
+    ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/status.json", None,               True,  False),
     ("online-ships",        "/home/ev/maritime-dashboard",  None,                    None,                           False, False),
     ("AdGuardHome",         "/home/ev/apps/AdGuardHome",    "http://127.0.0.1:3001/", None,                          False, False),
     ("ais-catcher",         "/home/ev",                     None,                    None,                           False, False),
@@ -407,9 +409,15 @@ def _sdr_usb_reset() -> bool:
 
 # ---------------------------------------------------------------- reporting
 
+def _state_path():
+    # $PI_DOCTOR_STATE points the ledger elsewhere — used by the tests and
+    # by a manual replay, so neither can touch the live state file.
+    return os.environ.get("PI_DOCTOR_STATE") or STATE_PATH
+
+
 def load_state():
     try:
-        with open(STATE_PATH) as f:
+        with open(_state_path()) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -417,7 +425,7 @@ def load_state():
 
 def save_state(s):
     try:
-        with open(STATE_PATH, "w") as f:
+        with open(_state_path(), "w") as f:
             json.dump(s, f, indent=1)
     except OSError:
         pass
@@ -492,8 +500,300 @@ def check_rtk():
     return []
 
 
+# ------------------------------------------------------- dark window (boot)
+# This Pi 5 has no RTC battery: after a power cut systemd advances the clock
+# to what timesyncd last saved in its clock file — the moment the box lost
+# power. The monotonic uptime knows nothing about the wrong clock, so
+# `now - /proc/uptime` is the real boot instant and the difference from the
+# saved value is how long the box was dark. The 2026-09-23 outage was
+# reconstructable only because the owner happened to remember where to look;
+# this records it.
+#
+# There are two timelines here and the first version of this check conflated
+# them (found in the 2026-09-26/27 outage — see below). While the clock is
+# *still restored*, `now` and the clock file's mtime are the same instant, so
+# `now - uptime` lands on the restored timeline and the subtraction collapses
+# to `-uptime`: a 20-hour blackout was recorded as nothing. Once NTP corrects
+# the clock, timesyncd rewrites that file, so the death time is gone. Neither
+# reading is enough on its own — the *pair* is, taken at different times:
+#
+#   * boot run, clock still restored -> write the reading down
+#     (`dark_window_pending`: boot id + restored value) and stop. Nothing is
+#     alertable yet, because the real boot instant does not exist until the
+#     correction lands.
+#   * a later run in the same boot -> `real_boot = corrected now - uptime`,
+#     `gap = real_boot - restored value`, i.e. how long the box was dark.
+#     Resolved here: alerted once, recorded in the ledger, reading cleared.
+#
+# The old single-shot path is kept for the *sliver* where the clock has been
+# corrected but the file has not been rewritten yet — there the mtime is still
+# the death time and both readings are on one timeline. It cannot be relied
+# on; it is what happens to be available.
+#
+# Hence the boot unit (`systemd/pi-doctor-boot.service` ->
+# `pi-doctor --dark-window`) plus the first-run-since-boot gate below, which
+# is also what makes a long uptime unable to mistake a stale clock file for
+# an outage.
+# ------------------------------------------------- boot timer armed?
+# The dark-window check only exists if pi-doctor-boot.timer was installed
+# and enabled: a re-image or a failed copy leaves it silently absent, which
+# looks exactly like "no outages have happened".
+
+BOOT_TIMER_UNIT = "pi-doctor-boot.timer"
+
+
+def parse_unit_props(out):
+    """`systemctl show -p …` Key=Value output -> {property: value}."""
+    props = {}
+    for line in (out or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key.strip()] = value.strip()
+    return props
+
+
+def _next_elapse(props):
+    """The timer's next elapse, in whichever clock it is anchored to."""
+    real = (props.get("NextElapseUSecRealtime") or "").strip()
+    if real and real not in ("n/a", "never"):
+        return real
+    mono = (props.get("NextElapseUSecMonotonic") or "").strip()
+    if mono in ("", "0", "infinity"):
+        # OnBootSec-only timer, measured live 2026-09-29: realtime empty,
+        # monotonic `infinity` — it fired and has no next elapse.
+        return "already fired this boot, nothing scheduled"
+    if mono.isdigit():
+        return f"in +{int(mono) / 1e6:.0f}s (monotonic)"
+    return "unknown"
+
+
+def boot_timer_state(props):
+    """Is the dark-window boot timer armed? -> (finding, info).
+
+    (None, None) means the question cannot be asked here at all: a host with
+    no systemd answering (a CI runner) has no such unit and must not be
+    flagged. On a host that does answer, `not-found` is a fault — the
+    dark-window check is silently gone, which is indistinguishable from a
+    quiet box. Findings name the unit, so the alert dedupes on it.
+    """
+    if not props.get("LoadState"):
+        return None, None
+    load = props["LoadState"]
+    unit_state = props.get("UnitFileState") or "unknown"
+    active = props.get("ActiveState") or "unknown"
+    unit = BOOT_TIMER_UNIT
+    if load == "not-found":
+        return (f"boot-timer:{unit} missing — the dark-window check cannot "
+                f"fire (re-image, or the unit copy failed)"), None
+    if unit_state in ("masked", "disabled") or active != "active":
+        return (f"boot-timer:{unit} not armed (UnitFileState={unit_state}, "
+                f"ActiveState={active}) — the dark-window check cannot "
+                f"fire"), None
+    return None, (f"timer:{unit} armed (UnitFileState={unit_state}, "
+                  f"ActiveState={active}, next elapse: {_next_elapse(props)})")
+
+
+def check_boot_timer():
+    rc, out = run(["systemctl", "show", BOOT_TIMER_UNIT, "-p", "LoadState",
+                   "-p", "UnitFileState", "-p", "ActiveState",
+                   "-p", "NextElapseUSecRealtime",
+                   "-p", "NextElapseUSecMonotonic"], timeout=20)
+    finding, info = boot_timer_state(parse_unit_props(out))
+    return ([finding] if finding else []), ([info] if info else [])
+
+
+CLOCK_FILE = "/var/lib/systemd/timesync/clock"
+UPTIME_FILE = "/proc/uptime"
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+DARK_THRESHOLD_S = 300          # 5 min: a clean reboot is seconds
+DARK_MAX_S = 7 * 86400          # older than this is a stale file, not a window
+DARK_LEDGER_MAX = 20
+DARK_PENDING_KEY = "dark_window_pending"
+
+
+def _env_path(var, default):
+    return os.environ.get(var) or default
+
+
+def _read_uptime(path=None):
+    try:
+        with open(path or _env_path("PI_DOCTOR_UPTIME_FILE", UPTIME_FILE)) as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _clock_saved(path=None):
+    """Timestamp of timesyncd's clock file = the clock value it last saved."""
+    try:
+        return os.path.getmtime(
+            path or _env_path("PI_DOCTOR_CLOCK_FILE", CLOCK_FILE))
+    except OSError:
+        return None
+
+
+def _boot_id(path=None):
+    try:
+        with open(path or _env_path("PI_DOCTOR_BOOT_ID_FILE", BOOT_ID_FILE)) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _window(dark_since_ts, boot_wall, gap, source):
+    """One window record. `source` names the evidence it came from."""
+    return {
+        "dark_since": datetime.fromtimestamp(dark_since_ts).isoformat(timespec="seconds"),
+        "dark_until": datetime.fromtimestamp(boot_wall).isoformat(timespec="seconds"),
+        "gap_s": int(gap),
+        "minutes": int(round(gap / 60)),
+        "source": source,
+    }
+
+
+def dark_window(now, uptime_s, saved_ts, threshold_s=DARK_THRESHOLD_S,
+                max_s=DARK_MAX_S):
+    """The window the box was dark, or None when there is nothing to say.
+
+    This is the single-shot path: `now` is the *corrected* clock and
+    `saved_ts` is the last value timesyncd saved — one timeline, so
+    `now - uptime` is the real boot instant. It only holds while the clock
+    file has not been rewritten yet (see the block comment above); the
+    restored-clock path is `resolve_dark_window`, which is what the boot unit
+    relies on.
+
+    None covers three cases that must not be confused with an outage: a
+    piece of evidence missing (no timesyncd, no uptime file), a gap under
+    the threshold (an ordinary reboot), and a gap beyond `max_s` — that is
+    not a seven-day blackout but a clock file nobody touched since an
+    earlier boot.
+    """
+    if uptime_s is None or saved_ts is None:
+        return None
+    boot_wall = now.timestamp() - uptime_s
+    gap = boot_wall - saved_ts
+    if gap < threshold_s or gap > max_s:
+        return None
+    return _window(saved_ts, boot_wall, gap, "clock-file-mtime")
+
+
+def resolve_dark_window(now, uptime_s, pending, threshold_s=DARK_THRESHOLD_S,
+                        max_s=DARK_MAX_S):
+    """Resolve a boot run's pre-sync reading. Returns (status, window).
+
+    `pending` is what `check_dark_window` wrote down while the clock was still
+    the restored value: the *pair* is what makes the gap measurable — the
+    restored value is the moment the box lost power, and the corrected `now`
+    minus the monotonic uptime is the real boot instant.
+
+    status is one of:
+      "unresolved" — `now` is still on the restored timeline (the correction
+                     has not landed), so the boot instant does not exist yet;
+                     the reading is kept and the next run tries again.
+      "none"       — measured, and not a window: an ordinary reboot, or a
+                     reading too old to be a blackout.
+      "window"     — measured: the box was dark for `gap`.
+    """
+    if not pending or uptime_s is None:
+        return "unresolved", None
+    restored = pending.get("restored_ts")
+    if restored is None:
+        return "none", None
+    boot_wall = now.timestamp() - uptime_s
+    gap = boot_wall - restored
+    if gap < 0:
+        # `now - uptime` still lands before the saved value: the clock is
+        # (still) the restored one, so there is nothing to measure yet.
+        return "unresolved", None
+    if gap < threshold_s or gap > max_s:
+        return "none", None
+    return "window", _window(restored, boot_wall, gap, "restored-clock")
+
+
+def check_dark_window(now=None, state=None, threshold_s=DARK_THRESHOLD_S,
+                      alert=True, save=True):
+    """Record this boot's dark window; alert exactly once per window.
+
+    Two runs, one measurement — see the block comment above. The boot run
+    writes the pre-sync reading down (`dark_window_pending`); a later run in
+    the same boot resolves it once the clock has been corrected. The run that
+    resolves it is the one that alerts. A reading whose boot is over and was
+    never resolved cannot be measured any more, and is reported as such
+    instead of leaving the boot looking quiet.
+
+    `line` is the human one-liner for anything worth saying (a resolved
+    window, or an unmeasurable reading); `window` is set only on the run that
+    records one. Observation is gated on the state's boot id, so a run on an
+    unrelated long uptime can never read a stale clock file as an outage.
+    """
+    now = now or datetime.now()
+    st = load_state() if state is None else state
+    boot = _boot_id()
+    first_run_since_boot = bool(boot) and st.get("boot_id") != boot
+    pending = st.get(DARK_PENDING_KEY) or None
+
+    note = None
+    if pending and pending.get("boot_id") != boot:
+        # never resolved while that boot was up (the correction never landed,
+        # or the box went down first) — the evidence for that window is gone.
+        st.pop(DARK_PENDING_KEY, None)
+        note = (f"dark window unmeasured for boot "
+                f"{(pending.get('boot_id') or '?')[:8]} — the clock was never "
+                "corrected while that boot was up")
+        pending = None
+
+    window = None
+    if first_run_since_boot:
+        st["boot_id"] = boot
+        saved = _clock_saved()
+        if saved is not None and abs(now.timestamp() - saved) <= threshold_s:
+            # pre-sync: `now` is still the clock restored from that file, i.e.
+            # the same instant as its mtime. Write the reading down; the real
+            # boot instant arrives with the correction.
+            st[DARK_PENDING_KEY] = {
+                "boot_id": boot,
+                "restored_ts": now.timestamp(),
+                "clock_mtime": saved,
+                "recorded_at": now.isoformat(timespec="seconds"),
+            }
+        else:
+            window = dark_window(now, _read_uptime(), saved, threshold_s)
+    elif pending:
+        status, window = resolve_dark_window(now, _read_uptime(), pending,
+                                             threshold_s)
+        if status != "unresolved":
+            st.pop(DARK_PENDING_KEY, None)
+
+    line = note
+    if note and alert:
+        send_alert("pi-doctor", note)
+    if window:
+        line = (f"dark window {window['dark_since']} -> "
+                f"{window['dark_until']} ({window['minutes']}m without power)")
+        seen = [e.get("dark_since") for e in st.get("dark_windows", [])]
+        if window["dark_since"] not in seen:
+            record = dict(window,
+                          detected_at=now.isoformat(timespec="seconds"))
+            st["dark_window"] = record
+            ledger = st.setdefault("dark_windows", [])
+            ledger.append(record)
+            del ledger[:-DARK_LEDGER_MAX]
+            if alert:
+                send_alert("pi-doctor", line)
+    if save:
+        save_state(st)
+    return line, window
+
+
 def main():
     verbose = "--verbose" in sys.argv
+    if "--dark-window" in sys.argv:
+        # Boot path (systemd/pi-doctor-boot.service): one cheap check, no
+        # project sweep, and silent unless there really was a dark window.
+        line, _ = check_dark_window(alert="--no-alert" not in sys.argv)
+        if line:
+            print(line)
+        return 0
     now = datetime.now()
     all_findings, all_fixes, all_info = [], [], []
 
@@ -524,6 +824,22 @@ def main():
         all_fixes += x
     except Exception as e:
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
+    try:
+        # The dark-window check is only worth anything if its unit is armed:
+        # a re-image or a failed install leaves it absent and silent.
+        f, i = check_boot_timer()
+        all_findings += f
+        all_info += i
+    except Exception as e:
+        all_findings.append(
+            f"doctor:boot-timer:check-error {type(e).__name__}: {e}")
+    try:
+        # Only the first run after a boot can see it — see check_dark_window.
+        line, _ = check_dark_window(now)
+        if line:
+            all_info.append(f"dark:{line}")
+    except Exception as e:
+        all_findings.append(f"doctor:dark:check-error {type(e).__name__}: {e}")
 
     report = format_report(all_findings, all_fixes, now, all_info)
     heals = _recent_heals(now)
@@ -595,7 +911,9 @@ def format_report(findings, fixes, now, info=None):
         lines += [f"  ⚠ {f}" for f in findings]
     info = info or []
     # Deliberate states, not faults: reported, never alerted.
-    parks = [x for x in info if not x.startswith("retired:")]
+    dark = [x for x in info if x.startswith("dark:")]
+    timer = [x for x in info if x.startswith("timer:")]
+    parks = [x for x in info if not x.startswith(("retired:", "dark:", "timer:"))]
     retired = [x for x in info if x.startswith("retired:")]
     if parks:
         lines.append("Parks / hand-offs (expected):")
@@ -603,6 +921,12 @@ def format_report(findings, fixes, now, info=None):
     if retired:
         lines.append("Retired (owner-disabled, not revived):")
         lines += [f"  ⏹ {x}" for x in retired]
+    if dark:
+        lines.append("Dark windows (box had no power):")
+        lines += [f"  🕳 {x.split(':', 1)[1].strip()}" for x in dark]
+    if timer:
+        lines.append("Boot timer (dark-window guard):")
+        lines += [f"  ⏱ {x.split(':', 1)[1].strip()}" for x in timer]
     if not fixes and not findings:
         lines.append("All projects healthy." if not info else
                      "All projects healthy (expected states above).")

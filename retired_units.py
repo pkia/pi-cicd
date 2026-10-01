@@ -67,3 +67,27 @@ def load(path=None) -> Retired:
         units.append(parts[0])
         tokens.update(parts)
     return Retired(units, tokens, path)
+
+
+# The tools want a question, not a config object: `retired_units.is_retired(svc)`.
+# The list is re-read when the path changes (a test or a probe pointing
+# $RETIRED_UNITS_FILE elsewhere) and is tiny, so the cache is per-path.
+_CACHE: dict = {}
+
+
+def _default() -> Retired:
+    path = os.environ.get(ENV_VAR) or DEFAULT_PATH
+    key = str(path)
+    if key not in _CACHE:
+        _CACHE[key] = load(path)
+    return _CACHE[key]
+
+
+def is_retired(name) -> bool:
+    """Is `name` (or one of its spellings) on the shared retired list?"""
+    return _default().is_retired(name)
+
+
+def hits(text) -> list:
+    """Retired tokens occurring in `text` (a probe row, a URL, a unit key)."""
+    return _default().hits(text)

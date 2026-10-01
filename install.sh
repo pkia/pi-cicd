@@ -168,5 +168,15 @@ else
     echo "note: /etc/chaos-drill.conf not found - chaos-drill not installed"
 fi
 
+# pi-doctor's boot check: this Pi has no RTC battery, so after a power cut
+# the clock comes back at the last value systemd-timesyncd saved. Running
+# 20 s after boot — while that file still holds the pre-outage clock — is the
+# only moment the dark window can be measured (see pi-doctor --dark-window).
+sudo cp "$REPO_DIR/systemd/pi-doctor-boot.service" \
+        "$REPO_DIR/systemd/pi-doctor-boot.timer" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet --now pi-doctor-boot.timer
+echo "pi-doctor boot check installed"
+
 echo
 echo "done. try:  new-project my-app --port 8100"

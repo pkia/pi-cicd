@@ -1,0 +1,18 @@
+[Unit]
+Description=pi-doctor — record the dark window of a cold boot (this Pi has no RTC battery)
+Documentation=https://github.com/pkia/pi-cicd
+# By the time this runs, systemd-timesyncd has restored the clock from its
+# saved file (whose timestamp is the moment the box last had a correct
+# clock, i.e. when it lost power), while the first NTP sync — which rewrites
+# that file with the corrected time — is still tens of seconds away. That
+# interval is the only one in which the outage is measurable at all, which
+# is why the timer fires at OnBootSec rather than on a calendar.
+After=systemd-timesyncd.service
+
+[Service]
+Type=oneshot
+User=ev
+ExecStart=/home/ev/pi-cicd/pi-doctor --dark-window
+
+[Install]
+WantedBy=multi-user.target

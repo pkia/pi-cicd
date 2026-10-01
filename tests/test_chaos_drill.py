@@ -409,6 +409,65 @@ def test_probe_timer_drill_skips_never_ran(monkeypatch):
     assert "timestamp" in detail.lower()
 
 
+def test_probe_timer_drill_passes_when_sweep_in_flight(monkeypatch):
+    """2026-09-28 regression: systemd reports ExecMainExitTimestampMonotonic
+    as 0 for the whole life of a new invocation, so a read that lands inside
+    a sweep used to call a perfectly healthy probe "never run".
+
+    The real event: 04:45:04, chaos-drill.timer and service-probe.timer both
+    fired on the same second, the drill read 0 and failed the night.
+    """
+    def fake_run_cmd(*cmd):
+        if "is-active" in cmd:
+            return 0, "active"
+        if "ActiveState" in cmd:
+            return 0, "activating"
+        if "ExecMainStartTimestampMonotonic" in cmd:
+            return 0, str(int((100000 - 2) * 1e6))  # started 2 s ago
+        return 0, "0"  # exit stamp is 0 while the sweep is still running
+
+    monkeypatch.setattr(cd, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(cd, "read_uptime", lambda path="/proc/uptime":
+                        100000.0)
+    result, detail = cd.drill_probe_timer_alive(make_ctx())
+    assert result == "pass", detail
+    assert "in flight" in detail
+
+
+def test_probe_timer_drill_passes_in_flight_without_start_stamp(monkeypatch):
+    def fake_run_cmd(*cmd):
+        if "is-active" in cmd:
+            return 0, "active"
+        if "ActiveState" in cmd:
+            return 0, "activating"
+        return 0, "0"  # no readable start stamp either
+
+    monkeypatch.setattr(cd, "run_cmd", fake_run_cmd)
+    result, detail = cd.drill_probe_timer_alive(make_ctx())
+    assert result == "pass", detail
+    assert "in flight" in detail
+
+
+def test_probe_timer_drill_fails_on_wedged_sweep(monkeypatch):
+    """An in-flight sweep excuses a missing exit stamp — but not forever:
+    one stuck for longer than the staleness budget is still a failure."""
+    def fake_run_cmd(*cmd):
+        if "is-active" in cmd:
+            return 0, "active"
+        if "ActiveState" in cmd:
+            return 0, "activating"
+        if "ExecMainStartTimestampMonotonic" in cmd:
+            return 0, str(int((100000 - 7200) * 1e6))  # 2 h and counting
+        return 0, "0"
+
+    monkeypatch.setattr(cd, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(cd, "read_uptime", lambda path="/proc/uptime":
+                        100000.0)
+    result, detail = cd.drill_probe_timer_alive(make_ctx())
+    assert result == "fail", detail
+    assert "wedged" in detail
+
+
 # ------------------------------------------------------------------ run
 
 def test_run_publishes_receipt_and_persists(tmp_path, monkeypatch):

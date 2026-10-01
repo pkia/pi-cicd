@@ -9,6 +9,8 @@ import hashlib
 import importlib.util
 import importlib.machinery
 import json
+import os
+import sqlite3
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -392,3 +394,119 @@ def test_ntfy_post_suppressed_when_muted(monkeypatch, tmp_path, capsys):
     assert pb.ntfy_post("http://n", {"Authorization": "Bearer x"},
                         {"topic": "backups"}) is True
     assert "muted" in capsys.readouterr().err
+
+
+# ------------------------------------------------------ live-DB snapshots
+
+def make_sqlite(path, rows=3):
+    """A real SQLite DB, the way the host's state.db is real: WAL, so a
+    reader never blocks on the writer this test keeps open."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute("pragma journal_mode=wal")
+    con.execute("create table t (id integer primary key, v text)")
+    con.executemany("insert into t (v) values (?)",
+                    [(f"row-{i}",) for i in range(rows)])
+    con.commit()
+    con.close()
+    return path
+
+
+def borg_listing(repo, name, cfg):
+    code, out, err = pb.run_cmd(
+        ["borg", "list", "--short", f"{repo}::{name}"], cfg)
+    assert code == 0, err
+    return [line.lstrip("/") for line in out.split()]
+
+
+def test_is_sqlite_file_reads_the_magic(tmp_path):
+    assert pb.is_sqlite_file(make_sqlite(tmp_path / "state.db"))
+    plain = tmp_path / "notes.txt"
+    plain.write_text("not a database\n")
+    assert not pb.is_sqlite_file(plain)
+    assert not pb.is_sqlite_file(tmp_path / "missing.db")
+
+
+def test_snapshot_dir_defaults_and_is_configurable(tmp_path):
+    conf = write_config(tmp_path, tmp_path / "repo", [str(tmp_path)],
+                        extra=f"SNAPSHOT_DIR={tmp_path}/snaps")
+    assert pb.load_config(conf)["snapshot_dir"] == f"{tmp_path}/snaps"
+    assert pb.load_config("/nonexistent")["snapshot_dir"] == \
+        pb.DEFAULT_SNAPSHOT_DIR
+    assert "SNAPSHOT_DIR not absolute: snaps" in pb.validate(
+        {**pb.load_config(conf), "snapshot_dir": "snaps"})
+
+
+def test_create_archive_snapshots_live_db_and_excludes_it(tmp_path):
+    """The nightly run must never hand borg a file that is being written
+    (borg aborts: "file changed while we backed it up"): the DB goes in
+    as a consistent snapshot and the live file is left out."""
+    src = tmp_path / "src"
+    live = make_sqlite(src / "hermes" / "state.db", rows=3)
+    snaps = tmp_path / "snaps"
+    repo = tmp_path / "repo"
+    conf = write_config(tmp_path, repo, [str(src / "hermes")],
+                        extra=f"SNAPSHOT_DIR={snaps}")
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+
+    writer = sqlite3.connect(live)
+    writer.execute("insert into t (v) values ('committed-before-backup')")
+    writer.commit()
+    inflight = sqlite3.connect(live)          # a transaction still open
+    inflight.execute("insert into t (v) values ('in-flight')")
+
+    ok, name, stats = pb.create_archive(cfg, datetime.now())
+    assert ok, stats
+    assert stats["snapshots"] == [str(snaps / str(live).lstrip("/"))]
+
+    listing = borg_listing(repo, name, cfg)
+    assert str(live).lstrip("/") not in listing           # live DB excluded
+    assert stats["snapshots"][0].lstrip("/") in listing   # snapshot archived
+
+    ex = tmp_path / "ex"
+    ex.mkdir()
+    code, _, err = pb.run_cmd(
+        ["borg", "extract", f"{repo}::{name}"], cfg, cwd=ex)
+    assert code == 0, err
+    restored = ex / str(stats["snapshots"][0]).lstrip("/")
+    con = sqlite3.connect(restored)
+    assert con.execute("pragma integrity_check").fetchone()[0] == "ok"
+    rows = [r[0] for r in con.execute("select v from t").fetchall()]
+    con.close()
+    assert len(rows) == 4 and "committed-before-backup" in rows
+    assert "in-flight" not in rows            # uncommitted work not captured
+
+    inflight.rollback()
+    writer.close()
+    inflight.close()
+
+
+def test_stale_snapshots_do_not_accumulate(tmp_path):
+    src = tmp_path / "src"
+    make_sqlite(src / "a.db")
+    gone = make_sqlite(src / "b.db")
+    snaps = tmp_path / "snaps"
+    conf = write_config(tmp_path, tmp_path / "repo", [str(src)],
+                        extra=f"SNAPSHOT_DIR={snaps}")
+    cfg = cfg_from(tmp_path, conf)
+    ok, live, dumps, err = pb.snapshot_live_dbs(cfg)
+    assert ok, err
+    assert len(dumps) == 2
+
+    gone.unlink()                             # a DB disappears
+    ok, live, dumps, err = pb.snapshot_live_dbs(cfg)
+    assert ok, err
+    assert dumps == [str(snaps / str(src / "a.db").lstrip("/"))]
+
+
+def test_create_archive_fails_loudly_when_a_db_cannot_be_snapshotted(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "torn.db").write_bytes(pb.SQLITE_MAGIC + b"garbage" * 20)
+    conf = write_config(tmp_path, tmp_path / "repo", [str(src)],
+                        extra=f"SNAPSHOT_DIR={tmp_path}/snaps")
+    cfg = cfg_from(tmp_path, conf)
+    ok, name, stats = pb.create_archive(cfg, datetime.now())
+    assert not ok
+    assert "sqlite snapshot" in stats["error"]
