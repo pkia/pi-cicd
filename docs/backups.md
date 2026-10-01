@@ -16,11 +16,19 @@ than a hope.
 
 ## What gets backed up
 
-Everything under `/etc` that this machine's services need but git
-cannot hold: the ntfy server config + user db, the loop's conf files
-(`loop-heartbeat`, `ntfy-notify`, `pi-backup` itself), and the custom
-systemd units. Application code, sites and dashboards all live in git
-repos with their own CI and are deliberately excluded.
+Everything this machine's services need but git cannot hold: the ntfy
+server config (`/etc/ntfy`) plus its **user db** at
+`/var/lib/ntfy/user.db` — the users, ACL grants and tokens the whole
+notification backbone is authenticated against, which `auth-file` in
+`server.yml` points at, so it is the path that matters, not the one next
+to the config — the loop's conf files (`loop-heartbeat`, `ntfy-notify`,
+`pi-backup` itself), the custom systemd units, and the agent's state
+below. Application code, sites and dashboards all live in git repos with
+their own CI and are deliberately excluded.
+
+Checked 2026-10-01 during a pi-doctor pass: `/etc/ntfy` held only config
+and tokens (no `user.db`), and nothing covered `/var/lib/ntfy` — the
+backup was one directory short of the auth db it claimed to carry.
 
 BACKUP_PATHS in the config is the single source of truth; `pi-backup
 list` shows what archives exist, `pi-backup restore ARCHIVE` extracts
