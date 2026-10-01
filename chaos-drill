@@ -51,6 +51,12 @@ Config: /etc/chaos-drill.conf (KEY=VALUE, '#' comments):
                    distinguishes "denied correctly" from "grant lost"
     HEAL_TARGET    URL a drill may point a probe at to simulate
                    recovery (default http://127.0.0.1:8090/ the portal)
+    HEAL_TARGETS   space/comma-separated candidates for that heal, in
+                   preference order. The first that ANSWERS is used:
+                   the portal is parked by ram-mode focus for long
+                   stretches, and healing the drill onto a parked
+                   endpoint fails it for the environment's reasons
+                   rather than the pipeline's. Nothing alive -> SKIP.
     DRILL          optional repeatable drill name to enable (default all)
 
 Exit 0 when every run drill PASSes (SKIP is not a failure), 1 when a
@@ -130,11 +136,47 @@ def load_config(path):
         "timeout": timeout if timeout > 0 else DEFAULT_TIMEOUT,
         "sub_token": first("NTFY_SUB_TOKEN"),
         "heal_target": first("HEAL_TARGET") or DEFAULT_HEAL_TARGET,
+        "heal_targets": heal_targets(raw),
         "allowed": {s.strip() for s in
                     (first("SUBSCRIBER_ALLOWED_TOPICS")
                      or DEFAULT_ALLOWED_TOPICS).split(",") if s.strip()},
         "enabled": enabled,  # empty set = all drills
     }
+
+
+def heal_targets(raw):
+    """Configured heal candidates, in preference order.
+
+    HEAL_TARGETS (comma/whitespace separated) wins; otherwise the single
+    HEAL_TARGET; otherwise the default portal. Duplicates dropped so a
+    repeated key does not make the drill ask the same dead URL twice.
+    """
+    seen, out = set(), []
+    for value in raw.get("HEAL_TARGETS", []):
+        for url in value.replace(",", " ").split():
+            if url not in seen:
+                seen.add(url)
+                out.append(url)
+    if not out:
+        single = (raw.get("HEAL_TARGET", [""])[-1] or "").strip() \
+            or DEFAULT_HEAL_TARGET
+        out = [single]
+    return out
+
+
+def first_live_target(candidates, timeout):
+    """First heal candidate that answers 200 -> (url, attempts_report).
+
+    '' means nothing answered: the drill SKIPS rather than fail, because
+    a parked/dead heal endpoint says nothing about the detection chain.
+    """
+    tried = []
+    for url in candidates:
+        code, _ = http_request(url, timeout=timeout)
+        tried.append(f"{url} -> {code if code is not None else 'no answer'}")
+        if code == 200:
+            return url, "; ".join(tried)
+    return "", "; ".join(tried)
 
 
 # ------------------------------------------------------------- plumbing
@@ -283,6 +325,12 @@ def drill_service_probe_dead_port(ctx):
     except OSError as exc:
         return "skip", f"cannot read live probe config {base_path}: {exc}"
 
+    candidates = ctx.get("heal_targets") or [ctx["heal_target"]]
+    heal_target, attempts = first_live_target(candidates,
+                                              ctx["cfg"]["timeout"])
+    if not heal_target:
+        return "skip", f"no heal candidate answered ({attempts})"
+
     port = pick_dead_port()
     if not port:
         return "skip", "no dead candidate port on loopback (all answered)"
@@ -338,8 +386,7 @@ def drill_service_probe_dead_port(ctx):
 
         # Phase 2 — heal and expect the recovery notice: the entry
         # flips back to "up" and a recovery digest is published.
-        seen, rc, out = sweep_until_status(
-            "up", heal_target=ctx["heal_target"])
+        seen, rc, out = sweep_until_status("up", heal_target=heal_target)
         if not seen:
             return "fail", f"no recovery after heal within {MAX_SWEEPS} " \
                            f"sweeps:\n{out}"
@@ -543,6 +590,7 @@ def drill_context(cfg, probe_conf, topic, dry_run=False):
         "topic": topic,
         "dry_run": dry_run,
         "heal_target": cfg["heal_target"],
+        "heal_targets": cfg.get("heal_targets") or [cfg["heal_target"]],
         "retarget_topic": topic,  # shadow sweeps alert the drill topic
         "tokens": {},             # tests inject: {"subscriber": "..."}
     }
