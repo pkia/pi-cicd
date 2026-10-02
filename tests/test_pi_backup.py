@@ -511,3 +511,85 @@ def test_create_archive_fails_loudly_when_a_db_cannot_be_snapshotted(tmp_path):
     ok, name, stats = pb.create_archive(cfg, datetime.now())
     assert not ok
     assert "sqlite snapshot" in stats["error"]
+
+
+# ---------------------------------------------------- snapshot rehearsal
+
+def test_verify_rehearses_the_archived_dump_without_the_live_db(tmp_path):
+    """Acceptance: extract the newest archive, integrity-check the dump and
+    assert its recorded rows — with the live database deleted first, so the
+    rehearsal provably reads the archive and not the live file."""
+    src = tmp_path / "src"
+    live = make_sqlite(src / "hermes" / "state.db", rows=3)
+    snaps = tmp_path / "snaps"
+    repo = tmp_path / "repo"
+    conf = write_config(tmp_path, repo, [str(src / "hermes")],
+                        extra=f"SNAPSHOT_DIR={snaps}")
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+
+    ok, name, stats = pb.create_archive(cfg, datetime.now())
+    assert ok, stats
+    manifest = Path(stats["snapshots"][0] + pb.MANIFEST_SUFFIX)
+    assert json.loads(manifest.read_text())["tables"] == {"t": 3}
+    assert str(manifest).lstrip("/") in borg_listing(
+        repo, name, cfg)                       # the manifest is archived too
+
+    live.unlink()                              # nothing left to read live
+    assert pb.main(["--config", str(conf), "--dry-run", "verify"]) == 0
+
+
+def test_verify_names_a_truncated_snapshot(tmp_path):
+    root = tmp_path / "ex"
+    db = make_sqlite(root / "etc" / "ntfy" / "user.db", rows=4)
+    pb.write_manifest(db, "/etc/ntfy/user.db")
+    assert pb.rehearse_snapshots(root)[0]      # good snapshot passes
+
+    raw = db.read_bytes()
+    db.write_bytes(raw[: len(raw) // 2])       # a truncated dump
+
+    ok, lines = pb.rehearse_snapshots(root)
+    assert not ok
+    joined = "\n".join(lines)
+    assert "/etc/ntfy/user.db" in joined       # named
+    assert "truncated" in joined or "integrity" in joined
+
+
+def test_verify_names_a_missing_snapshot(tmp_path):
+    root = tmp_path / "ex"
+    db = make_sqlite(root / "etc" / "ntfy" / "user.db")
+    pb.write_manifest(db, "/etc/ntfy/user.db")
+    db.unlink()
+
+    ok, lines = pb.rehearse_snapshots(root)
+    assert not ok
+    assert any("absent" in line for line in lines)
+    assert any("/etc/ntfy/user.db" in line for line in lines)
+
+
+def test_verify_row_assertion_is_load_bearing(tmp_path):
+    """A dump that opens clean and passes its bytes-check can still have
+    lost the rows it recorded: the manifest row counts are the gate."""
+    root = tmp_path / "ex"
+    db = make_sqlite(root / "etc" / "ntfy" / "user.db", rows=4)
+    pb.write_manifest(db, "/etc/ntfy/user.db")
+
+    con = sqlite3.connect(db)
+    con.execute("delete from t where id = 1")
+    con.commit()
+    con.close()
+    mpath = Path(str(db) + pb.MANIFEST_SUFFIX)  # rehash: only rows can catch it
+    man = json.loads(mpath.read_text())
+    man["sha256"] = pb.file_hash(db)
+    mpath.write_text(json.dumps(man))
+
+    ok, lines = pb.rehearse_snapshots(root)
+    assert not ok
+    assert any("'t' holds 3 rows, the dump recorded 4" in line
+               for line in lines)
+
+
+def test_verify_says_so_when_there_is_nothing_to_rehearse(tmp_path):
+    ok, lines = pb.rehearse_snapshots(tmp_path / "empty")
+    assert not ok
+    assert "no DB-snapshot manifest" in lines[0]

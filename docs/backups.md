@@ -98,6 +98,7 @@ pi-backup list                                  # pick an archive
 sudo pi-backup restore pi-2026-08-25T033000     # extracts to ./restore
 sudo pi-backup restore pi-... /etc/ntfy         # just one subtree
 sudo pi-backup check                            # repo integrity check
+sudo pi-backup verify                           # rehearse the newest archive's DB snapshot
 ```
 
 Extracted paths mirror their absolute source layout

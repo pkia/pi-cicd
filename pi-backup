@@ -210,6 +210,7 @@ def snapshot_live_dbs(cfg):
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             _dump_sqlite(path, dest)
+            write_manifest(dest, path)
         except Exception as exc:  # sqlite3.Error / OSError
             return False, live, snapshots, \
                 f"sqlite snapshot of {path} failed: {exc}"
@@ -217,6 +218,7 @@ def snapshot_live_dbs(cfg):
         snapshots.append(str(dest))
     if snapshots:
         keep = set(snapshots)
+        keep |= {s + MANIFEST_SUFFIX for s in snapshots}
         for stale in Path(snap_dir).rglob("*"):
             if stale.is_file() and str(stale) not in keep:
                 stale.unlink(missing_ok=True)
@@ -241,30 +243,133 @@ def _dump_sqlite(src_path, dest_path):
         src.close()
 
 
+# --------------------------------------------------- snapshot rehearsal
+
+#: Sidecar written next to each dump: what the DB held when it was taken.
+MANIFEST_SUFFIX = ".manifest.json"
+
+
+def _db_profile(path):
+    """Read-only (integrity verdict, {table: row count}) of a SQLite DB."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        verdict = con.execute("pragma integrity_check").fetchone()[0]
+        tables = {}
+        for (name,) in con.execute(
+                "select name from sqlite_master where type='table'"):
+            tables[name] = con.execute(
+                f'select count(*) from "{name}"').fetchone()[0]
+    finally:
+        con.close()
+    return verdict, tables
+
+
+def write_manifest(snapshot, live_path):
+    """Record what the dump held when it was taken, so a later rehearsal
+    can assert a known row instead of just 'some file came back'."""
+    verdict, tables = _db_profile(snapshot)
+    path = str(snapshot) + MANIFEST_SUFFIX
+    Path(path).write_text(json.dumps({
+        "live_path": str(live_path),
+        "integrity_check": verdict,
+        "tables": tables,
+        "rows": sum(tables.values()),
+        "sha256": file_hash(snapshot),
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def rehearse_snapshot(db_path, manifest, label):
+    """One archived snapshot against its own manifest. Returns problems."""
+    problems = []
+    db = Path(db_path)
+    if not db.is_file():
+        return [f"{label}: snapshot absent from the archive"]
+    if manifest.get("sha256") and file_hash(db) != manifest["sha256"]:
+        problems.append(f"{label}: bytes differ from the dump "
+                        f"(truncated or damaged?)")
+    try:
+        verdict, tables = _db_profile(db)
+    except Exception as exc:                     # sqlite3.Error / OSError
+        problems.append(f"{label}: cannot open the snapshot: {exc}")
+        return problems
+    if verdict != "ok":
+        problems.append(f"{label}: integrity_check says {verdict!r}")
+    expected = manifest.get("tables") or {}
+    if not expected:
+        problems.append(f"{label}: manifest recorded no tables")
+    for table in sorted(expected):
+        if table not in tables:
+            problems.append(f"{label}: table {table!r} is gone")
+        elif tables[table] != expected[table]:
+            problems.append(
+                f"{label}: {table!r} holds {tables[table]} rows, the dump "
+                f"recorded {expected[table]}")
+    return problems
+
+
+def rehearse_snapshots(root, limit=50):
+    """Rehearse every archived DB snapshot under an extraction root.
+
+    Only files under `root` are read — the live database is never opened,
+    so a restore is proven from the archive alone. Returns (ok, lines).
+    """
+    root = Path(root)
+    mpaths = sorted(root.rglob("*" + MANIFEST_SUFFIX))
+    if not mpaths:
+        return False, ["verify: no DB-snapshot manifest in the archive "
+                       "— nothing to rehearse"]
+    lines, ok, checked = [], True, 0
+    for mpath in mpaths[:limit]:
+        try:
+            manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            ok = False
+            lines.append(f"verify: unreadable manifest {mpath.name}: {exc}")
+            continue
+        db = Path(str(mpath)[:-len(MANIFEST_SUFFIX)])
+        label = manifest.get("live_path") or str(db)
+        problems = rehearse_snapshot(db, manifest, label)
+        checked += 1
+        if problems:
+            ok = False
+            lines.extend("verify: " + p for p in problems)
+        else:
+            lines.append(f"verify: {label} — integrity ok, "
+                         f"{manifest.get('rows', 0)} row(s) as recorded")
+    lines.append(f"verify: {'PASS' if ok else 'FAIL'} — "
+                 f"{checked} snapshot(s) rehearsed from the archive")
+    return ok, lines
+
+
 def create_archive(cfg, now):
     """borg create one archive; returns (ok, archive_name, stats_dict).
 
-    Live SQLite DBs are snapshotted first and the live files excluded (see
-    snapshot_live_dbs), so the archive carries a transactionally
-    consistent copy instead of borg aborting on a file that changed
-    while it was being read.
+    Live SQLite DBs are snapshotted first (with their manifests) and the
+    live files excluded (see snapshot_live_dbs), so the archive carries a
+    transactionally consistent copy instead of borg aborting on a file
+    that changed while it was being read.
     """
     name = archive_name(cfg, now)
     ok, live, snapshots, err = snapshot_live_dbs(cfg)
     if not ok:
         return False, name, {"error": err}
+    manifests = [s + MANIFEST_SUFFIX for s in snapshots
+                 if Path(s + MANIFEST_SUFFIX).is_file()]
     argv = ["borg", "create"]
     for pat in cfg["exclude"]:
         argv += ["--exclude", pat]
     for path in live:
         argv += ["--exclude", f"pp:{path}"]
     argv.append(f"{cfg['repo']}::{name}")
-    argv += cfg["paths"] + snapshots
+    argv += cfg["paths"] + snapshots + manifests
     code, _, err = run_cmd(argv, cfg)
     if code != 0:
         return False, name, {"error": err.strip().splitlines()[-1] if err.strip() else "borg create failed"}
     stats = archive_stats(cfg, name)
     stats["snapshots"] = snapshots
+    stats["snapshot_manifests"] = manifests
     return True, name, stats
 
 
@@ -482,6 +587,40 @@ def act_drill(cfg, now, dry_run=False):
     return 0 if ok else 1
 
 
+def newest_archive(cfg):
+    """Name of the most recent archive in the repo, or None."""
+    code, out, _ = run_cmd(
+        ["borg", "list", "--short", "--last", "1", cfg["repo"]], cfg)
+    names = out.split()
+    return names[-1] if code == 0 and names else None
+
+
+def act_verify(cfg, archive=None, dry_run=False):
+    """Extract an archive to scratch and rehearse its DB snapshots.
+
+    Nothing here reads the live database: the archive is the only input.
+    """
+    name = archive or newest_archive(cfg)
+    if not name:
+        print("verify: no archive found", file=sys.stderr)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="pi-backup-verify-") as tmp:
+        code, _, err = run_cmd(
+            ["borg", "extract", f"{cfg['repo']}::{name}"], cfg, cwd=tmp)
+        if code != 0:
+            print("verify: borg extract failed: "
+                  f"{err.strip().splitlines()[-1] if err.strip() else '?'}",
+                  file=sys.stderr)
+            return 1
+        ok, lines = rehearse_snapshots(tmp)
+    for line in lines:
+        print(line)
+    notify(cfg, "pi-backup verify " + ("PASS" if ok else "FAIL"),
+           "; ".join(lines[-2:]), priority=None if ok else 4,
+           dry_run=dry_run)
+    return 0 if ok else 1
+
+
 # ------------------------------------------------------------- main
 
 def main(argv=None, now=None):
@@ -498,6 +637,9 @@ def main(argv=None, now=None):
     sub.add_parser("list", help="list archives")
     sub.add_parser("check", help="borg integrity check")
     sub.add_parser("drill", help="backup + restore + byte-compare")
+    vp = sub.add_parser("verify",
+                        help="rehearse an archived DB snapshot (newest first)")
+    vp.add_argument("--archive", help="archive name (default: newest)")
     rp = sub.add_parser("restore", help="extract ARCHIVE [PATH] to --dest")
     rp.add_argument("archive")
     rp.add_argument("path", nargs="?", help="optional path pattern filter")
@@ -519,6 +661,8 @@ def main(argv=None, now=None):
         return act_restore(cfg, args.archive, args.path, args.dest)
     if args.cmd == "check":
         return act_check(cfg)
+    if args.cmd == "verify":
+        return act_verify(cfg, args.archive, args.dry_run)
     return act_drill(cfg, now, args.dry_run)
 
 
