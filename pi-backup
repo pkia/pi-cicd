@@ -524,6 +524,17 @@ def act_run(cfg, now, dry_run=False):
                priority=4, dry_run=dry_run)
         print(f"backup failed: {stats.get('error', '?')}", file=sys.stderr)
         return 1
+    if stats.get("snapshot_manifests"):
+        vok, vlines = rehearse_archive(cfg, name)
+        if not vok:
+            for line in vlines:
+                print(line, file=sys.stderr)
+            notify(cfg, "pi-backup verify FAIL", "; ".join(vlines[-2:]),
+                   priority=4, dry_run=dry_run)
+            print(f"archive {name} is not proven restorable — nothing pruned",
+                  file=sys.stderr)
+            return 1
+        print("\u2713 " + vlines[-1])
     code, _, err = run_cmd(prune_args(cfg), cfg)
     if code != 0:
         notify(cfg, "pi-backup prune failed",
@@ -595,6 +606,22 @@ def newest_archive(cfg):
     return names[-1] if code == 0 and names else None
 
 
+def rehearse_archive(cfg, name):
+    """Extract one archive to scratch and rehearse its DB snapshots.
+
+    The archive is the only input: the live database is never opened.
+    Returns (ok, lines) so the nightly create and the standalone `verify`
+    cannot disagree about what a good archive is.
+    """
+    with tempfile.TemporaryDirectory(prefix="pi-backup-verify-") as tmp:
+        code, _, err = run_cmd(
+            ["borg", "extract", f"{cfg['repo']}::{name}"], cfg, cwd=tmp)
+        if code != 0:
+            last = err.strip().splitlines()[-1] if err.strip() else "?"
+            return False, [f"verify: borg extract failed: {last}"]
+        return rehearse_snapshots(tmp)
+
+
 def act_verify(cfg, archive=None, dry_run=False):
     """Extract an archive to scratch and rehearse its DB snapshots.
 
@@ -604,15 +631,7 @@ def act_verify(cfg, archive=None, dry_run=False):
     if not name:
         print("verify: no archive found", file=sys.stderr)
         return 1
-    with tempfile.TemporaryDirectory(prefix="pi-backup-verify-") as tmp:
-        code, _, err = run_cmd(
-            ["borg", "extract", f"{cfg['repo']}::{name}"], cfg, cwd=tmp)
-        if code != 0:
-            print("verify: borg extract failed: "
-                  f"{err.strip().splitlines()[-1] if err.strip() else '?'}",
-                  file=sys.stderr)
-            return 1
-        ok, lines = rehearse_snapshots(tmp)
+    ok, lines = rehearse_archive(cfg, name)
     for line in lines:
         print(line)
     notify(cfg, "pi-backup verify " + ("PASS" if ok else "FAIL"),

@@ -593,3 +593,71 @@ def test_verify_says_so_when_there_is_nothing_to_rehearse(tmp_path):
     ok, lines = pb.rehearse_snapshots(tmp_path / "empty")
     assert not ok
     assert "no DB-snapshot manifest" in lines[0]
+
+
+# ------------------------------------------------- the nightly rehearses
+
+def test_act_run_rehearses_a_bad_archive_and_pages(tmp_path, capsys,
+                                                   monkeypatch):
+    """Acceptance: the nightly rehearses the archive it just wrote, and a
+    damaged one is a fault — paged, named, exit 1 — never a green run."""
+    src = tmp_path / "src"
+    make_sqlite(src / "hermes" / "state.db", rows=3)
+    repo = tmp_path / "repo"
+    conf = write_config(tmp_path, repo, [str(src / "hermes")],
+                        extra=f"SNAPSHOT_DIR={tmp_path / 'snaps'}\n"
+                              "NTFY_URL=https://ntfy.invalid/backups\n"
+                              "NTFY_TOKEN=tok")
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+
+    real = pb.snapshot_live_dbs
+
+    def truncating(cfg_):
+        ok, live, snaps, err = real(cfg_)   # damage the dump borg will pack
+        for s in snaps:
+            raw = Path(s).read_bytes()
+            Path(s).write_bytes(raw[: len(raw) // 2])
+        return ok, live, snaps, err
+
+    monkeypatch.setattr(pb, "snapshot_live_dbs", truncating)
+    posts = []
+    monkeypatch.setattr(
+        pb, "ntfy_post",
+        lambda url, headers, payload, timeout=15:
+        posts.append(payload) or True)
+
+    assert pb.main(["--config", str(conf), "run"]) == 1
+    out, err = capsys.readouterr()
+    assert "bytes differ from the dump" in out + err
+    titles = [p["title"] for p in posts]
+    assert titles == ["pi-backup verify FAIL"], titles
+    assert posts[0]["priority"] == 4
+    # the fault is a report, not a delete: the archive is still in the repo
+    assert pb.newest_archive(cfg)
+
+
+def test_act_run_rehearses_the_good_archive_and_stays_quiet(tmp_path, capsys,
+                                                            monkeypatch):
+    """A good nightly rehearses (PASS printed) and pages nothing but the one
+    ok digest — no fault on a healthy archive, and no false one either."""
+    src = tmp_path / "src"
+    make_sqlite(src / "hermes" / "state.db", rows=3)
+    repo = tmp_path / "repo"
+    conf = write_config(tmp_path, repo, [str(src / "hermes")],
+                        extra=f"SNAPSHOT_DIR={tmp_path / 'snaps'}\n"
+                              "NTFY_URL=https://ntfy.invalid/backups\n"
+                              "NTFY_TOKEN=tok")
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+
+    posts = []
+    monkeypatch.setattr(
+        pb, "ntfy_post",
+        lambda url, headers, payload, timeout=15:
+        posts.append(payload) or True)
+
+    assert pb.main(["--config", str(conf), "run"]) == 0
+    out = capsys.readouterr().out
+    assert "verify: PASS" in out                  # it really did rehearse
+    assert [p["title"] for p in posts] == ["pi-backup ok"]
