@@ -456,17 +456,42 @@ def test_probe_timer_drill_fails_on_stale_sweep(monkeypatch):
     assert "sweep 60m ago" in detail
 
 
-def test_probe_timer_drill_skips_never_ran(monkeypatch):
+def test_probe_timer_drill_fails_when_never_ran_on_a_long_running_box(
+        monkeypatch):
     def fake_run_cmd(*cmd):
         if "is-active" in cmd:
             return 0, "active"
         return 0, "0"  # no last-run timestamp recorded yet
 
     monkeypatch.setattr(cd, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(cd, "read_uptime", lambda path="/proc/uptime":
+                        100000.0)
     ctx = make_ctx()
     result, detail = cd.drill_probe_timer_alive(ctx)
     assert result == "fail"
     assert "timestamp" in detail.lower()
+
+
+def test_probe_timer_drill_skips_never_ran_just_after_boot(monkeypatch):
+    """2026-10-06 regression: an 18 h power cut rebooted the box, every
+    Persistent=true timer fired at once, and this drill ran before
+    service-probe.timer had ever exited a sweep (exit stamp 0).
+
+    "Never ran" on a box that booted a minute ago is a race, not a broken
+    detection layer, so the drill SKIPs (recorded, not hidden) rather than
+    crying wolf at every cold boot. Past the staleness budget the same
+    read is still a FAIL — see the long-running-box test above.
+    """
+    def fake_run_cmd(*cmd):
+        if "is-active" in cmd:
+            return 0, "active"
+        return 0, "0"
+
+    monkeypatch.setattr(cd, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(cd, "read_uptime", lambda path="/proc/uptime": 60.0)
+    result, detail = cd.drill_probe_timer_alive(make_ctx())
+    assert result == "skip", detail
+    assert "boot" in detail.lower()
 
 
 def test_probe_timer_drill_passes_when_sweep_in_flight(monkeypatch):

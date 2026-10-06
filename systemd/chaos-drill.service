@@ -1,9 +1,17 @@
 [Unit]
 Description=Chaos drill — prove the box notices when things break (one drill per night)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ntfy.service
+Wants=network-online.target ntfy.service
 
 [Service]
 Type=oneshot
 User=ev
+# Boot race (2026-10-06, power cut): every Persistent=true timer fires at
+# once when the box comes back, and this drill beat ntfy to its own socket
+# on 100.122.94.33:6839 — the nightly receipt went nowhere. ntfy already
+# retries its bind while tailscale comes up, so wait for its health
+# endpoint first. Bounded (~4 min) and fail-open: a genuinely dead ntfy
+# still gets a drill that reports the undelivered receipt loudly.
+EnvironmentFile=-/etc/chaos-drill.conf
+ExecStartPre=/bin/sh -c "case $NTFY_URL in http*) ;; *) exit 0 ;; esac; i=0; while [ $i -lt 48 ]; do curl -sf -m 3 -o /dev/null $NTFY_URL/v1/health && exit 0; i=$((i+1)); sleep 5; done; exit 0"
 ExecStart=/home/ev/.local/bin/chaos-drill

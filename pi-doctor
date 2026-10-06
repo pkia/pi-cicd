@@ -280,6 +280,23 @@ def st_ok(url):
 
 # ---------------------------------------------------------------- system
 
+def failed_units(out):
+    """Unit names from `systemctl --failed --no-legend --plain`.
+
+    systemd prints a leading bullet marker even with --no-legend, so the
+    old `line.split()[0]` parsing reported the finding "sys:failed-unit
+    <bullet>" (2026-10-06) — an alert that names no unit at all. --plain
+    drops the marker; stripping it too keeps the parser honest if a future
+    systemd re-adds it.
+    """
+    names = []
+    for line in (out or "").splitlines():
+        fields = line.replace("\u25cf", " ").split()
+        if fields:
+            names.append(fields[0])
+    return names
+
+
 def check_system():
     findings, fixes = [], []
 
@@ -308,10 +325,10 @@ def check_system():
     if m and int(m.group(2)) / int(m.group(1)) > 0.95:
         findings.append(f"sys:mem {m.group(2)}/{m.group(1)}MB used >95%")
 
-    rc, out = run(["systemctl", "--failed", "--no-legend"])
-    if out:
-        for line in out.splitlines():
-            findings.append(f"sys:failed-unit {line.split()[0]}")
+    rc, out = run(["systemctl", "--failed", "--no-legend", "--plain"])
+    if rc == 0 and out:
+        for unit in failed_units(out):
+            findings.append(f"sys:failed-unit {unit}")
 
     # AdGuard DNS actually resolving (raw UDP query, stdlib only)
     if not _dns_resolves():

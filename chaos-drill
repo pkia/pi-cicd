@@ -554,6 +554,21 @@ def drill_probe_timer_alive(ctx):
             f"no/invalid last-sweep timestamp ({mono!r}) — "
             "has service-probe ever run?")
     if mono_us <= 0:  # systemd's value when the unit never ran
+        # Boot race (2026-10-06): a power cut rebooted the box and every
+        # Persistent=true timer fired at once, so this drill ran before
+        # service-probe.timer had ever exited a sweep. "Never ran" on a
+        # box that booted a minute ago says nothing about the detection
+        # layer — SKIP it (recorded, not hidden) instead of crying wolf at
+        # every cold boot. Past the staleness budget it is still a FAIL: a
+        # timer that never sweeps is exactly what this drill exists to
+        # catch, so the long-running-box case is untouched.
+        boot_uptime = read_uptime()
+        if (boot_uptime is not None
+                and boot_uptime < ctx.get("max_sweep_age", 1800)):
+            return "skip", (
+                f"no sweep yet on this boot (uptime {int(boot_uptime)}s, "
+                "under the staleness budget — boot race, not a stuck "
+                "probe timer)")
         return "fail", (
             "no last-sweep timestamp — service-probe has "
             "never run under this timer")
