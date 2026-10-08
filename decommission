@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""decommission — list every artifact a project owns; remove it only on --apply.
+
+A project that is switched off leaves receipts: a git repo under the repos
+dir, systemd units (in the repo tree and installed live), a hermes cron
+job, and tasks registered on a remote host it once deployed to. The
+2026-10-08 forex-copybot teardown was done by hand and still left three
+scheduled tasks on the VPS pointing at a directory that no longer existed
+— a script would have caught them, a human forgot. This tool walks every
+source, prints each artifact it finds, and changes NOTHING unless --apply
+is given.
+
+    decommission PROJECT [--apply] [--json]
+
+Artifact kinds and what the plan does with each:
+
+  repo         a directory under the repos dir named PROJECT (or a sibling
+               whose git origin leaf is PROJECT). REPORTED only — this tool
+               never deletes a repo.
+  unit_system  PROJECT*.service|.timer in the live systemd dir. --apply:
+               `systemctl disable --now <unit>` then `rm -f <file>`.
+  unit_user    the same under ~/.config/systemd/user. --apply: the same
+               with `systemctl --user`.
+  cron         hermes cron jobs whose Name mentions PROJECT. --apply:
+               `hermes cron remove <id>`.
+  remote_task  entries the remote registry declares for PROJECT (host +
+               task). REPORTED only — this box cannot see that host, so
+               removal there is a human step.
+
+A unit file under the project's name whose suffix is not .service/.timer
+(a .socket, a .path, an extensionless file) is an artifact this tool
+cannot classify: it is named and the run exits 2 rather than guessing —
+guessing here is how you remove the wrong thing.
+
+Exit codes: 0 = plan printed (dry run) or every applied action succeeded,
+even for a project that is already gone (0 artifacts found); 1 = --apply
+and at least one action failed; 2 = an artifact could not be classified,
+nothing was changed.
+
+Env overrides (each also a flag; the tests use them to stay hermetic):
+  DECOMMISSION_REPOS_DIR       default /home/ev
+  DECOMMISSION_SYSTEMD_DIR     default /etc/systemd/system
+  DECOMMISSION_USER_UNIT_DIR   default ~/.config/systemd/user
+  DECOMMISSION_REMOTES         default /etc/decommission-remotes.json
+                               (JSON: {"<project>": [{"host","task","detail"}]})
+  DECOMMISSION_CRON_FILE       a recorded `hermes cron list` to parse
+                               instead of running hermes
+
+Run as root (or via sudo): this tool does not elevate itself.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Unit-file suffixes this tool knows how to remove. Anything else under the
+# project's name is unclassifiable (see the module docstring).
+UNIT_SUFFIXES = (".service", ".timer")
+
+
+def run_command(argv, timeout=60):
+    """Run argv, return (rc, stdout+stderr). Never raises; rc 124 = could not run."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 124, str(exc)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def parse_cron_jobs(text):
+    """`hermes cron list` output -> {name: (id, state)}.
+
+    Same shape loop-heartbeat reads: a 12-hex id line ending in
+    `[active]`/`[paused]`/`[deleted]`, then a `Name:` line.
+    """
+    jobs = {}
+    job_id = state = None
+    for line in text.splitlines():
+        s = line.strip()
+        if " [" in s and s.endswith(("active]", "paused]", "deleted]")):
+            head = s.split()[0]
+            if len(head) == 12 and head.isalnum():
+                job_id, state = head, s.split("[", 1)[1].rstrip("]")
+                continue
+        if s.startswith("Name:") and job_id:
+            jobs[s.split("Name:", 1)[1].strip()] = (job_id, state)
+            job_id = state = None
+    return jobs
+
+
+def git_origin(path: Path):
+    """The origin remote URL from .git/config, or None if not a git repo."""
+    cfg = path / ".git" / "config"
+    if not cfg.is_file():
+        return None
+    section = None
+    for line in cfg.read_text(errors="replace").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1]
+        elif section == 'remote "origin"' and s.startswith("url"):
+            return s.split("=", 1)[1].strip()
+    return None
+
+
+def name_matches(project, text):
+    """Whole-token match (so PROJECT never catches a longer unrelated word)."""
+    return re.search(r"(?<![a-z0-9])" + re.escape(project) + r"(?![a-z0-9])",
+                     text, re.IGNORECASE) is not None
+
+
+def artifact(kind, name, location, detail="", ident=None):
+    return {"kind": kind, "name": name, "location": str(location),
+            "detail": detail, "id": ident}
+
+
+def find_artifacts(project, repos_dir, systemd_dir, user_unit_dir,
+                   cron_text, registry):
+    """Return (found, unclassifiable). Reads only — writes nothing."""
+    found, bad = [], []
+
+    # repos — a directory named PROJECT, or a sibling whose origin leaf is it.
+    root = Path(repos_dir)
+    if root.is_dir():
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            origin = git_origin(child)
+            leaf = Path(origin).stem if origin else None
+            if child.name == project or leaf == project:
+                found.append(artifact("repo", child.name, child,
+                                      detail=origin or "no origin remote"))
+
+    # live systemd + user units, by name.
+    for kind, unit_dir in (("unit_system", systemd_dir),
+                           ("unit_user", user_unit_dir)):
+        d = Path(unit_dir).expanduser()
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob(project + "*")):
+            if not f.is_file():
+                continue
+            if f.suffix in UNIT_SUFFIXES:
+                found.append(artifact(kind, f.name, f))
+            else:
+                bad.append(artifact(kind + "/" + (f.suffix.lstrip(".") or "no-suffix"),
+                                    f.name, f,
+                                    detail="unit file with an unrecognised suffix"))
+
+    # hermes cron jobs.
+    for name, (jid, state) in parse_cron_jobs(cron_text or "").items():
+        if name_matches(project, name):
+            found.append(artifact("cron", name, jid, detail=state, ident=jid))
+
+    # remote tasks — a declaration; this box cannot see the remote host.
+    for entry in registry or []:
+        host = entry.get("host", "?")
+        task = entry.get("task", "?")
+        found.append(artifact("remote_task", f"{task} @ {host}",
+                              entry.get("detail", ""),
+                              detail="remove on the remote host by hand"))
+    return found, bad
+
+
+def actions_for(a):
+    """The argv list(s) --apply runs for this artifact ([] == manual only)."""
+    k = a["kind"]
+    if k == "unit_system":
+        return [["systemctl", "disable", "--now", a["name"]],
+                ["rm", "-f", a["location"]]]
+    if k == "unit_user":
+        return [["systemctl", "--user", "disable", "--now", a["name"]],
+                ["rm", "-f", a["location"]]]
+    if k == "cron":
+        return [["hermes", "cron", "remove", a["id"]]]
+    return []
+
+
+def render(project, found, bad):
+    lines = [f"decommission: {project}"]
+    if bad:
+        lines += ["",
+                  f"  {len(bad)} artifact(s) this tool cannot classify:"]
+        for a in bad:
+            lines.append(f"    ! [{a['kind']}] {a['name']}  ({a['location']})")
+        lines.append("  refusing to guess — nothing was changed.")
+        return "\n".join(lines)
+    if not found:
+        lines.append("  0 artifacts found — nothing to decommission.")
+        return "\n".join(lines)
+    lines += ["", f"  {len(found)} artifact(s) found:"]
+    manual = []
+    for a in found:
+        acts = actions_for(a)
+        lines.append(f"    [{a['kind']}] {a['name']}")
+        if a["location"]:
+            lines.append(f"        {a['location']}")
+        if a["detail"]:
+            lines.append(f"        {a['detail']}")
+        if acts:
+            lines.append("        action: " + " ; ".join(" ".join(x) for x in acts))
+        else:
+            manual.append(a)
+    if manual:
+        lines += ["",
+                  f"  {len(manual)} artifact(s) this tool will NOT touch (by hand):"]
+        for a in manual:
+            lines.append(
+                f"    [{a['kind']}] {a['name']} — {a['detail'] or a['location']}")
+    return "\n".join(lines)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="decommission")
+    p.add_argument("project")
+    p.add_argument("--apply", action="store_true",
+                   help="remove what can be removed locally (units + cron job)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--repos-dir",
+                   default=os.environ.get("DECOMMISSION_REPOS_DIR", "/home/ev"))
+    p.add_argument("--systemd-dir", default=os.environ.get(
+        "DECOMMISSION_SYSTEMD_DIR", "/etc/systemd/system"))
+    p.add_argument("--user-unit-dir", default=os.environ.get(
+        "DECOMMISSION_USER_UNIT_DIR", "~/.config/systemd/user"))
+    p.add_argument("--remotes", default=os.environ.get(
+        "DECOMMISSION_REMOTES", "/etc/decommission-remotes.json"))
+    p.add_argument("--cron-file", default=os.environ.get("DECOMMISSION_CRON_FILE"))
+    return p
+
+
+def load_text(path):
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return None
+
+
+def registry_for(path, project):
+    text = load_text(path) if path else None
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        entries = data.get(project, [])
+        return list(entries) if isinstance(entries, list) else []
+    return []
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    cron_text = load_text(args.cron_file) if args.cron_file else None
+    if cron_text is None:
+        rc, cron_text = run_command(["hermes", "cron", "list"])
+        if rc != 0:
+            cron_text = ""
+
+    found, bad = find_artifacts(
+        args.project, args.repos_dir, args.systemd_dir, args.user_unit_dir,
+        cron_text, registry_for(args.remotes, args.project))
+
+    if args.json:
+        print(json.dumps({"project": args.project, "artifacts": found,
+                          "unclassifiable": bad}, indent=2))
+    else:
+        print(render(args.project, found, bad))
+
+    if bad:
+        print(f"decommission: cannot classify {len(bad)} artifact(s); "
+              "nothing changed.", file=sys.stderr)
+        return 2
+
+    if not args.apply:
+        if not args.json:
+            print("\n  dry run — nothing was changed. Re-run with --apply to "
+                  "remove the local units and cron job.")
+        return 0
+
+    applied = failed = 0
+    for a in found:
+        for cmd in actions_for(a):
+            rc, out = run_command(cmd)
+            if rc == 0:
+                applied += 1
+            else:
+                failed += 1
+                print(f"  FAILED: {' '.join(cmd)} -> rc={rc} {out.strip()}",
+                      file=sys.stderr)
+    print(f"\n  applied {applied} action(s); {failed} failed.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

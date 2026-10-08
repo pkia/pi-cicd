@@ -34,11 +34,13 @@ ln -sf "$REPO_DIR/pi-doctor"     "$BIN_DIR/pi-doctor"
 ln -sf "$REPO_DIR/prom-dash"     "$BIN_DIR/prom-dash"
 ln -sf "$REPO_DIR/metric-alert" "$BIN_DIR/metric-alert"
 ln -sf "$REPO_DIR/ram-mode" "$BIN_DIR/ram-mode"
+ln -sf "$REPO_DIR/decommission" "$BIN_DIR/decommission"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
          "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
          "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
-         "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode"
+         "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode" \
+         "$REPO_DIR/decommission"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).

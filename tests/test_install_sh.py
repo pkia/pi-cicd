@@ -20,6 +20,7 @@ INSTALL_SH = (REPO / "install.sh").read_text()
 # repo layout; a tool added to the repo without appearing here fails.
 TOOLS = [
     "chaos-drill",
+    "decommission",
     "loop-heartbeat",
     "metric-alert",
     "new-project",
