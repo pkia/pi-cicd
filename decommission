@@ -10,7 +10,7 @@ scheduled tasks on the VPS pointing at a directory that no longer existed
 source, prints each artifact it finds, and changes NOTHING unless --apply
 is given.
 
-    decommission PROJECT [--apply] [--json]
+    decommission PROJECT [--apply | --check] [--json]
 
 Artifact kinds and what the plan does with each:
 
@@ -32,10 +32,17 @@ A unit file under the project's name whose suffix is not .service/.timer
 cannot classify: it is named and the run exits 2 rather than guessing —
 guessing here is how you remove the wrong thing.
 
-Exit codes: 0 = plan printed (dry run) or every applied action succeeded,
-even for a project that is already gone (0 artifacts found); 1 = --apply
-and at least one action failed; 2 = an artifact could not be classified,
-nothing was changed.
+`--check` is the gate another job can call: it changes nothing and exits
+3 when the project still owns any *locally removable* artifact (a unit or
+a cron job — the kinds --apply can remove), else 0. A repo or a remote
+task is reported but never makes the run unclean, because this tool cannot
+remove either.
+
+Exit codes: 0 = plan printed (dry run), every applied action succeeded, or
+--check found the project clean (including one already gone, 0 artifacts);
+1 = --apply and at least one action failed; 2 = an artifact could not be
+classified, nothing was changed; 3 = --check and at least one locally
+removable artifact remains.
 
 Env overrides (each also a flag; the tests use them to stay hermetic):
   DECOMMISSION_REPOS_DIR       default /home/ev
@@ -218,8 +225,12 @@ def render(project, found, bad):
 def build_parser():
     p = argparse.ArgumentParser(prog="decommission")
     p.add_argument("project")
-    p.add_argument("--apply", action="store_true",
-                   help="remove what can be removed locally (units + cron job)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="remove what can be removed locally (units + cron job)")
+    mode.add_argument("--check", action="store_true",
+                      help="gate mode: exit 3 if any locally removable artifact "
+                           "remains, 0 if the project is clean; changes nothing")
     p.add_argument("--json", action="store_true")
     p.add_argument("--repos-dir",
                    default=os.environ.get("DECOMMISSION_REPOS_DIR", "/home/ev"))
@@ -267,9 +278,15 @@ def main(argv=None):
         args.project, args.repos_dir, args.systemd_dir, args.user_unit_dir,
         cron_text, registry_for(args.remotes, args.project))
 
+    # Locally removable = the kinds --apply can act on (units, cron jobs).
+    # A repo or a remote task is a real finding but not this tool's to remove.
+    removable = [a for a in found if actions_for(a)]
+
     if args.json:
         print(json.dumps({"project": args.project, "artifacts": found,
-                          "unclassifiable": bad}, indent=2))
+                          "unclassifiable": bad,
+                          "locally_removable": [a["name"] for a in removable],
+                          "clean": not removable}, indent=2))
     else:
         print(render(args.project, found, bad))
 
@@ -277,6 +294,17 @@ def main(argv=None):
         print(f"decommission: cannot classify {len(bad)} artifact(s); "
               "nothing changed.", file=sys.stderr)
         return 2
+
+    if args.check:
+        if removable:
+            print(f"decommission: NOT CLEAN — {len(removable)} locally "
+                  "removable artifact(s) remain:", file=sys.stderr)
+            for a in removable:
+                print(f"    [{a['kind']}] {a['name']}  ({a['location']})",
+                      file=sys.stderr)
+            return 3
+        print("decommission: CLEAN — nothing locally removable remains.")
+        return 0
 
     if not args.apply:
         if not args.json:

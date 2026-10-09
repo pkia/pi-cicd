@@ -200,3 +200,45 @@ def test_json_output_lists_the_artifacts(tmp_path, capsys):
     kinds = {a["kind"] for a in data["artifacts"]}
     assert {"repo", "unit_system", "unit_user", "cron", "remote_task"} <= kinds
     assert data["unclassifiable"] == []
+
+
+def test_check_gate_flags_a_leftover_unit_and_changes_nothing(tmp_path, capsys):
+    """Acceptance, first half: --check exits non-zero and names the leftover."""
+    dirs = stub_project(tmp_path)
+    runner = RecordingRunner()
+    dc.run_command = runner  # any command would be recorded here
+
+    rc = dc.main(argv_for("widget", dirs, extra=["--check"]))
+    err = capsys.readouterr().err
+
+    assert rc == 3
+    assert "NOT CLEAN" in err
+    assert "widget.service" in err          # the leftover is named
+    assert runner.calls == []               # a gate never changes anything
+
+
+def test_check_gate_is_clean_once_the_removable_artifacts_are_gone(tmp_path, capsys):
+    """Acceptance, second half: after the units and cron job are removed the
+    same project is clean — its repo and remote task remain but are reported,
+    not removability the gate owns."""
+    dirs = stub_project(tmp_path)
+    repos, sysd, user, cron, remotes = dirs
+    dc.run_command = RecordingRunner()
+    # what --apply leaves behind: units unlinked, cron job gone.
+    for f in list(sysd.glob("widget*")) + list(user.glob("widget*")):
+        f.unlink()
+    cron.write_text("")
+
+    rc = dc.main(argv_for("widget", dirs, extra=["--check"]))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "CLEAN" in out
+    assert "[repo] widget" in out           # still reported ...
+    assert "[remote_task]" in out           # ... but not locally removable
+
+
+def test_check_and_apply_are_mutually_exclusive():
+    import pytest
+    with pytest.raises(SystemExit):
+        dc.build_parser().parse_args(["widget", "--check", "--apply"])
