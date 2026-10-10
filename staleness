@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""staleness — report a running process that is older than the code it runs.
+
+The 2026-10-10 devlog taped the shape of this failure: a control plane
+serving pre-fix code because its process had been started before the fix
+landed — found only because a human-ish agent read a process start time
+next to a commit log, and only because the day's real work was blocked.
+This is the mechanical version of that reading.
+
+    staleness UNIT --repo DIR [--path SUBPATH] [--grace SEC] [--json] [--verbose]
+
+Reads only. It never restarts anything: the output is a report and the
+restart stays a decision.
+
+How the two sides are measured:
+
+  process  `systemctl show -p ActiveState -p ActiveEnterTimestampMonotonic
+           UNIT`. The monotonic stamp (microseconds since boot) is the one
+           systemd property with no locale and no human date format in it;
+           it is converted to wallclock as `(now - uptime) + us/1e6` — the
+           same two-timeline arithmetic pi-doctor's dark-window check uses,
+           and the same place a naive reading goes wrong, so uptime comes
+           from the kernel, not from the clock twice.
+  code     `git -C DIR log -1 --format=%ct%x00%H%x00%s -- PATHSPEC`, the
+           newest commit touching that path.
+
+A process older than that commit — by more than --grace seconds, the
+window where a deploy legitimately restarts right after pushing — is
+STALE. Silence is the healthy default: a fresh service prints nothing at
+all, so a unit whose code has not moved stays quiet forever.
+
+Exit codes: 0 = fresh (or nothing to compare: the unit is not running),
+1 = STALE, 2 = a side could not be measured (systemd did not answer, the
+repo is not a git repo, the path has no commits). 1 and 2 name what they
+read, on stderr.
+
+Env overrides (each also the tests' way in; none of them can restart
+anything):
+  STALENESS_NOW           wallclock epoch to use instead of time.time()
+  STALENESS_UPTIME_FILE   file to read uptime from, default /proc/uptime
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Properties asked of systemd. ActiveState separates "running" from a unit
+# that exists but is stopped; the monotonic stamp is the start instant.
+SHOW_PROPS = ("ActiveState", "ActiveEnterTimestampMonotonic")
+
+# Default grace: a deploy may push the commit and restart moments later,
+# and both orders exist in the wild. 60 s absorbs that window without
+# hiding a process that is genuinely an hour behind its code.
+DEFAULT_GRACE_S = 60
+
+
+def run_command(argv, timeout=60):
+    """Run argv, return (rc, stdout+stderr). Never raises; rc 124 = could not run."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 124, str(exc)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def parse_show(text):
+    """`systemctl show` key=value lines -> dict (unknown keys kept as-is)."""
+    props = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key.strip()] = value.strip()
+    return props
+
+
+def read_uptime(path):
+    """Seconds since boot from a /proc/uptime-shaped file, or None."""
+    try:
+        return float(Path(path).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def service_start_epoch(props, uptime_s, now):
+    """The service's start as a wallclock epoch, or None if it is not running.
+
+    None covers both "the unit is stopped" and "systemd answered nothing":
+    neither can be serving stale code, and neither is this tool's to judge.
+    """
+    if not props:
+        return None
+    if props.get("ActiveState", "") not in ("active", "activating"):
+        return None
+    try:
+        start_us = int(props.get("ActiveEnterTimestampMonotonic", "0") or "0")
+    except ValueError:
+        return None
+    if start_us <= 0 or uptime_s is None:
+        return None
+    boot_wall = now - uptime_s
+    return boot_wall + start_us / 1_000_000.0
+
+
+def newest_commit(repo, pathspec):
+    """(epoch, sha, subject) of the newest commit touching pathspec, or None."""
+    rc, out = run_command(["git", "-C", str(repo), "log", "-1",
+                           "--format=%ct%x00%H%x00%s", "--", pathspec])
+    if rc != 0 or "\x00" not in out:
+        return None
+    parts = out.strip().split("\x00")
+    if len(parts) < 3:
+        return None
+    try:
+        return (int(parts[0]), parts[1], parts[2])
+    except ValueError:
+        return None
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="staleness")
+    p.add_argument("unit", help="systemd unit name, e.g. cs2-dashboard.service")
+    p.add_argument("--repo", required=True,
+                   help="git repo whose code the unit runs")
+    p.add_argument("--path", default=".",
+                   help="pathspec inside the repo (default the whole repo)")
+    p.add_argument("--grace", type=int, default=DEFAULT_GRACE_S,
+                   help="seconds a restart may lag its commit (default 60)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="print the healthy reading too")
+    p.add_argument("--uptime-file",
+                   default=os.environ.get("STALENESS_UPTIME_FILE",
+                                          "/proc/uptime"))
+    return p
+
+
+def measure(args, now):
+    """Read both sides once. Returns (start_epoch, commit, props)."""
+    rc, out = run_command(["systemctl", "show",
+                           *[f"-p{p}" for p in SHOW_PROPS], args.unit])
+    props = parse_show(out) if rc == 0 else {}
+    start = service_start_epoch(props, read_uptime(args.uptime_file), now)
+    commit = newest_commit(args.repo, args.path) if start is not None else None
+    return start, commit, props
+
+
+def format_epoch(epoch):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        now = float(os.environ["STALENESS_NOW"])
+    except (KeyError, ValueError):
+        now = time.time()
+
+    start, commit, props = measure(args, now)
+
+    if start is None:
+        # Not running (or systemd said nothing): a stopped process cannot be
+        # serving stale code. Reported only when asked.
+        if args.verbose:
+            state = props.get("ActiveState") or "unknown"
+            print(f"staleness: {args.unit} not running (ActiveState={state})"
+                  " — nothing to compare")
+        if args.json:
+            print(json.dumps({"unit": args.unit, "repo": args.repo,
+                              "path": args.path, "state": "not-running",
+                              "start_epoch": None, "commit": None}, indent=2))
+        return 0
+
+    if commit is None:
+        print(f"staleness: {args.unit} is running but {args.path} in "
+              f"{args.repo} has no commit to compare — not a git repo, or no "
+              "commit touches that path.", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"unit": args.unit, "repo": args.repo,
+                              "path": args.path, "state": "unmeasurable",
+                              "start_epoch": start, "commit": None}, indent=2))
+        return 2
+
+    commit_epoch, sha, subject = commit
+    gap_s = int(start - commit_epoch)
+    stale = start + args.grace < commit_epoch
+
+    if args.json:
+        print(json.dumps({
+            "unit": args.unit, "repo": str(args.repo), "path": args.path,
+            "state": "stale" if stale else "fresh",
+            "start_epoch": int(start), "start": format_epoch(start),
+            "commit_epoch": commit_epoch, "commit": sha, "subject": subject,
+            "gap_s": gap_s, "grace_s": args.grace}, indent=2))
+
+    if stale:
+        print(f"staleness: STALE — {args.unit} started "
+              f"{format_epoch(start)} ({abs(gap_s)}s before the newest commit "
+              f"touching {args.path})", file=sys.stderr)
+        print(f"    newest commit {sha[:12]} {format_epoch(commit_epoch)} "
+              f"{subject}", file=sys.stderr)
+        print(f"    the running process predates its code; restarting it is a "
+              "decision, not this tool's.", file=sys.stderr)
+        return 1
+
+    if args.verbose:
+        print(f"staleness: OK — {args.unit} started {format_epoch(start)}, "
+              f"newest commit {sha[:12]} {format_epoch(commit_epoch)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

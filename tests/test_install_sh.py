@@ -33,6 +33,7 @@ TOOLS = [
     "ram-mode",
     "release-watch",
     "service-probe",
+    "staleness",
 ]
 
 LINK_RE = re.compile(r'ln -sf "\$REPO_DIR/(\S+)"\s+"\$BIN_DIR/\1"')
