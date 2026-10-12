@@ -38,10 +38,25 @@ Env overrides (each also the tests' way in; none of them can restart
 anything):
   STALENESS_NOW           wallclock epoch to use instead of time.time()
   STALENESS_UPTIME_FILE   file to read uptime from, default /proc/uptime
+  STALENESS_ALLOWLIST_FILE  allowlist to read, default /etc/staleness-allowlist
+
+Some pairings are stale on purpose: a unit that happens to run out of a
+directory whose commits are not its business (prometheus.service against
+the pi-cicd checkout, xmedia.service against twitter-launch) is flagged
+by the raw comparison every time, and a flag nobody can act on is noise.
+The allowlist is a **data file** — one entry per line:
+
+    <unit-glob> <repo-glob> [reason]
+
+`#` starts a comment, the reason text is printed verbatim, and a missing
+or unreadable file means *nothing is allowlisted* — an absent file can
+never silence the tool. An allowlisted pair exits 0 and states the reason
+instead of the STALE report; it is still reported, just not as a fault.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import subprocess
@@ -57,6 +72,53 @@ SHOW_PROPS = ("ActiveState", "ActiveEnterTimestampMonotonic")
 # and both orders exist in the wild. 60 s absorbs that window without
 # hiding a process that is genuinely an hour behind its code.
 DEFAULT_GRACE_S = 60
+
+# Default allowlist path; the live file is the owner's to populate. Absent
+# or unreadable reads as empty, so this tool fails *loud* on a missing
+# file rather than inheriting a silent exemption.
+
+DEFAULT_ALLOWLIST = "/etc/staleness-allowlist"
+
+DEFAULT_REASON = "allowlisted (no reason given in the file)"
+
+
+def load_allowlist(path):
+    """[(unit_glob, repo_glob, reason)] from a data file.
+
+    Missing, unreadable or comment-only reads as `[]` — i.e. today's
+    behaviour exactly. A line needs a unit; the repo defaults to `*`.
+    """
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return []
+    entries = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        unit_glob = parts[0]
+        repo_glob = parts[1] if len(parts) > 1 else "*"
+        reason = parts[2].strip() if len(parts) > 2 else DEFAULT_REASON
+        entries.append((unit_glob, repo_glob, reason or DEFAULT_REASON))
+    return entries
+
+
+def allowlist_reason(entries, unit, repo):
+    """The stated reason this unit/repo pair may be stale, or None.
+
+    A repo is matched on its full path *and* its basename, so an entry can
+    be written either as the checkout directory's name or as a path.
+    """
+    for unit_glob, repo_glob, reason in entries:
+        if not fnmatch.fnmatch(unit, unit_glob):
+            continue
+        if (fnmatch.fnmatch(repo, repo_glob)
+                or fnmatch.fnmatch(os.path.basename(repo.rstrip("/")),
+                                   repo_glob)):
+            return reason
+    return None
 
 
 def run_command(argv, timeout=60):
@@ -136,6 +198,11 @@ def build_parser():
     p.add_argument("--uptime-file",
                    default=os.environ.get("STALENESS_UPTIME_FILE",
                                           "/proc/uptime"))
+    p.add_argument("--allowlist", metavar="FILE",
+                   default=os.environ.get("STALENESS_ALLOWLIST_FILE",
+                                          DEFAULT_ALLOWLIST),
+                   help="data file of unit/repo pairs allowed to be stale "
+                        f"(default {DEFAULT_ALLOWLIST})")
     return p
 
 
@@ -188,14 +255,29 @@ def main(argv=None):
     commit_epoch, sha, subject = commit
     gap_s = int(start - commit_epoch)
     stale = start + args.grace < commit_epoch
+    reason = (allowlist_reason(load_allowlist(args.allowlist), args.unit,
+                               str(args.repo)) if stale else None)
 
     if args.json:
         print(json.dumps({
             "unit": args.unit, "repo": str(args.repo), "path": args.path,
-            "state": "stale" if stale else "fresh",
+            "state": ("allowlisted" if reason is not None
+                      else ("stale" if stale else "fresh")),
             "start_epoch": int(start), "start": format_epoch(start),
             "commit_epoch": commit_epoch, "commit": sha, "subject": subject,
-            "gap_s": gap_s, "grace_s": args.grace}, indent=2))
+            "gap_s": gap_s, "grace_s": args.grace,
+            "allowlisted": reason is not None, "allow_reason": reason,
+        }, indent=2))
+
+    if reason is not None:
+        # Stale, and the pair is declared stale on purpose: a clean verdict
+        # that still says why, so the reading is visible without being a
+        # finding. Reported on stdout, never as a fault. Under --json the
+        # reason travels in `allow_reason` instead, like every other verdict.
+        if not args.json:
+            print(f"staleness: OK — {args.unit} is stale against {args.path} "
+                  f"in {args.repo}, allowlisted: {reason}")
+        return 0
 
     if stale:
         print(f"staleness: STALE — {args.unit} started "

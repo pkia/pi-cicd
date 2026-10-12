@@ -198,3 +198,74 @@ def test_source_has_no_restart_path():
     src = SCRIPT.read_text()
     for verb in ("restart", "stop", "kill", "disable", "enable"):
         assert f'"{verb}"' not in src and f"'{verb}'" not in src
+
+
+def allowlist_file(tmp_path, text, name="allowlist"):
+    path = tmp_path / name
+    path.write_text(text)
+    return str(path)
+
+
+def test_an_allowlisted_pair_is_ok_and_states_why(tmp_path, monkeypatch,
+                                                  capsys):
+    """Acceptance 1: a pair meant to be stale exits 0, naming the reason.
+
+    The same reading that is STALE without the file (START 3000 s before
+    the commit, matching test_stale_when_the_process_predates…)."""
+    make_repo(tmp_path, NOW - 7200, NOW - 600)
+    allow = allowlist_file(
+        tmp_path,
+        "# pairs that are meant to be stale\n"
+        "widget.*  */code  a commit in that repo is not this unit's business\n")
+    rc, _ = run(monkeypatch, tmp_path, show(monotonic_for(NOW - 3000)),
+                extra=["--allowlist", allow])
+
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.err == ""
+    assert "allowlisted" in out.out
+    assert "not this unit's business" in out.out
+
+
+def test_without_the_entry_the_same_pair_is_stale_again(tmp_path, monkeypatch,
+                                                        capsys):
+    """Acceptance 2: delete the entry (and an absent file) -> exit 1 again."""
+    make_repo(tmp_path, NOW - 7200, NOW - 600)
+    empty = allowlist_file(tmp_path, "# nothing here yet\n", name="empty")
+    rc, _ = run(monkeypatch, tmp_path, show(monotonic_for(NOW - 3000)),
+                extra=["--allowlist", empty])
+    assert rc == 1
+    assert "STALE" in capsys.readouterr().err
+
+    rc, _ = run(monkeypatch, tmp_path, show(monotonic_for(NOW - 3000)),
+                extra=["--allowlist", str(tmp_path / "absent")])
+    assert rc == 1
+    assert "STALE" in capsys.readouterr().err
+
+
+def test_the_entry_is_data_and_covers_only_its_own_pair(tmp_path, monkeypatch,
+                                                        capsys):
+    """Acceptance 3: the allowlist is a file, not code — a unit it does not
+    name stays STALE, and --json carries the verdict and the reason."""
+    make_repo(tmp_path, NOW - 7200, NOW - 600)
+    other = allowlist_file(tmp_path, "other.service */code  not this one\n",
+                           name="other")
+    rc, _ = run(monkeypatch, tmp_path, show(monotonic_for(NOW - 3000)),
+                extra=["--allowlist", other])
+    assert rc == 1
+    assert "STALE" in capsys.readouterr().err
+
+    # a bare entry (no reason) still matches, and defaults its reason
+    bare = allowlist_file(tmp_path, "widget.service */code\n", name="bare")
+    rc, _ = run(monkeypatch, tmp_path, show(monotonic_for(NOW - 3000)),
+                extra=["--allowlist", bare, "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["state"] == "allowlisted" and data["allowlisted"] is True
+    assert data["allow_reason"]
+    assert data["gap_s"] == -2400          # the measurement is still made
+
+    rc, _ = run(monkeypatch, tmp_path, show(monotonic_for(NOW - 60)),
+                extra=["--allowlist", bare, "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0 and data["state"] == "fresh" and data["allowlisted"] is False
