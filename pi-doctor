@@ -20,6 +20,8 @@ Per-project checks:
 Deliberate states are reported, never "fixed":
   * units stopped by `ram-mode focus` (owner park) -> left stopped, listed
   * ais-catcher idling while a NOAA capture owns the RTL-SDR -> left alone
+  * ais-catcher inside the sdr-monitor marine-band scan window (the
+    scanner hands the single SDR back within seconds) -> waited out
 
 Safe fixes applied automatically:
   F1 service dead/not-found-but-unit-exists -> systemctl reset-failed + start
@@ -90,6 +92,16 @@ def _sat_capture_running() -> bool:
         return False
 
 
+# sdr-monitor hands the single RTL-SDR back and forth on a ~3 min cycle:
+# stop ais-catcher, scan 155.5-163 MHz for a few seconds, start it again.
+# An audit landing in that window sees a dead-looking service and used to
+# revive it (2026-10-13 06:30: the revive raced the scanner, and only the
+# scanner start of its own succeeded). Only a RECENT stop counts as a
+# hand-off — a unit that died hours ago is still a real fault.
+SDR_SCANNER = "sdr-monitor"
+SDR_HANDOFF_GRACE_S = 60
+
+
 RAM_PARK_STATE = os.path.expanduser("~/.local/state/ram-mode/stopped")
 
 
@@ -112,6 +124,33 @@ def _ram_parked() -> set:
     except OSError:
         pass
     return parked
+
+
+def _inactive_for(svc) -> float | None:
+    """Seconds since the unit last went inactive, None if unreadable."""
+    rc, out = run(["systemctl", "show", svc, "-p",
+                   "InactiveEnterTimestampMonotonic", "--value"])
+    if rc != 0:
+        return None
+    try:
+        inactive_us = int((out or "").strip())
+    except ValueError:
+        return None
+    up = _read_uptime()
+    if inactive_us <= 0 or up is None:
+        return None
+    return max(0.0, up - inactive_us / 1e6)
+
+
+def _sdr_handoff(svc) -> bool:
+    """True when this stop is the SDR scanner handing the dongle over."""
+    if svc != "ais-catcher":
+        return False
+    rc, _ = run(["systemctl", "is-active", SDR_SCANNER])
+    if rc != 0:
+        return False
+    secs = _inactive_for(svc)
+    return secs is not None and secs <= SDR_HANDOFF_GRACE_S
 
 
 def _unit_retired(svc) -> bool:
@@ -192,6 +231,18 @@ def check_project(svc, pdir, ui, healthz, has_deploy, has_ci):
             # finding behind. Report as an expected state instead.
             info.append(f"retired:{svc} — unit disabled by owner, not reviving")
             return findings, fixes, info
+
+        # A stop younger than the grace window, with the SDR scanner up,
+        # is the scanner handing the dongle over: wait for it instead of
+        # reviving (and racing) a service that comes back by itself.
+        if _sdr_handoff(svc):
+            for _ in range(6):
+                time.sleep(5)
+                rc, _ = run(["systemctl", "is-active", svc])
+                if rc == 0:
+                    info.append(f"yielded:{svc} — sdr-monitor scan window, "
+                                "service came back on its own")
+                    return findings, fixes, info
         # F1: unit exists but dead -> try revive
         # (sudo -n: the doctor runs unattended, and plain `systemctl start`
         # of a system unit fails as ev with "Interactive authentication

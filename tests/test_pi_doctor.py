@@ -619,3 +619,63 @@ def test_boot_timer_silent_where_no_unit_can_exist():
     assert findings == [] and infos == []
     r = doc.format_report([], [], None, infos)
     assert "Boot timer" not in r and "All projects healthy" in r
+
+
+def test_ais_catcher_sdr_scan_window_is_not_a_death(tmp_path, monkeypatch):
+    # sdr-monitor stops ais-catcher for a few seconds on every ~3 min scan;
+    # the audit must wait that hand-off out, not revive and race it.
+    started = []
+    probes = {"n": 0}
+
+    def fake_run(cmd, timeout=60):
+        v = _verb(cmd)
+        if v == "show" and "InactiveEnterTimestampMonotonic" in cmd:
+            return 0, str(int(95.0 * 1e6))       # stopped 5s ago
+        if v == "is-active":
+            if cmd[-1] == "sdr-monitor":
+                return 0, "active"
+            probes["n"] += 1
+            return (3, "inactive") if probes["n"] == 1 else (0, "active")
+        if v == "start":
+            started.append(cmd)
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(doc, "run", fake_run)
+    monkeypatch.setattr(doc, "_read_uptime", lambda path=None: 100.0)
+    monkeypatch.setattr("time.sleep", lambda *a: None)
+    with mock.patch("os.path.exists",
+                    side_effect=lambda p: p == "/etc/systemd/system/ais-catcher.service"):
+        f, x, i = doc.check_project("ais-catcher", str(tmp_path), None, None, False, False)
+    assert started == []                            # nothing was revived
+    assert f == [] and x == []                      # and not a fault either
+    assert any(s.startswith("yielded:ais-catcher") for s in i), i
+
+
+def test_ais_catcher_stale_death_is_still_revived(tmp_path, monkeypatch):
+    # stopped 3h ago: not a scan hand-off, so F1 must still revive it
+    state = {"active": False, "started": 0}
+
+    def fake_run(cmd, timeout=60):
+        v = _verb(cmd)
+        if v == "show" and "InactiveEnterTimestampMonotonic" in cmd:
+            return 0, str(int((100000.0 - 10800.0) * 1e6))
+        if v == "is-active":
+            if cmd[-1] == "sdr-monitor":
+                return 0, "active"
+            return (0, "active") if state["active"] else (3, "inactive")
+        if v == "start":
+            state["started"] += 1
+            state["active"] = True
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(doc, "run", fake_run)
+    monkeypatch.setattr(doc, "_read_uptime", lambda path=None: 100000.0)
+    monkeypatch.setattr("time.sleep", lambda *a: None)
+    with mock.patch("os.path.exists",
+                    side_effect=lambda p: p == "/etc/systemd/system/ais-catcher.service"):
+        f, x, i = doc.check_project("ais-catcher", str(tmp_path), None, None, False, False)
+    assert state["started"] == 1
+    assert any("revived" in s for s in x), x
+
