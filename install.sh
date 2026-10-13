@@ -36,12 +36,14 @@ ln -sf "$REPO_DIR/metric-alert" "$BIN_DIR/metric-alert"
 ln -sf "$REPO_DIR/ram-mode" "$BIN_DIR/ram-mode"
 ln -sf "$REPO_DIR/decommission" "$BIN_DIR/decommission"
 ln -sf "$REPO_DIR/staleness" "$BIN_DIR/staleness"
+ln -sf "$REPO_DIR/journal-receipt" "$BIN_DIR/journal-receipt"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
          "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
          "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
          "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode" \
-         "$REPO_DIR/decommission" "$REPO_DIR/staleness"
+         "$REPO_DIR/decommission" "$REPO_DIR/staleness" \
+         "$REPO_DIR/journal-receipt"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -180,6 +182,18 @@ sudo cp "$REPO_DIR/systemd/pi-doctor-boot.service" \
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now pi-doctor-boot.timer
 echo "pi-doctor boot check installed"
+
+# journal-receipt: the durable slice of the journal (warning and above,
+# bounded) plus the boot verdict. Runs on the boot and every 5 min: the
+# `record` half keeps a receipt on real storage (~/.local/state, not the
+# /var/log RAM disk), and the `check` half says out loud whether the
+# previous boot recorded a shutdown sequence. No config file — the
+# defaults (priority warning, 200 lines, 4 boots kept) are the point.
+sudo cp "$REPO_DIR/systemd/journal-receipt.service" \
+        "$REPO_DIR/systemd/journal-receipt.timer" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet --now journal-receipt.timer
+echo "journal-receipt timer installed and active"
 
 echo
 echo "done. try:  new-project my-app --port 8100"

@@ -21,6 +21,7 @@ INSTALL_SH = (REPO / "install.sh").read_text()
 TOOLS = [
     "chaos-drill",
     "decommission",
+    "journal-receipt",
     "loop-heartbeat",
     "metric-alert",
     "new-project",

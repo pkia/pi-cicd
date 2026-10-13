@@ -1,0 +1,17 @@
+[Unit]
+Description=journal-receipt — durable journal slice + shutdown verdict
+Documentation=https://github.com/pkia/pi-cicd
+# The slice is the point: /var/log on this box is a 128 MB RAM disk, so the
+# minutes before an unclean reboot evaporate unless something copies them to
+# real storage first. Runs as ev (the state dir is ~ev/.local/state, and a
+# system unit resolves %h from the manager — absolute paths only, see the
+# 2026-09-26 lesson).
+
+[Service]
+Type=oneshot
+User=ev
+ExecStart=/usr/bin/python3 /home/ev/pi-cicd/journal-receipt record
+# The verdict is said out loud on every sweep, into the journal — the one
+# place a human looks after a crash. `-` on purpose: "no shutdown record"
+# exits 1, and a finding is not a failed unit.
+ExecStartPost=-/usr/bin/python3 /home/ev/pi-cicd/journal-receipt check

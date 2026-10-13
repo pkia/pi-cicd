@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""journal-receipt — leave a durable receipt of the minutes before a boot.
+
+The 2026-10-12/13 devlog forensics, in one line: `Storage=persistent` in
+systemd 257's journald config, but `/var/log` is this box's 128 MB RAM
+disk, mirrored to real storage once a night — so whatever happened in the
+minutes before an unclean reboot is gone unless it happens to fall on the
+right side of that nightly sync. The 10-12 crash left a 26-minute hole and
+`vcgencmd get_throttled` could only answer "since last boot".
+
+This tool writes the answer down before the box can lose it:
+
+  record   takes a small, bounded slice of the *current* boot's journal —
+           priority `warning` and above, at most `--max-lines` lines — and
+           appends it to a receipt on real storage, keyed by this boot's
+           id. One receipt per boot (a re-run replaces it), at most KEEP
+           boots kept: the cost is a few tens of KB, not a second journal.
+  check    reads back the *previous* boot and says out loud whether a
+           shutdown sequence was recorded. When it was not — a forced or
+           unclean end — it quotes the last journal lines and the durable
+           receipt for that boot, so the reading is a report with evidence
+           rather than a hole. When even the previous boot is missing from
+           the journal (this box's normal state after the nightly sync
+           window, because the journal lives on the RAM disk), it says
+           that too, and quotes the newest receipt instead of printing
+           nothing.
+
+Scheduling `record` (a `systemd/journal-receipt.timer` oneshot every few
+minutes) is the owner's call, like every other unit here — the tool is
+runnable by hand and from a timer.
+
+**It cannot act on the system.** Every command it runs is `journalctl`
+reading (`--list-boots`, `-b`, `-p`, `-n`, `--output`, `--no-pager`); the
+source carries no restart, stop, reboot or poweroff verb and never invokes
+systemd's own control CLI at all, and the tests assert exactly that.
+
+Usage:
+    journal-receipt record [--priority P] [--max-lines N] [--json]
+    journal-receipt check [--boot IDX | --boot-id ID] [--max-lines N] [--json]
+
+Exit codes:
+    0  record wrote a receipt / check found a recorded shutdown sequence
+    1  check measured the previous boot and it has no shutdown record
+    2  unmeasurable: no boot id, no previous boot, or journalctl refused
+
+Env overrides (the tests' way in; none of them can change system state):
+    JOURNAL_RECEIPT_DIR          durable store, default
+                                 ~/.local/state/journal-receipt
+    JOURNAL_RECEIPT_BOOT_ID_FILE current boot id, default
+                                 /proc/sys/kernel/random/boot_id
+    JOURNAL_RECEIPT_KEEP         how many boot receipts to keep, default 4
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_DIR = Path.home() / ".local" / "state" / "journal-receipt"
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+
+DEFAULT_PRIORITY = "warning"
+DEFAULT_MAX_LINES = 200
+DEFAULT_KEEP = 4
+CHECK_TAIL_LINES = 60
+
+# A boot that ended cleanly leaves one of these in the journal, last thing.
+SHUTDOWN_MARKERS = (
+    "systemd-shutdown",
+    "Shutting down",
+    "Reached target Power-Off",
+    "Reached target Shutdown",
+    "Reached target Reboot",
+    "System is powering down",
+    "Powering off",
+)
+
+JOURNALCTL = "journalctl"
+BOOT_LINE_RE = re.compile(r"^\s*(-?\d+)\s+([0-9a-fA-F]{32})\b")
+
+
+def run_command(argv, timeout=60):
+    """The only way this tool reaches the system. Injectable for tests."""
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def receipt_dir():
+    return Path(os.environ.get("JOURNAL_RECEIPT_DIR") or DEFAULT_DIR)
+
+
+def keep_count():
+    try:
+        return max(1, int(os.environ.get("JOURNAL_RECEIPT_KEEP", DEFAULT_KEEP)))
+    except ValueError:
+        return DEFAULT_KEEP
+
+
+def boot_id():
+    """This boot's id from the kernel, or None when unreadable."""
+    path = Path(os.environ.get("JOURNAL_RECEIPT_BOOT_ID_FILE") or BOOT_ID_FILE)
+    try:
+        bid = path.read_text().strip()
+    except OSError:
+        return None
+    return bid or None
+
+
+def list_boots():
+    """[(index, boot id, first, last)] from `journalctl --list-boots`."""
+    rc, out = run_command([JOURNALCTL, "--list-boots", "--no-pager"])
+    if rc != 0:
+        return None, out.strip()
+    boots = []
+    for line in out.splitlines():
+        m = BOOT_LINE_RE.match(line)
+        if m:
+            boots.append((m.group(1), m.group(2).lower(), line.strip()))
+    if not boots:
+        return None, "journalctl --list-boots listed nothing"
+    return boots, ""
+
+
+def boot_tail(index, max_lines):
+    return run_command([JOURNALCTL, "-b", str(index), "-o", "short-iso",
+                        "--no-pager", "-n", str(max_lines)])
+
+
+def slice_argv(priority, max_lines):
+    """The record side's read: warning and above, most recent lines first."""
+    return [JOURNALCTL, "-b", "-p", priority, "-o", "short-iso",
+            "--no-pager", "-n", str(max_lines)]
+
+
+def receipt_path(bid):
+    return receipt_dir() / f"{bid}.log"
+
+
+def prune(dirpath, keep):
+    """Keep the newest `keep` receipts; nothing else on disk is touched."""
+    try:
+        files = sorted(dirpath.glob("*.log"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    removed = []
+    for p in files[keep:]:
+        try:
+            p.unlink()
+            removed.append(p)
+        except OSError:
+            continue
+    return removed
+
+
+def read_receipt(path):
+    """(header line, body lines) or (None, []) when the receipt is absent."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None, []
+    if not lines:
+        return None, []
+    return lines[0], lines[1:]
+
+
+def newest_receipt():
+    dirpath = receipt_dir()
+    try:
+        files = sorted(dirpath.glob("*.log"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    return files[0] if files else None
+
+
+def shutdown_line(lines):
+    for line in lines:
+        for marker in SHUTDOWN_MARKERS:
+            if marker in line:
+                return line.strip()
+    return None
+
+
+def cmd_record(args):
+    bid = boot_id()
+    if not bid:
+        print("journal-receipt: UNMEASURABLE — no boot id readable "
+              f"({os.environ.get('JOURNAL_RECEIPT_BOOT_ID_FILE') or BOOT_ID_FILE})")
+        return 2
+
+    argv = slice_argv(args.priority, args.max_lines)
+    rc, out = run_command(argv)
+    if rc != 0:
+        print("journal-receipt: UNMEASURABLE — journalctl refused the slice read "
+              f"(rc {rc}): {out.strip()[:200]}")
+        return 2
+
+    body = [ln for ln in out.splitlines() if ln.strip()]
+    dirpath = receipt_dir()
+    dirpath.mkdir(parents=True, exist_ok=True)
+    path = receipt_path(bid)
+    header = (f"# journal-receipt boot={bid} priority<={args.priority} "
+              f"max_lines={args.max_lines} "
+              f"recorded_at={datetime.now(timezone.utc).isoformat()}")
+    path.write_text(header + "\n" + "".join(ln + "\n" for ln in body))
+    removed = prune(dirpath, keep_count())
+
+    if args.json:
+        print(json.dumps({"state": "recorded", "boot_id": bid,
+                          "path": str(path), "lines": len(body),
+                          "priority": args.priority, "pruned": len(removed)}))
+    else:
+        print(f"journal-receipt: receipt for boot {bid} — {len(body)} line(s) "
+              f"at priority <= {args.priority} → {path}")
+        if removed:
+            print(f"  pruned {len(removed)} older receipt(s)")
+    return 0
+
+
+def cmd_check(args):
+    boots, err = list_boots()
+    tail_default = args.max_lines or CHECK_TAIL_LINES
+
+    if boots is None:
+        print(f"journal-receipt: UNMEASURABLE — cannot list boots: {err[:200]}")
+        receipt = newest_receipt()
+        if receipt:
+            header, body = read_receipt(receipt)
+            print(f"  newest durable receipt ({receipt}): {header}")
+            for ln in body[-10:]:
+                print(f"    {ln}")
+        return 2
+
+    if args.boot_id:
+        wanted = args.boot_id.lower()
+        match = [b for b in boots if b[1] == wanted]
+        if not match:
+            print(f"journal-receipt: UNMEASURABLE — boot {args.boot_id} is not "
+                  "in the journal")
+            return 2
+        idx, bid = match[0][0], match[0][1]
+    elif args.boot is not None:
+        match = [b for b in boots if b[0] == str(args.boot)]
+        if not match:
+            print(f"journal-receipt: UNMEASURABLE — boot index {args.boot} is "
+                  "not in the journal")
+            return 2
+        idx, bid = match[0][0], match[0][1]
+    else:
+        prev = [b for b in boots if b[0] == "-1"]
+        if not prev:
+            reason = ("the journal lists no previous boot (only the running "
+                      "one), so there is no shutdown record to read; the "
+                      "durable receipt, when one exists, is the only record "
+                      "of how the last boot ended")
+            receipt = newest_receipt()
+            rpath, rlines = None, []
+            if receipt:
+                _rh, rbody = read_receipt(receipt)
+                rpath, rlines = str(receipt), rbody[-10:]
+            if args.json:
+                print(json.dumps({"state": "unmeasurable", "boot_id": None,
+                                  "boot_index": None, "reason": reason,
+                                  "receipt_path": rpath,
+                                  "receipt_lines": rlines}))
+                return 2
+            print(f"journal-receipt: UNMEASURABLE — {reason}")
+            if rpath:
+                print(f"  newest durable receipt ({rpath}): {_rh}")
+                for ln in rlines:
+                    print(f"    {ln}")
+            else:
+                print("  durable receipt: none — the slice is disabled or has "
+                      "never run")
+            return 2
+        idx, bid = prev[0][0], prev[0][1]
+
+    rc, out = boot_tail(idx, tail_default)
+    if rc != 0:
+        print(f"journal-receipt: UNMEASURABLE — journalctl could not read boot "
+              f"{idx} (rc {rc}): {out.strip()[:200]}")
+        return 2
+
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    marker = shutdown_line(lines)
+
+    path = receipt_path(bid)
+    rheader, rbody = read_receipt(path)
+    rpath = str(path) if rheader else None
+
+    if marker:
+        if args.json:
+            print(json.dumps({"state": "shutdown_recorded", "boot_id": bid,
+                              "boot_index": idx, "shutdown_line": marker,
+                              "receipt_path": rpath,
+                              "receipt_lines": len(rbody)}))
+        else:
+            print(f"journal-receipt: SHUTDOWN RECORDED — boot {bid} (index {idx}) "
+                  f"recorded a shutdown sequence: {marker}")
+        return 0
+
+    if args.json:
+        print(json.dumps({"state": "no_shutdown_record", "boot_id": bid,
+                          "boot_index": idx, "shutdown_line": None,
+                          "journal_tail": lines[-10:], "receipt_path": rpath,
+                          "receipt_lines": rbody[-10:] if rheader else []}))
+        return 1
+
+    print(f"journal-receipt: NO SHUTDOWN RECORD — boot {bid} (index {idx}) has "
+          "no shutdown sequence in the journal: the box stopped without one "
+          "(forced or unclean end), or the journal was lost before it was read")
+    if lines:
+        print("  last journal entries for that boot:")
+        for ln in lines[-10:]:
+            print(f"    {ln}")
+    else:
+        print("  the journal holds no entries at all for that boot")
+    if rheader:
+        print(f"  durable receipt ({path}): {rheader}")
+        if rbody:
+            for ln in rbody[-10:]:
+                print(f"    {ln}")
+        else:
+            print("    (empty — the slice ran but captured nothing)")
+    else:
+        print(f"  durable receipt: none for boot {bid} — the slice is disabled "
+              "or never ran for it")
+    return 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="journal-receipt",
+        description="Durable receipt of the minutes before a boot.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    rec = sub.add_parser("record", help="write the current boot's slice")
+    rec.add_argument("--priority", default=DEFAULT_PRIORITY,
+                     help="journalctl priority ceiling (default warning)")
+    rec.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
+    rec.add_argument("--json", action="store_true")
+
+    chk = sub.add_parser("check", help="read back the previous boot")
+    chk.add_argument("--boot", type=int, default=None,
+                     help="boot index to read (default -1, the previous boot)")
+    chk.add_argument("--boot-id", default=None, help="boot id to read")
+    chk.add_argument("--max-lines", type=int, default=None)
+    chk.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.command == "record":
+        return cmd_record(args)
+    return cmd_check(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

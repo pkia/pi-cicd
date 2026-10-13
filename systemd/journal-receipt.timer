@@ -1,0 +1,15 @@
+[Unit]
+Description=journal-receipt every 5 minutes, and once shortly after boot
+
+[Timer]
+# 45 s after boot is deliberate: the receipt for the *previous* boot is still
+# readable then (and on this box it is the only copy that survives at all),
+# and the new boot's slice starts being written immediately.
+OnBootSec=45s
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=20s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
