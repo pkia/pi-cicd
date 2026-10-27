@@ -11,13 +11,41 @@ Exits non-zero on any failure. No secrets are printed. Companion to
 docs/notifications.md.
 """
 import json
+import socket
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://100.122.94.33:6839"
-DNS = "http://"
+
+def _base_from_conf(default="http://100.122.94.33:6839"):
+    """NTFY_URL from /etc/ntfy-notify.conf — the same source every other
+    tool here uses, so this check follows the host instead of a hardcoded
+    address (the backbone IP changed when the lab moved to a new Pi)."""
+    try:
+        with open("/etc/ntfy-notify.conf", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("NTFY_URL="):
+                    return line.split("=", 1)[1].strip() or default
+    except OSError:
+        pass
+    return default
+
+
+BASE = _base_from_conf()
+
+
+def _magicdns_name():
+    """The tailnet DNS name of this host, from the backbone IP itself."""
+    ip = BASE.split("//", 1)[-1].split(":", 1)[0]
+    try:
+        name = socket.gethostbyaddr(ip)[0].rstrip(".")
+        return f"http://{name}:{BASE.rsplit(':', 1)[1]}"
+    except (OSError, IndexError):
+        return None
+
+
+DNS = _magicdns_name()
 
 
 def req(method, path, token=None, data=None):
@@ -64,11 +92,15 @@ def main():
     checks = []
     code, body = req("GET", "/v1/health")
     checks.append(("health (tailnet IP)", code == 200 and "healthy" in body))
-    try:
-        with urllib.request.urlopen(DNS + "/v1/health", timeout=8) as resp:
-            checks.append(("health (MagicDNS name)", resp.getcode() == 200))
-    except urllib.error.URLError:
-        checks.append(("health (MagicDNS name)", False))
+    if DNS:
+        try:
+            with urllib.request.urlopen(DNS + "/v1/health", timeout=8) as resp:
+                checks.append((f"health (MagicDNS name: {DNS.split('//')[-1].split(':')[0]})",
+                               resp.getcode() == 200))
+        except (urllib.error.URLError, OSError):
+            checks.append(("health (MagicDNS name)", False))
+    else:
+        checks.append(("health (MagicDNS name: unresolved)", False))
 
     code, _ = req("POST", "/", data={"topic": "radar", "message": "anon"})
     checks.append(("anonymous publish denied (403)", code == 403))
