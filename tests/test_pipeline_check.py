@@ -73,3 +73,27 @@ def test_no_heal_means_no_status_file():
         r = _run_check(home)
         assert r.stdout == ""  # silent when green AND nothing fixed
         assert not (Path(home) / ".local/state/pipeline-check/status.json").exists()
+
+
+def test_deny_listed_dir_is_not_alerted():
+    """A directory the owner deny-lists is a policy choice, not a pipeline
+    gap: the guard will never adopt it, so the 'should adopt within 10
+    min' alert must not fire for it."""
+    with tempfile.TemporaryDirectory() as home:
+        proj = Path(home) / "denied-proj"
+        proj.mkdir()
+        (proj / "app.py").write_text("print('hi')\n")  # code, unversioned
+        cfg = Path(home) / ".config/project-guard/deny-list"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("# policy\ndenied-proj\n", encoding="utf-8")
+        r = _run_check(home)
+        assert "NOT a git repo" not in r.stdout
+
+
+def test_unlisted_unversioned_dir_still_alerts():
+    with tempfile.TemporaryDirectory() as home:
+        proj = Path(home) / "free-proj"
+        proj.mkdir()
+        (proj / "app.py").write_text("print('hi')\n")  # code, unversioned
+        r = _run_check(home)
+        assert "NOT a git repo" in r.stdout
