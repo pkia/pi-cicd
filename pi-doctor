@@ -55,20 +55,15 @@ import retired_units
 # --------------------------------------------------------------------------
 PROJECTS = [
     # (service, dir, http_url, healthz_url, has_deploy, has_ci)
-    ("cs2-tracker",         "/home/ev/cs2-tracker",         "http://127.0.0.1:8092/", "http://127.0.0.1:8092/healthz", True,  True),
-    ("cs2-dashboard",       "/home/ev/cs2-dashboard",       "http://127.0.0.1:8001/", None,                           True,  True),
-    ("maritime-dashboard",  "/home/ev/maritime-dashboard",  "http://127.0.0.1:8000/", None,                           True,  False),
-    ("kiosk-home",          "/home/ev/kiosk-home",          "http://127.0.0.1:8091/", None,                           True,  True),
-    ("project-hub",         "/home/ev/project-hub",         "http://127.0.0.1:8090/", None,                           True,  True),
-    ("mark-site",           "/home/ev/apps/mark-site",      "http://127.0.0.1:8089/", None,                           True,  False),
-    ("shelfmate",           "/home/ev/apps/shelfmate",      "http://127.0.0.1:8086/", None,                           True,  True),
-    ("book-app",            "/home/ev/book-app",            None,                    None,                           True,  True, "static"),
-    # /stream.mp3 is an endless encoder output: an 8s probe read 8KB then
-    # closed, which used to strand an ffmpeg (and now burns CPU for nothing).
-    ("sat-audio",           "/home/ev/apps/sat-audio",      "http://127.0.0.1:8085/status.json", None,               True,  False),
-    ("online-ships",        "/home/ev/maritime-dashboard",  None,                    None,                           False, False),
-    ("AdGuardHome",         "/home/ev/apps/AdGuardHome",    "http://127.0.0.1:3001/", None,                          False, False),
-    ("ais-catcher",         "/home/ev",                     None,                    None,                           False, False),
+    # Registry ported 2026-10-27 to the rebuilt Raspberry Pi 5 (the old
+    # box's kiosk stack — cs2-*, maritime-dashboard, project-hub,
+    # sat-audio, shelfmate, book-app — does not live here). What runs now:
+    ("cluster-coordinator", "/home/ev/cluster-prototype", None,
+     None, False, True),
+    # HTTP health of the user-unit kiosk dashboard (:8790) and the Hermes
+    # WebUI (:8787) is the service-probe scoreboard's job; the cluster
+    # API answers 401 to anonymous probes by design, so its health here
+    # means "systemd unit active + tree clean + CI green".
 ]
 
 # services that have no systemd unit by design (static hosting etc.)
@@ -381,14 +376,18 @@ def check_system():
         for unit in failed_units(out):
             findings.append(f"sys:failed-unit {unit}")
 
-    # AdGuard DNS actually resolving (raw UDP query, stdlib only)
-    if not _dns_resolves():
-        run(["systemctl", "restart", "AdGuardHome"], 90)
-        time.sleep(5)
-        if _dns_resolves():
-            fixes.append("restarted AdGuardHome (DNS not resolving)")
-        else:
-            findings.append("sys:adguard-dns down even after restart")
+    # AdGuard DNS actually resolving (raw UDP query, stdlib only).
+    # Gated on the unit existing: the query is hardcoded to 127.0.0.1:53,
+    # which is AdGuard's port on hosts that run it — anywhere else this
+    # would restart a nonexistent unit and false-alarm every day.
+    if run(["systemctl", "is-active", "--quiet", "AdGuardHome"])[0] == 0:
+        if not _dns_resolves():
+            run(["systemctl", "restart", "AdGuardHome"], 90)
+            time.sleep(5)
+            if _dns_resolves():
+                fixes.append("restarted AdGuardHome (DNS not resolving)")
+            else:
+                findings.append("sys:adguard-dns down even after restart")
 
     # rpi-connect leak guard
     rc, out = run(["pgrep", "-f", "rpi-connectd", "-o"])
