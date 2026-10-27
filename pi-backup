@@ -38,6 +38,20 @@ Config: /etc/pi-backup.conf (KEY=VALUE, '#' comments), root-readable only:
                       while we backed it up") and a DB copied mid-commit
                       may be torn. The dump is archived under its
                       mirrored path, so restores stay unambiguous.
+    RECEIPTS_DIR      journal-receipt's durable receipts dir, folded into
+                      every archive when it exists (default
+                      /home/ev/.local/state/journal-receipt — absolute
+                      on purpose: the nightly runs as root; empty value
+                      disables). /var/log on this box is a RAM disk, so
+                      the crash receipt is the only copy of the minutes
+                      before an unclean boot — it should live wherever
+                      the nightly archive lives, not only on the same SD
+                      card as the journal it describes. The live file is
+                      rewritten in place every few minutes, so borg is
+                      handed a staged copy (mirrored path, like the DB
+                      dumps) and never the live file; the weekly drill
+                      byte-compares the staged copies like every other
+                      file.
     PRUNE_KEEP_DAILY   default 7
     PRUNE_KEEP_WEEKLY  default 4
     PRUNE_KEEP_MONTHLY default 6
@@ -73,6 +87,13 @@ DEFAULT_CONFIG = "/etc/pi-backup.conf"
 #: Where live-DB snapshots are staged. Overridable with SNAPSHOT_DIR.
 DEFAULT_SNAPSHOT_DIR = "/var/backups/pi-sqlite"
 
+#: journal-receipt's durable receipts, folded into every archive when
+#: present (RECEIPTS_DIR= disables). /var/log on this box is a RAM disk,
+#: so the crash receipt is the only copy of the minutes before an
+#: unclean boot — it should live wherever the nightly archive lives,
+#: not only on the same SD card as the journal it describes.
+DEFAULT_RECEIPTS_DIR = "/home/ev/.local/state/journal-receipt"
+
 #: First bytes of every SQLite database file.
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -107,6 +128,7 @@ def load_config(path):
         "prefix": raw.get("ARCHIVE_PREFIX", "pi").strip() or "pi",
         "snapshot_dir": (raw.get("SNAPSHOT_DIR", DEFAULT_SNAPSHOT_DIR)
                          .strip() or DEFAULT_SNAPSHOT_DIR),
+        "receipts_dir": raw.get("RECEIPTS_DIR", DEFAULT_RECEIPTS_DIR).strip(),
         "drill_max_files": int(raw.get("DRILL_MAX_FILES", 60) or 60),
         "ntfy_url": raw.get("NTFY_URL", "").strip().rstrip("/"),
         "ntfy_token": raw.get("NTFY_TOKEN", "").strip(),
@@ -128,6 +150,9 @@ def validate(cfg):
     snap = cfg.get("snapshot_dir", DEFAULT_SNAPSHOT_DIR)
     if snap and not snap.startswith("/"):
         problems.append(f"SNAPSHOT_DIR not absolute: {snap}")
+    rec = cfg.get("receipts_dir", DEFAULT_RECEIPTS_DIR)
+    if rec and not rec.startswith("/"):
+        problems.append(f"RECEIPTS_DIR not absolute: {rec}")
     return problems
 
 
@@ -243,6 +268,49 @@ def _dump_sqlite(src_path, dest_path):
         src.close()
 
 
+# --------------------------------------------------- crash receipts
+
+def stage_receipts(cfg):
+    """Consistent copies of journal-receipt's receipts, the way
+    snapshot_live_dbs stages live DBs.
+
+    The live receipt is rewritten in place every few minutes (truncate
+    + write), and borg aborts on a file that changes while it reads it
+    — the same trap the DB path avoids with sqlite's backup API. So
+    each `*.log` receipt is copied once into the snapshot dir (mirrored
+    live path, like the dumps) and borg reads only the copy. Every run
+    re-stages from scratch, so receipts that aged out of the live dir
+    (journal-receipt keeps a handful of boots) do not accumulate here.
+
+    Returns the staged paths, in the order borg will be handed them.
+    A receipt that cannot be copied is fatal, like a DB dump that
+    fails: the tool said it folds receipts in, so it proves it or the
+    nightly fails loudly instead of archiving silently without them.
+    """
+    rec_dir = (cfg.get("receipts_dir") or "").strip()
+    if not rec_dir or not Path(rec_dir).is_dir():
+        return []
+    snap_dir = cfg.get("snapshot_dir", DEFAULT_SNAPSHOT_DIR)
+    staged = []
+    for src in sorted(Path(rec_dir).glob("*.log")):
+        dest = snapshot_path(snap_dir, src)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+        except OSError as exc:
+            raise OSError(f"receipt staging of {src} failed: {exc}") from None
+        staged.append(str(dest))
+    mirrored = Path(snap_dir) / str(rec_dir).lstrip("/")
+    keep = set(staged)
+    try:
+        for old in mirrored.glob("*.log"):
+            if str(old) not in keep:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return staged
+
+
 # --------------------------------------------------- snapshot rehearsal
 
 #: Sidecar written next to each dump: what the DB held when it was taken.
@@ -349,12 +417,18 @@ def create_archive(cfg, now):
     Live SQLite DBs are snapshotted first (with their manifests) and the
     live files excluded (see snapshot_live_dbs), so the archive carries a
     transactionally consistent copy instead of borg aborting on a file
-    that changed while it was being read.
+    that changed while it was being read. journal-receipt's crash
+    receipts are staged the same way (see stage_receipts) and folded in:
+    the receipt is the only copy of the minutes before an unclean boot.
     """
     name = archive_name(cfg, now)
     ok, live, snapshots, err = snapshot_live_dbs(cfg)
     if not ok:
         return False, name, {"error": err}
+    try:
+        receipts = stage_receipts(cfg)
+    except OSError as exc:
+        return False, name, {"error": str(exc)}
     manifests = [s + MANIFEST_SUFFIX for s in snapshots
                  if Path(s + MANIFEST_SUFFIX).is_file()]
     argv = ["borg", "create"]
@@ -363,13 +437,16 @@ def create_archive(cfg, now):
     for path in live:
         argv += ["--exclude", f"pp:{path}"]
     argv.append(f"{cfg['repo']}::{name}")
-    argv += cfg["paths"] + snapshots + manifests
+    argv += cfg["paths"] + snapshots + manifests + receipts
     code, _, err = run_cmd(argv, cfg)
     if code != 0:
         return False, name, {"error": err.strip().splitlines()[-1] if err.strip() else "borg create failed"}
     stats = archive_stats(cfg, name)
     stats["snapshots"] = snapshots
     stats["snapshot_manifests"] = manifests
+    stats["receipts"] = {"dir": receipts[0] if receipts else None,
+                         "files": len(receipts),
+                         "staged": receipts}
     return True, name, stats
 
 
@@ -548,6 +625,9 @@ def act_run(cfg, now, dry_run=False):
            f"— archive {name}")
     if stats.get("snapshots"):
         msg += f" ({len(stats['snapshots'])} live DB snapshot(s))"
+    rec = stats.get("receipts") or {}
+    if rec.get("files"):
+        msg += f" (+{rec['files']} crash receipt(s))"
     notify(cfg, "pi-backup ok", msg, dry_run=dry_run)
     print(f"✓ {msg}")
     return 0
