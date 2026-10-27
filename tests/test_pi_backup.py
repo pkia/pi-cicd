@@ -45,6 +45,9 @@ def write_config(tmp_path, repo, paths, extra=""):
         f"REPO={repo}\n"
         f"PASSPHRASE=test-passphrase-123\n"
         f"BACKUP_PATHS={' '.join(paths)}\n"
+        # pinned disabled: on the dev box the real receipts dir exists,
+        # and a test must not fold live host files into its tmp archive
+        f"RECEIPTS_DIR=\n"
         f"{extra}\n")
     return conf
 
@@ -661,3 +664,190 @@ def test_act_run_rehearses_the_good_archive_and_stays_quiet(tmp_path, capsys,
     out = capsys.readouterr().out
     assert "verify: PASS" in out                  # it really did rehearse
     assert [p["title"] for p in posts] == ["pi-backup ok"]
+
+
+# ------------------------------------------------- crash-receipt fold
+
+def make_receipts(tmp_path, boots=1):
+    """Receipts shaped like journal-receipt's: <boot-id>.log, header first."""
+    d = tmp_path / "receipts"
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(boots):
+        (d / f"00000000-0000-0000-0000-{i:012d}.log").write_text(
+            "# journal-receipt boot=fake priority<=warning max_lines=200\n"
+            "2026-10-27T03:14:00+0000 pi kernel: something at warning\n")
+    return d
+
+
+def test_receipts_dir_default_override_and_validation(tmp_path):
+    conf = write_config(tmp_path, tmp_path / "repo", [str(tmp_path)])
+    assert pb.load_config(conf)["receipts_dir"] == ""       # pinned disabled
+    # a config missing the key entirely gets the built-in default
+    assert pb.load_config("/nonexistent")["receipts_dir"] == \
+        pb.DEFAULT_RECEIPTS_DIR
+    assert pb.DEFAULT_RECEIPTS_DIR == \
+        "/home/ev/.local/state/journal-receipt"   # absolute: nightly is root
+    conf2 = write_config(tmp_path, tmp_path / "repo", [str(tmp_path)],
+                         extra="RECEIPTS_DIR=/data/receipts")
+    assert pb.load_config(conf2)["receipts_dir"] == "/data/receipts"
+    assert pb.validate(pb.load_config(conf2)) == []
+    assert "RECEIPTS_DIR not absolute: rel/r" in pb.validate(
+        {**pb.load_config(conf2), "receipts_dir": "rel/r"})
+    assert pb.validate(pb.load_config(conf)) == []          # empty disables
+
+
+def test_create_archive_stages_and_archives_receipts_without_a_db(tmp_path):
+    """Acceptance: a receipt written after a boot lands in the archive —
+    and the whole path involves no database: the sources here hold no
+    SQLite file at all, stats report zero snapshots, and the staged
+    copies (not the live files the 5-minute timer rewrites in place)
+    are what borg archives."""
+    src = tmp_path / "src"
+    (src / "etc").mkdir(parents=True)
+    (src / "etc" / "motd").write_text("no databases anywhere here\n")
+    receipts = make_receipts(tmp_path, boots=2)
+    snaps = tmp_path / "snaps"
+    repo = tmp_path / "repo"
+    conf = write_config(tmp_path, repo, [str(src)],
+                        extra=f"RECEIPTS_DIR={receipts}\n"
+                              f"SNAPSHOT_DIR={snaps}")
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+
+    ok, name, stats = pb.create_archive(cfg, datetime.now())
+    assert ok, stats
+    assert stats["snapshots"] == []               # no DB was touched
+    assert stats["receipts"]["files"] == 2
+    staged = stats["receipts"]["staged"]
+    assert len(staged) == 2
+    for live_receipt, st in zip(sorted(receipts.glob("*.log")), staged):
+        # mirrored live path under the snapshot dir, like the DB dumps
+        assert st == str(snaps / str(live_receipt).lstrip("/"))
+        assert Path(st).read_bytes() == live_receipt.read_bytes()
+
+    listing = borg_listing(repo, name, cfg)
+    for st in staged:
+        assert st.lstrip("/") in listing          # staged copies archived
+    live_prefix = str(receipts).lstrip("/")
+    assert not any(ln.startswith(live_prefix) for ln in listing)
+    # ...so borg never read the live dir it could have caught mid-rewrite
+
+    ex = tmp_path / "ex"
+    ex.mkdir()
+    code, _, err = pb.run_cmd(
+        ["borg", "extract", f"{repo}::{name}"], cfg, cwd=ex)
+    assert code == 0, err
+    for st in staged:
+        restored = ex / st.lstrip("/")
+        assert restored.is_file()
+        assert restored.read_bytes() == Path(st).read_bytes()
+
+
+def test_receipts_absent_or_disabled_changes_nothing(tmp_path):
+    """A box without journal-receipt (or with RECEIPTS_DIR= disabled)
+    archives exactly what it archived before: no staging, no failure,
+    no receipts clause in stats."""
+    src = tmp_path / "src"
+    (src / "etc").mkdir(parents=True)
+    (src / "etc" / "motd").write_text("plain file\n")
+    repo = tmp_path / "repo"
+    make_receipts(tmp_path, boots=1)              # exists, but disabled
+    conf = write_config(tmp_path, repo, [str(src)])
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+    ok, name, stats = pb.create_archive(cfg, datetime.now())
+    assert ok, stats
+    assert stats["receipts"] == {"dir": None, "files": 0, "staged": []}
+
+    ok2, name2, stats2 = pb.create_archive(
+        cfg, datetime.now() + timedelta(seconds=1))
+    assert ok2, stats2
+
+    gone = tmp_path / "nope"                      # configured but absent
+    cfg3 = {**cfg, "receipts_dir": str(gone)}
+    ok3, name3, stats3 = pb.create_archive(
+        cfg3, datetime.now() + timedelta(seconds=2))
+    assert ok3, stats3
+    assert stats3["receipts"] == {"dir": None, "files": 0, "staged": []}
+
+
+def test_stale_staged_receipts_do_not_accumulate(tmp_path):
+    """A receipt that ages out of the live dir (journal-receipt prunes
+    all but a few boots) must not haunt the staging area either."""
+    receipts = make_receipts(tmp_path, boots=2)
+    snaps = tmp_path / "snaps"
+    conf = write_config(tmp_path, tmp_path / "repo", [str(tmp_path)],
+                        extra=f"RECEIPTS_DIR={receipts}\n"
+                              f"SNAPSHOT_DIR={snaps}")
+    cfg = cfg_from(tmp_path, conf)
+    staged = pb.stage_receipts(cfg)
+    assert len(staged) == 2
+
+    receipts_sorted = sorted(receipts.glob("*.log"))
+    receipts_sorted[0].unlink()                   # aged out live
+    staged2 = pb.stage_receipts(cfg)
+    assert len(staged2) == 1
+    mirrored = snaps / str(receipts).lstrip("/")
+    assert [p.name for p in sorted(mirrored.glob("*.log"))] == \
+        [receipts_sorted[1].name]
+
+
+def test_staging_failure_is_fatal_and_named(tmp_path):
+    """The fold is proven or the nightly fails loudly: an unreadable
+    receipt must not quietly produce a receipt-less archive."""
+    receipts = make_receipts(tmp_path, boots=1)
+    (receipts / "locked.log").write_text("# journal-receipt boot=x\n")
+    (receipts / "locked.log").chmod(0o000)
+    conf = write_config(tmp_path, tmp_path / "repo", [str(tmp_path)],
+                        extra=f"RECEIPTS_DIR={receipts}\n"
+                              f"SNAPSHOT_DIR={tmp_path / 'snaps'}")
+    cfg = cfg_from(tmp_path, conf)
+    with pytest.raises(OSError, match="receipt staging of .*locked.log"):
+        pb.stage_receipts(cfg)
+
+
+def test_drill_byte_compares_the_staged_receipts(tmp_path):
+    """The weekly drill's byte-compare now covers the receipts too: the
+    staged copies come back and are compared against the staging area
+    like every other archived file."""
+    src = tmp_path / "src"
+    (src / "etc").mkdir(parents=True)
+    (src / "etc" / "motd").write_text("one plain file\n")
+    receipts = make_receipts(tmp_path, boots=1)
+    conf = write_config(tmp_path, tmp_path / "repo", [str(src)],
+                        extra=f"RECEIPTS_DIR={receipts}\n"
+                              f"SNAPSHOT_DIR={tmp_path / 'snaps'}")
+    cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
+    ok, lines = pb.run_drill(cfg, datetime.now())
+    assert ok, lines
+    joined = "\n".join(lines)
+    assert "byte-compared 2" in joined            # 1 source + 1 receipt
+    assert "PASS" in joined
+
+
+def test_act_run_digest_names_the_crash_receipts(tmp_path, capsys,
+                                                 monkeypatch):
+    """The nightly's own manifest-of-record — the ok digest, printed and
+    published — says the receipts were folded in, so a receipt-less
+    nightly is visible in the notification instead of silent."""
+    src = tmp_path / "src"
+    (src / "etc").mkdir(parents=True)
+    (src / "etc" / "motd").write_text("plain\n")
+    receipts = make_receipts(tmp_path, boots=1)
+    conf = write_config(tmp_path, tmp_path / "repo", [str(src)],
+                        extra=f"RECEIPTS_DIR={receipts}\n"
+                              f"SNAPSHOT_DIR={tmp_path / 'snaps'}\n"
+                              "NTFY_URL=https://ntfy.invalid/backups\n"
+                              "NTFY_TOKEN=tok")
+    cfg = cfg_from(tmp_path, conf)
+    posts = []
+    monkeypatch.setattr(
+        pb, "ntfy_post",
+        lambda url, headers, payload, timeout=15:
+        posts.append(payload) or True)
+    rc = pb.act_run(cfg, datetime.now())
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "+1 crash receipt(s)" in out
+    assert posts and "crash receipt" in posts[0]["message"]
