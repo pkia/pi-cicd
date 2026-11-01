@@ -24,8 +24,14 @@ Artifact kinds and what the plan does with each:
   cron         hermes cron jobs whose Name mentions PROJECT. --apply:
                `hermes cron remove <id>`.
   remote_task  entries the remote registry declares for PROJECT (host +
-               task). REPORTED only — this box cannot see that host, so
-               removal there is a human step.
+               task). REPORTED only — this tool removes nothing off-box.
+               Where an entry carries "query" (an argv list), that argv is
+               run verbatim — no shell, one call per distinct argv — and
+               its output measures the declaration: state "measured" (the
+               host answered and lists the task), "cleared" (the host
+               answered and no longer lists it — the declaration is stale)
+               or "unreachable" (rc != 0 — the declaration stands alone).
+               No "query" → today's plain declaration, state "declared".
 
 A unit file under the project's name whose suffix is not .service/.timer
 (a .socket, a .path, an extensionless file) is an artifact this tool
@@ -49,7 +55,11 @@ Env overrides (each also a flag; the tests use them to stay hermetic):
   DECOMMISSION_SYSTEMD_DIR     default /etc/systemd/system
   DECOMMISSION_USER_UNIT_DIR   default ~/.config/systemd/user
   DECOMMISSION_REMOTES         default /etc/decommission-remotes.json
-                               (JSON: {"<project>": [{"host","task","detail"}]})
+                               (JSON: {"<project>": [{"host", "task",
+                               "detail", "query": [argv], "match": regex}];
+                               "query" is optional, trusted, root-owned
+                               config — a read-only listing command run
+                               verbatim with the tool's own privileges)
   DECOMMISSION_CRON_FILE       a recorded `hermes cron list` to parse
                                instead of running hermes
 
@@ -63,11 +73,16 @@ import os
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 # Unit-file suffixes this tool knows how to remove. Anything else under the
 # project's name is unclassifiable (see the module docstring).
 UNIT_SUFFIXES = (".service", ".timer")
+
+# Bound on one remote query. A host that cannot answer inside this is
+# unreachable as far as this tool is concerned.
+PROBE_TIMEOUT = 20
 
 
 def run_command(argv, timeout=60):
@@ -121,9 +136,12 @@ def name_matches(project, text):
                      text, re.IGNORECASE) is not None
 
 
-def artifact(kind, name, location, detail="", ident=None):
-    return {"kind": kind, "name": name, "location": str(location),
-            "detail": detail, "id": ident}
+def artifact(kind, name, location, detail="", ident=None, state=None):
+    a = {"kind": kind, "name": name, "location": str(location),
+         "detail": detail, "id": ident}
+    if state is not None:
+        a["state"] = state
+    return a
 
 
 def find_artifacts(project, repos_dir, systemd_dir, user_unit_dir,
@@ -164,13 +182,48 @@ def find_artifacts(project, repos_dir, systemd_dir, user_unit_dir,
         if name_matches(project, name):
             found.append(artifact("cron", name, jid, detail=state, ident=jid))
 
-    # remote tasks — a declaration; this box cannot see the remote host.
+    # remote tasks — a declaration; where the entry carries a query, the
+    # query's own output measures whether the task is still registered.
+    # The argv is the registry's own, run verbatim (no shell) with this
+    # tool's privileges; the tool constructs no remote command of its own
+    # and removes nothing off-box — a remote task never appears in
+    # actions_for(), so neither --apply nor --check can act on it.
+    probes = {}
+    for entry in registry or []:
+        q = entry.get("query")
+        if isinstance(q, list) and q:
+            key = tuple(q)
+            if key not in probes:
+                probes[key] = run_command(list(q), timeout=PROBE_TIMEOUT)
     for entry in registry or []:
         host = entry.get("host", "?")
         task = entry.get("task", "?")
+        query = entry.get("query")
+        state, detail = "declared", "remove on the remote host by hand"
+        if isinstance(query, list) and query:
+            rc, out = probes[tuple(query)]
+            if rc == 0:
+                pat = entry.get("match") or task
+                line = next((ln.strip() for ln in out.splitlines()
+                             if re.search(pat, ln)), None)
+                if line:
+                    state = "measured"
+                    detail = (f"still registered on {host} (measured "
+                              f"{date.today():%Y-%m-%d}): {line[:120]}"
+                              " — remove on the remote host by hand")
+                else:
+                    state = "cleared"
+                    detail = (f"host answered; nothing matching is "
+                              f"registered — the declaration is stale "
+                              f"(measured {date.today():%Y-%m-%d})")
+            else:
+                state = "unreachable"
+                detail = (f"unreachable when checked (rc={rc}) — "
+                          "declaration only; remove on the remote host "
+                          "by hand")
         found.append(artifact("remote_task", f"{task} @ {host}",
-                              entry.get("detail", ""),
-                              detail="remove on the remote host by hand"))
+                              entry.get("detail", ""), detail=detail,
+                              state=state))
     return found, bad
 
 

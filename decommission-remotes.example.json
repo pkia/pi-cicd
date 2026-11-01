@@ -1,0 +1,23 @@
+{
+  "_README": [
+    "decommission's remote-task registry (live path: /etc/decommission-remotes.json,",
+    "root-owned, host state that git cannot hold). One key per project; each entry",
+    "declares a scheduled task the project left on a remote host. 'query' is an",
+    "optional READ-ONLY listing command (argv, no shell) run verbatim once per",
+    "distinct argv; its output is matched per entry ('match' regex, default the",
+    "task name) and the verdict joins the artifact: measured / cleared /",
+    "unreachable / declared. decommission removes nothing off-box, ever.",
+    "Hosts and usernames are deliberately placeholders here: this file is public,",
+    "the live /etc copy is where the real host lives (the 2026-10-02 lesson)."
+  ],
+  "example-project": [
+    {
+      "host": "win-vps.example",
+      "task": "Example Boot Task",
+      "detail": "C:\\example\\run.cmd (path removed in the teardown)",
+      "query": ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                "win-vps.example", "schtasks", "/query", "/fo", "LIST"],
+      "match": "Example Boot Task"
+    }
+  ]
+}
