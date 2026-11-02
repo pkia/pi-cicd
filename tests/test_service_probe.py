@@ -56,8 +56,10 @@ class Router:
         self.ntfy_code = ntfy_code
         self.fail_urls = fail_urls
         self.published = []
+        self.seen = []                # every Request, for header assertions
 
     def __call__(self, req, timeout=None):
+        self.seen.append(req)
         url = req.full_url
         for prefix in self.fail_urls:
             if url.startswith(prefix):
@@ -169,6 +171,34 @@ def test_config_skips_bad_entries(tmp_path, capsys):
     assert "bad PROBE_DNS entry" in err
 
 
+def test_config_parses_header_entries(tmp_path):
+    f = tmp_path / "sp.conf"
+    f.write_text(
+        "PROBE_HTTP=cluster=http://127.0.0.1:8800/health,portal=http://127.0.0.1:8090/\n"
+        "PROBE_HTTP_HEADER=cluster=Authorization: Bearer sekrit\n"
+        "PROBE_HTTP_HEADER=cluster=X-Debug: 1\n"
+        "PROBE_HTTP_HEADER=portal=X-Nope: 0\n")
+    cfg = sp.load_config(f)
+    assert cfg["http_headers"]["cluster"] == {"Authorization": "Bearer sekrit",
+                                              "X-Debug": "1"}
+    assert cfg["http_headers"]["portal"] == {"X-Nope": "0"}
+
+
+def test_config_header_malformed_skips_and_never_prints_value(tmp_path, capsys):
+    f = tmp_path / "sp.conf"
+    f.write_text(
+        "PROBE_HTTP=cluster=http://127.0.0.1:8800/health\n"
+        "PROBE_HTTP_HEADER=cluster=Authorization: Bearer sekrit\n"
+        "PROBE_HTTP_HEADER=cluster=BrokenHeader sekrit-value\n"   # no colon -> skip
+        "PROBE_HTTP_HEADER=ghost=X-Orphan: 1\n")                  # no such probe -> drop
+    cfg = sp.load_config(f)
+    assert cfg["http_headers"] == {"cluster": {"Authorization": "Bearer sekrit"}}
+    err = capsys.readouterr().err
+    assert "no PROBE_HTTP entry" in err and "ghost" in err
+    assert "sekrit-value" not in err      # the malformed value stays out of the journal
+    assert "BrokenHeader sekrit-value" not in err
+
+
 # ----------------------------------------------------------------- probes
 
 def test_http_probe_ok(monkeypatch):
@@ -188,6 +218,44 @@ def test_http_probe_error_codes(monkeypatch):
     monkeypatch.setattr(sp.urllib.request, "urlopen", router)
     ok, lat, err = sp.http_probe("http://x/", 5)
     assert not ok and "503" in err
+
+
+def test_http_probe_sends_configured_headers(monkeypatch):
+    router = Router(pages={"http://x/health": '{"healthy": false}'})
+    monkeypatch.setattr(sp.urllib.request, "urlopen", router)
+    ok, lat, err = sp.http_probe("http://x/health", 5,
+                                 headers={"Authorization": "Bearer sekrit"})
+    assert not ok and err == "healthz reports unhealthy"
+    assert router.seen[-1].get_header("Authorization") == "Bearer sekrit"
+
+
+def test_http_probe_without_headers_sends_none(monkeypatch):
+    router = Router(pages={"http://x/": "<html>ok</html>"})
+    monkeypatch.setattr(sp.urllib.request, "urlopen", router)
+    ok, lat, err = sp.http_probe("http://x/", 5)
+    assert ok and err is None
+    assert router.seen[-1].get_header("Authorization") is None
+
+
+def test_run_passes_matching_headers_per_probe(state_file, monkeypatch, tmp_path):
+    cfg = make_cfg(http=(("cluster", "http://127.0.0.1:8800/health"),
+                         ("portal", "http://127.0.0.1:8090/")))
+    cfg["http_headers"] = {"cluster": {"Authorization": "Bearer sekrit"}}
+    pages = {"http://127.0.0.1:8800/health": '{"healthy": true, "workers": []}',
+             "http://127.0.0.1:8090/": "<html>portal</html>"}
+    rc, router = run_sweep(cfg, state_file, monkeypatch, pages=pages)
+    assert rc == 0
+    by_url = {r.full_url: r for r in router.seen}
+    authed = by_url["http://127.0.0.1:8800/health"]
+    plain = by_url["http://127.0.0.1:8090/"]
+    assert authed.get_header("Authorization") == "Bearer sekrit"
+    assert plain.get_header("Authorization") is None
+    st = json.loads(state_file.read_text())
+    assert st["probes"]["http:cluster"]["status"] == "up"
+    # the credential rides the wire only — never state.json or the scoreboard
+    state_text = state_file.read_text()
+    score_text = (state_file.parent / "status.json").read_text()
+    assert "sekrit" not in state_text and "sekrit" not in score_text
 
 
 # ------------------------------------------------------------------- dns

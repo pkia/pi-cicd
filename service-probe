@@ -24,6 +24,13 @@ Probes (config-driven, one per line, commas allowed in a line):
   PROBE_DNS   Name=server[:port]:domain — an A query must come back with
               rcode 0 and at least one answer
 
+Authed endpoints (e.g. cluster-coordinator's bearer-gated API): add
+  PROBE_HTTP_HEADER Name=Header: value
+lines — one per header, repeated Header: value lines accumulate per
+probe name. Header values are sent on the wire and nowhere else: they
+are never printed, never written to state.json or the scoreboard, and a
+malformed line is reported by probe name only.
+
 State: ~/.local/state/service-probe/state.json (per-probe status,
 failure streaks, last change time) alongside status.json (the rendered
 scoreboard source, rewritten atomically every sweep).
@@ -145,10 +152,31 @@ def load_config(path):
     except ValueError:
         timeout = DEFAULT_TIMEOUT
 
+    # Per-probe request headers: PROBE_HTTP_HEADER Name=Header: value.
+    # Values are credentials-adjacent, so a malformed line is reported by
+    # probe name only — the value itself never reaches stderr or state.
+    http_headers: dict[str, dict[str, str]] = {}
+    for entry in split_entries(raw.get("PROBE_HTTP_HEADER", [])):
+        name, _, rest = entry.partition("=")
+        header, _, value = rest.partition(":")
+        name, header, value = name.strip(), header.strip(), value.strip()
+        if not name or not header or not value:
+            print(f"service-probe: bad PROBE_HTTP_HEADER entry for probe "
+                  f"{name or '?'} (want Name=Header: value) — skipped",
+                  file=sys.stderr)
+            continue
+        http_headers.setdefault(name, {})[header] = value
+    http_names = {name for name, _ in http_probes}
+    for name in sorted(set(http_headers) - http_names):
+        print(f"service-probe: PROBE_HTTP_HEADER names probe {name!r} "
+              "which has no PROBE_HTTP entry — dropped", file=sys.stderr)
+        del http_headers[name]
+
     first = lambda key: (raw.get(key, [""])[-1].strip())  # noqa: E731
     return {
         "http": http_probes,
         "dns": dns_probes,
+        "http_headers": http_headers,
         "ntfy_url": first("NTFY_URL").rstrip("/"),
         "ntfy_token": first("NTFY_TOKEN"),
         "topic": first("NTFY_TOPIC") or DEFAULT_TOPIC,
@@ -159,10 +187,12 @@ def load_config(path):
 
 # ---------------------------------------------------------------- probes
 
-def http_probe(url, timeout):
+def http_probe(url, timeout, headers=None):
     """GET -> (ok, latency_ms, error). 2xx/3xx ok; JSON healthy:false is down."""
-    req = urllib.request.Request(url, method="GET",
-                                 headers={"User-Agent": "pi-service-probe"})
+    merged = {"User-Agent": "pi-service-probe"}
+    if headers:
+        merged.update(headers)
+    req = urllib.request.Request(url, method="GET", headers=merged)
     start = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -379,7 +409,8 @@ def run(cfg, state_path, dry_run=False, verbose=False):
     now = datetime.now(timezone.utc)
 
     for name, url in cfg["http"]:
-        ok, latency, error = http_probe(url, cfg["timeout"])
+        ok, latency, error = http_probe(url, cfg["timeout"],
+                                        (cfg.get("http_headers") or {}).get(name))
         if verbose:
             print(f"  http {name}: {'ok' if ok else 'FAIL'}"
                   + (f" {error}" if error else f" {latency} ms"))
