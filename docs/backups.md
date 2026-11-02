@@ -34,9 +34,27 @@ BACKUP_PATHS in the config is the single source of truth; `pi-backup
 list` shows what archives exist, `pi-backup restore ARCHIVE` extracts
 one.
 
-The agent's own state rides along (`~/.hermes`: the state db, auth and
-config files, profiles, cron and skills) — it is host state too, and
-nothing else backs it up.
+The agent's state that rides along today is journal-receipt's crash
+receipts — see *Crash receipts* below. (The pre-rebuild config also
+archived `~/.hermes`; the rebuilt box's `BACKUP_PATHS` does not carry it
+today, and the config is the single source of truth.)
+
+## Crash receipts
+
+`journal-receipt` writes the minutes before a boot to
+`~/.local/state/journal-receipt/<boot-id>.log` — on this box the only
+durable copy of a crash window, because `/var/log` is a RAM disk. Those
+receipts are folded into every archive: `RECEIPTS_DIR` (default
+`/home/ev/.local/state/journal-receipt`, empty value disables) is staged
+into `SNAPSHOT_DIR` mirroring the live path, like the DB dumps, and borg
+is handed the copies — the live receipt is rewritten in place every few
+minutes, and borg aborts on a file that changes while it reads it. The
+receipt then lives wherever the nightly archive lives, so once the repo
+moves to USB (see *Moving to USB storage later*) the receipt survives
+the medium the journal died on, not just a reboot. The weekly drill
+byte-compares the staged copies like every other file, and a receipt
+that cannot be staged fails the run loudly: the fold is proven or the
+nightly says so instead of archiving silently without the receipts.
 
 ## Live databases
 

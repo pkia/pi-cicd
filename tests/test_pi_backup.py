@@ -818,6 +818,7 @@ def test_drill_byte_compares_the_staged_receipts(tmp_path):
                         extra=f"RECEIPTS_DIR={receipts}\n"
                               f"SNAPSHOT_DIR={tmp_path / 'snaps'}")
     cfg = cfg_from(tmp_path, conf)
+    assert pb.init_repo(cfg)[0]
     ok, lines = pb.run_drill(cfg, datetime.now())
     assert ok, lines
     joined = "\n".join(lines)

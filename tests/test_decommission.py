@@ -242,3 +242,173 @@ def test_check_and_apply_are_mutually_exclusive():
     import pytest
     with pytest.raises(SystemExit):
         dc.build_parser().parse_args(["widget", "--check", "--apply"])
+
+
+# --- the registry's read-only query -------------------------------------
+
+QUERY = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+         "vps-1", "schtasks", "/query", "/fo", "LIST"]
+
+SCHTASKS_LISTING = """\
+
+TaskName: \\MT5 Bridge Boot
+Status:     Unknown
+
+TaskName: \\MT5 Terminal
+Status:     Ready
+
+TaskName: \\MT5 Terminal Boot
+Status:     Unknown
+"""
+
+
+def query_dirs(tmp_path, entries, with_unit=False):
+    """Dirs for a project whose only artifact is remote task declaration(s)."""
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    sysd = tmp_path / "systemd"
+    sysd.mkdir()
+    if with_unit:
+        (sysd / "widget.service").write_text("[Unit]\n")
+    user = tmp_path / "user"
+    user.mkdir()
+    cron = tmp_path / "cron.txt"
+    cron.write_text("")
+    remotes = tmp_path / "remotes.json"
+    remotes.write_text(json.dumps({"widget": entries}))
+    return repos, sysd, user, cron, remotes
+
+
+def mt5_entries(**override):
+    entry = {"host": "vps-1", "task": "MT5 Bridge Boot",
+             "detail": r"C:\mt5-bridge\run_bridge.cmd (path removed)",
+             "query": QUERY}
+    no_query = override.pop("_no_query", False)
+    entry.update(override)
+    if no_query:
+        entry.pop("query")
+    return [entry]
+
+
+def test_query_measures_a_task_still_registered(tmp_path, capsys):
+    """Acceptance: with the registry present the tool names the remote task
+    the host still holds — measured from the query's own output — and the
+    verdict never makes --check unclean (a remote task is not removable
+    here)."""
+    dirs = query_dirs(tmp_path, mt5_entries())
+    runner = RecordingRunner(results={tuple(QUERY): (0, SCHTASKS_LISTING)})
+    dc.run_command = runner
+
+    rc = dc.main(argv_for("widget", dirs, extra=["--check"]))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "[remote_task] MT5 Bridge Boot @ vps-1" in out
+    assert "still registered on vps-1" in out
+    assert "TaskName: \\MT5 Bridge Boot" in out      # the measured line quoted
+    assert runner.calls == [list(QUERY)]             # the query, and only it
+
+
+def test_query_json_carries_the_state(tmp_path, capsys):
+    dirs = query_dirs(tmp_path, mt5_entries())
+    dc.run_command = RecordingRunner(results={tuple(QUERY): (0, SCHTASKS_LISTING)})
+
+    rc = dc.main(argv_for("widget", dirs, extra=["--json"]))
+    data = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    remote = [a for a in data["artifacts"] if a["kind"] == "remote_task"]
+    assert len(remote) == 1
+    assert remote[0]["state"] == "measured"
+
+
+def test_one_query_serves_every_entry_sharing_it(tmp_path, capsys):
+    """The three MT5 tasks share one listing command — one call, three verdicts."""
+    entries = [
+        {"host": "vps-1", "task": name, "detail": "orphan", "query": QUERY}
+        for name in ("MT5 Bridge Boot", "MT5 Terminal", "MT5 Terminal Boot")
+    ]
+    dirs = query_dirs(tmp_path, entries)
+    runner = RecordingRunner(results={tuple(QUERY): (0, SCHTASKS_LISTING)})
+    dc.run_command = runner
+
+    rc = dc.main(argv_for("widget", dirs))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "3 artifact(s) found" in out
+    # each verdict prints twice: in the artifact list and again in the
+    # manual-only section render() closes with.
+    assert out.count("still registered on vps-1") == 6
+    assert runner.calls == [list(QUERY)]             # memoised, not thrice
+
+
+def test_query_cleared_marks_the_declaration_stale(tmp_path, capsys):
+    """A host that answers but no longer lists the task retires the
+    declaration — stale, not an orphan."""
+    dirs = query_dirs(tmp_path, mt5_entries())
+    dc.run_command = RecordingRunner(
+        results={tuple(QUERY): (0, "INFO: No tasks are scheduled.")})
+
+    rc = dc.main(argv_for("widget", dirs))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "[remote_task] MT5 Bridge Boot @ vps-1" in out   # reported, not absent
+    assert "declaration is stale" in out
+    assert "still registered" not in out
+
+
+def test_query_failure_reports_unreachable_not_silently_absent(tmp_path, capsys):
+    """An unreachable host leaves the declaration standing, named as such."""
+    dirs = query_dirs(tmp_path, mt5_entries())
+    dc.run_command = RecordingRunner(
+        results={tuple(QUERY): (255, "ssh: connect to host vps-1 port 22: "
+                                     "Connection refused")})
+
+    rc = dc.main(argv_for("widget", dirs))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "[remote_task] MT5 Bridge Boot @ vps-1" in out
+    assert "unreachable when checked (rc=255)" in out
+    assert "declaration only" in out
+
+
+def test_entry_without_query_is_declared_and_touches_nothing(tmp_path, capsys):
+    dirs = query_dirs(tmp_path, mt5_entries(_no_query=True))
+    runner = RecordingRunner()
+    dc.run_command = runner
+
+    rc = dc.main(argv_for("widget", dirs, extra=["--json"]))
+    data = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    remote = [a for a in data["artifacts"] if a["kind"] == "remote_task"]
+    assert remote[0]["state"] == "declared"
+    assert "by hand" in remote[0]["detail"]
+    assert runner.calls == []
+
+
+def test_apply_acts_only_locally_and_only_queries_the_remote(tmp_path, capsys):
+    """No run removes anything remote: with a leftover unit and a measured
+    remote orphan, --apply's every recorded call is either a local action or
+    the verbatim read-only query — nothing else names the remote host."""
+    dirs = query_dirs(tmp_path, mt5_entries(), with_unit=True)
+    sysd = dirs[1]
+    runner = RecordingRunner(results={tuple(QUERY): (0, SCHTASKS_LISTING)})
+    dc.run_command = runner
+
+    rc = dc.main(argv_for("widget", dirs, extra=["--apply"]))
+    capsys.readouterr()
+
+    assert rc == 0
+    remote_calls = [c for c in runner.calls if "vps-1" in " ".join(c)]
+    assert remote_calls == [list(QUERY)]
+    assert not any(c[:2] == ["rm", "-rf"] for c in runner.calls)
+    assert not any("delete" in " ".join(c).lower()
+                   or "unregister" in " ".join(c).lower()
+                   for c in runner.calls)
+    assert ("systemctl", "disable", "--now", "widget.service") in \
+        {tuple(c) for c in runner.calls}
+
