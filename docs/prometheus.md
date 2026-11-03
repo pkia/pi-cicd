@@ -36,6 +36,30 @@ instead: `prom-dash` (step 2, shipped) — zero extra resident daemons.
   `node_systemd_unit_state` exposes every unit's state — ~990 series,
   i.e. per-service health over time, the raw material for the dashboard
   graph the devlogs quote)
+- `cluster` — the coordinator's `GET /metrics` (cluster-prototype,
+  shipped 2026-11-03), `127.0.0.1:8800`: `cluster_queue_depth`,
+  `cluster_units`/`cluster_jobs` by status, per-worker
+  `cluster_worker_last_seen_seconds` and `cluster_worker_healthy`
+  (0/1, the same verdict /health serves). The route is bearer-authed
+  like every coordinator route, so the job reads the token at scrape
+  time from `/etc/cluster-metrics.token` — `credentials_file`, never an
+  inline value, and nothing secret in this repo.
+
+## The cluster job's owner step (why it is guarded)
+
+Prometheus validates referenced credential files when it loads a
+config, so installing the yml before the token file exists would take
+the whole metrics stack down at its next load — not just the new
+target. `install.sh` therefore guards the order: it installs the
+coordinator's own `var/token` to `/etc/cluster-metrics.token`
+(root:prometheus 0640) first, copies the yml second, and skips the copy
+with a loud note if no token exists anywhere. Applied by re-running
+`install.sh` on the box (the same pass that ships every other unit);
+until then the live `/etc` config is untouched and the graphs simply
+do not see the cluster yet. Note the endpoint itself only exists from
+the coordinator's next restart after the 2026-11-03 `GET /metrics`
+ship — until that restart the target scrapes 404 and shows DOWN,
+loudly, which is the truthful state of the world.
 
 `up` returns 1 for both jobs; every unit on the box, including the
 pi-cicd ones (`project-guard`, `service-probe`, `pi-doctor`,

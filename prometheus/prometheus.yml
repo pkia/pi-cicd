@@ -17,3 +17,17 @@ scrape_configs:
   - job_name: ntfy
     static_configs:
       - targets: ["127.0.0.1:9091"]
+  # cluster coordinator (cluster-prototype): queue depth, per-worker
+  # last-seen seconds, unit/job counters in Prometheus text format at
+  # GET /metrics. Bearer-authed like every coordinator route — the token
+  # is read at scrape time from /etc/cluster-metrics.token (never
+  # inline, never in this repo): the coordinator's own var/token copied
+  # root:prometheus 0640. See docs/prometheus.md for the owner's two
+  # commands; until both land the target shows DOWN, loudly.
+  - job_name: cluster
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/cluster-metrics.token
+    static_configs:
+      - targets: ["127.0.0.1:8800"]
