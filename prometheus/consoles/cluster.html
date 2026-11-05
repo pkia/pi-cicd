@@ -1,0 +1,107 @@
+{{/* Cluster coordinator console — pi-cicd, shipped 2026-11-05.
+
+     Rendered by Prometheus from /etc/prometheus/consoles/cluster.html
+     (URL /consoles/cluster.html). Every number is queried at render
+     time from the same exposition /health derives from
+     (cluster-prototype GET /metrics), so the page cannot disagree with
+     /health the way a second collector could. Styled by the package's
+     own console_libraries (prom.lib + menu.lib), like the shipped node
+     examples. A console can only query, never write. */}}
+{{ template "head" . }}
+
+{{ template "prom_right_table_head" }}
+  <tr><th colspan="2">Cluster</th></tr>
+  <tr>
+    <td>Queue depth</td>
+    <td>{{ template "prom_query_drilldown" (args "cluster_queue_depth") }}</td>
+  </tr>
+  <tr>
+    <td>Workers recent</td>
+    <td>{{ template "prom_query_drilldown" (args "cluster_workers_recent") }}</td>
+  </tr>
+  <tr>
+    <td>Stale after</td>
+    <td>{{ template "prom_query_drilldown" (args "cluster_stale_after_seconds" "s" "printf.1f") }}</td>
+  </tr>
+{{ template "prom_right_table_tail" }}
+
+{{ template "prom_content_head" . }}
+  <h1>Cluster coordinator</h1>
+  <p>Queue depth, unit/job counts and per-worker freshness from the
+  coordinator's <code>GET /metrics</code> (127.0.0.1:8800, bearer token
+  read from /etc/cluster-metrics.token). The healthy verdicts here
+  mirror the coordinator's own /health.</p>
+
+  {{ if query "cluster_queue_depth" }}
+  <p class="lead">Queue depth
+    <strong>{{ with query "cluster_queue_depth" }}{{ . | first | value }}{{ end }}</strong>
+    unit(s) queued or claimed-and-running — unfinished work the cluster
+    owes.</p>
+  <div id="queueGraph"></div>
+  <script>
+  new PromConsole.Graph({
+    node: document.querySelector("#queueGraph"),
+    expr: "cluster_queue_depth",
+    renderer: 'line',
+    yAxisFormatter: PromConsole.NumberFormatter.humanize,
+    yHoverFormatter: PromConsole.NumberFormatter.humanize,
+    yTitle: 'units'
+  })
+  </script>
+  {{ else }}
+  <div class="alert alert-warning">
+    <strong>No cluster data yet.</strong> The <code>cluster</code> scrape
+    job polls the coordinator's bearer-authed
+    <code>127.0.0.1:8800/metrics</code>; until the coordinator serves
+    /metrics and its token is installed at /etc/cluster-metrics.token
+    the target is DOWN (docs/prometheus.md has the owner's steps).
+    Nothing is wrong with this page — the store is simply empty.
+  </div>
+  {{ end }}
+
+  <h3>Units by status</h3>
+  <table class="table table-striped table-condensed">
+    <tr><th>status</th><th>units</th></tr>
+    {{ range query "cluster_units" | sortByLabel "status" }}
+    <tr><td>{{ .Labels.status }}</td><td>{{ .Value }}</td></tr>
+    {{ else }}
+    <tr><td colspan="2">no units scraped yet</td></tr>
+    {{ end }}
+  </table>
+
+  <h3>Jobs by status</h3>
+  <table class="table table-striped table-condensed">
+    <tr><th>status</th><th>jobs</th></tr>
+    {{ range query "cluster_jobs" | sortByLabel "status" }}
+    <tr><td>{{ .Labels.status }}</td><td>{{ .Value }}</td></tr>
+    {{ else }}
+    <tr><td colspan="2">no jobs scraped yet</td></tr>
+    {{ end }}
+  </table>
+
+  <h3>Workers</h3>
+  {{ if query "cluster_worker_healthy == 0" }}
+  <div class="alert alert-warning">
+    <strong>Silent workers</strong> (no heartbeat inside the stale
+    threshold):
+    {{ range query "cluster_worker_healthy == 0" }}<span class="label label-danger">{{ .Labels.worker }}</span>
+    last seen {{ with query (printf "cluster_worker_last_seen_seconds{worker='%s'}" .Labels.worker) }}{{ . | first | value | printf "%.0f" }}{{ end }}s ago
+    {{ end }}
+  </div>
+  {{ end }}
+  <table class="table table-striped table-condensed">
+    <tr><th>worker</th><th>last seen (s)</th><th>healthy</th><th>units done</th></tr>
+    {{ range query "cluster_worker_last_seen_seconds" | sortByLabel "worker" }}
+    <tr>
+      <td>{{ .Labels.worker }}</td>
+      <td>{{ .Value | printf "%.0f" }}</td>
+      <td>{{ with query (printf "cluster_worker_healthy{worker='%s'}" .Labels.worker) }}{{ if gt (. | first | value) 0.0 }}yes{{ else }}<strong>NO</strong>{{ end }}{{ else }}?{{ end }}</td>
+      <td>{{ with query (printf "cluster_worker_units_done_total{worker='%s'}" .Labels.worker) }}{{ . | first | value }}{{ else }}0{{ end }}</td>
+    </tr>
+    {{ else }}
+    <tr><td colspan="4">no workers have been scraped yet</td></tr>
+    {{ end }}
+  </table>
+{{ template "prom_content_tail" . }}
+
+{{ template "tail" }}

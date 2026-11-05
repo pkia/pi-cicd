@@ -100,10 +100,31 @@ if command -v prometheus >/dev/null 2>&1; then
         /etc/systemd/system/prometheus.service.d/bind-local.conf
     sudo cp "$REPO_DIR/prometheus/node-exporter-bind-local.conf" \
         /etc/systemd/system/prometheus-node-exporter.service.d/bind-local.conf
+    # Console page for the cluster numbers (2026-11-05): /consoles/cluster.html,
+    # served from /etc/prometheus/consoles with the console flags from
+    # consoles.conf. The page builds on the package's own example libraries
+    # (prom.lib, menu.lib — shipped unused until now). A reload cannot pick
+    # up new flags, so the unit is try-restarted below (loopback-only,
+    # sub-second gap) as part of this owner-run pass.
+    sudo install -m 0644 "$REPO_DIR/prometheus/consoles/cluster.html" \
+        /etc/prometheus/consoles/cluster.html
+    if [ -d /usr/share/doc/prometheus/examples/console_libraries ]; then
+        sudo install -m 0644 \
+            /usr/share/doc/prometheus/examples/console_libraries/prom.lib \
+            /usr/share/doc/prometheus/examples/console_libraries/menu.lib \
+            /etc/prometheus/console_libraries/
+    else
+        echo "NOTE: prometheus example console libraries not found -" \
+             "/consoles/cluster.html will fail to render until prom.lib and" \
+             "menu.lib are installed to /etc/prometheus/console_libraries/"
+    fi
+    sudo install -m 0644 "$REPO_DIR/prometheus/prometheus-consoles.conf" \
+        /etc/systemd/system/prometheus.service.d/consoles.conf
     sudo systemctl daemon-reload
     sudo systemctl enable --quiet --now prometheus prometheus-node-exporter
+    sudo systemctl try-restart prometheus 2>/dev/null || true
     sudo systemctl reload prometheus 2>/dev/null || true
-    echo "prometheus + node_exporter enabled (loopback-bound)"
+    echo "prometheus + node_exporter enabled (loopback-bound, /consoles/cluster.html)"
 else
     echo "note: prometheus not installed - run: sudo apt install prometheus prometheus-node-exporter"
 fi

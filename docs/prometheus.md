@@ -130,3 +130,47 @@ scrape target down. State + rendered summary in
 `~/.local/state/metric-alert/`. systemd timer every 5 min, offset 4 min
 from service-probe so the two sweeps never stack — probe answers "is it
 up", metric-alert answers "is it healthy".
+
+## Step 4 — shipped 2026-11-05: the cluster console page (`/consoles/cluster.html`)
+
+Grafana stayed false (no such Debian package), but Prometheus serves
+its own console templates, and the package ships example skeletons
+nobody used — `/etc/prometheus/consoles/` and
+`/etc/prometheus/console_libraries/` (empty by default, examples under
+`/usr/share/doc/prometheus/examples/`). The cluster numbers get one of
+those pages: `prometheus/consoles/cluster.html` in this repo,
+installed to `/etc/prometheus/consoles/cluster.html`.
+
+- **Served by the running Prometheus.** `prometheus-consoles.conf` (a
+  systemd drop-in, installed next to `bind-local.conf`) adds
+  `--web.console.templates=/etc/prometheus/consoles
+  --web.console.libraries=/etc/prometheus/console_libraries` to the
+  daemon's flags; the page is then at
+  `http://127.0.0.1:9090/consoles/cluster.html`, loopback-only like
+  the rest of this stack. A drop-in's ExecStart replaces rather than
+  merges, so the file repeats the loopback flags from bind-local.conf
+  — `tests/test_prometheus_console.py` pins that union so the repeat
+  cannot silently drop a flag.
+- **Libraries.** The page uses the package's own `prom.lib`/`menu.lib`
+  templates (the standard console look, same as the shipped node
+  examples). install.sh copies them from the examples directory into
+  `/etc/prometheus/console_libraries/` and says so loudly if they are
+  missing.
+- **What it shows.** Queue depth (number + time-series graph), unit and
+  job counts by status, and per-worker last-seen / healthy /
+  units-done — all queried at render time from the same exposition
+  /health derives from, so the page cannot disagree with /health. A
+  worker past the stale threshold renders the unhealthy verdict in a
+  warning banner above the table, not just a 0 in a cell.
+- **Empty store.** Before the first successful cluster scrape the page
+  renders its named empty state — a warning box naming the two owner
+  steps (the coordinator serving `/metrics`, the token at
+  `/etc/cluster-metrics.token`) — and does not error; the tables print
+  their own no-data rows. The drills run the real prometheus binary
+  against a canned `/metrics` stand-in for exactly these two cases:
+  `test_console_renders_real_numbers_from_a_running_scrape` and
+  `test_empty_store_renders_its_empty_state_without_erroring`.
+- **install.sh try-restarts prometheus** after installing the drop-in:
+  a config reload cannot pick up new flags. Loopback-only daemon,
+  sub-second gap; the restart is part of the owner's install.sh pass,
+  not a scheduled-unit change.
