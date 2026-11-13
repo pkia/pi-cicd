@@ -37,13 +37,14 @@ ln -sf "$REPO_DIR/ram-mode" "$BIN_DIR/ram-mode"
 ln -sf "$REPO_DIR/decommission" "$BIN_DIR/decommission"
 ln -sf "$REPO_DIR/staleness" "$BIN_DIR/staleness"
 ln -sf "$REPO_DIR/journal-receipt" "$BIN_DIR/journal-receipt"
+ln -sf "$REPO_DIR/feed-fresh" "$BIN_DIR/feed-fresh"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
          "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
          "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
          "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode" \
          "$REPO_DIR/decommission" "$REPO_DIR/staleness" \
-         "$REPO_DIR/journal-receipt"
+         "$REPO_DIR/journal-receipt" "$REPO_DIR/feed-fresh"
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
@@ -238,6 +239,18 @@ sudo cp "$REPO_DIR/systemd/journal-receipt.service" \
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now journal-receipt.timer
 echo "journal-receipt timer installed and active"
+
+# feed-fresh: the devlog's heartbeat, measured from outside. One GET of the
+# published feed an hour, one line, one exit code — 1 when the newest post is
+# older than 36 h (the devlog fires daily at 01:00, so that is at least one
+# missed fire). Stateless on purpose; the failed unit is what pi-doctor's
+# sys:failed-unit finding names in the daily audit, and the journal keeps the
+# line. No config file: the URL and the limit are the defaults the unit pins.
+sudo cp "$REPO_DIR/systemd/feed-fresh.service" \
+        "$REPO_DIR/systemd/feed-fresh.timer" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet --now feed-fresh.timer
+echo "feed-fresh timer installed and active"
 
 echo
 echo "done. try:  new-project my-app --port 8100"

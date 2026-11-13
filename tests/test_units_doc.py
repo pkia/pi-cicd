@@ -31,6 +31,7 @@ EXPECTED_UNITS = {
     "chaos-drill",
     "ram-mode",
     "mission-control",
+    "feed-fresh",
 }
 
 REQUIRED_COLUMNS = {"Unit", "Kind", "Schedule", "Config", "State", "Topic", "Verify"}
@@ -42,6 +43,7 @@ EXPECTED_LAYERS = {
     "pipeline-check",
     "pi-doctor",
     "loop-heartbeat",
+    "feed-fresh",
     "Notifications",
     "Backup",
     "Release watching",

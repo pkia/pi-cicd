@@ -1,0 +1,18 @@
+[Unit]
+Description=Devlog feed freshness tripwire - fail when the published feed goes quiet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+# Absolute path, not %h: a system unit resolves %h from the manager, not User=
+# (the trap cs2-train's units hit on 2026-09-26). The tool links into
+# ~/.local/bin via install.sh, which is how every other tool here is called.
+Environment=PATH=/home/ev/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ev/.local/bin/feed-fresh --url https://pkia.github.io/feed.xml --max-hours 36
+# A stale feed is a *finding*: the unit is allowed to fail and stay failed
+# (pi-doctor's sys:failed-unit line names it in the daily audit). No restart
+# loop on a network hiccup - the next hourly fire is one minute of check.
+Restart=no
+TimeoutStartSec=90

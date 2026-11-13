@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the devlog feed's freshness every hour
+
+[Timer]
+# The devlog posts daily at 01:00; a 36-hour limit with an hourly check
+# means a missed fire is named within ~1 h of the limit, not when a human
+# counts the days. One HTTP GET an hour is nothing.
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

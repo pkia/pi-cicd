@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""feed-fresh — the devlog's heartbeat, measured from outside.
+
+Every job in this loop reads what the daily devlog leaves behind: the
+board, the site, the git history. If the devlog's cron dies, nothing on
+this box notices — a missing post surfaces only when a human counts the
+days. This tool is the tripwire: it fetches the published feed, reads the
+newest item's date, and exits nonzero when that item is older than a
+limit (36 hours by default: the devlog posts daily at 01:00, so a 36-hour
+gap means at least one fire was missed).
+
+It is a **gate, not a daemon**: one fetch, one line, one exit code.
+
+    feed-fresh [--url URL | --file PATH] [--max-hours H]
+               [--now ISO8601] [--json] [-v]
+
+Exit codes (the contract a caller branches on):
+    0  fresh       — one OK line naming the newest item's age
+    1  STALE       — the newest item is older than the limit; the line
+                     names the hours since the last post and the limit
+    2  unmeasurable — the feed could not be fetched, parsed, or carried
+                     no dated item; the reason is named
+
+**Stateless by design.** It writes nothing anywhere: no state file, no
+cache, no dedupe record — the only trace a run leaves is its own log
+line. That is deliberate: a tripwire with state can be silenced by a
+stale state file, and this check's whole job is to be believable when
+nobody is watching. The consequence (also deliberate): the timer's unit
+fails on every run while the feed stays stale, which is exactly the
+signal pi-doctor's `sys:failed-unit` finding picks up in its daily audit.
+
+Parsing: RSS 2.0 `channel/item/pubDate` (this site's feed shape), with
+Atom `entry/published`/`entry/updated` accepted as a fallback so the
+tool is not married to one generator. Dates are RFC 822 / ISO 8601 —
+anything an aware datetime cannot be built from is a named parse fault,
+not a guess: a feed whose dates we cannot read is unmeasurable, never
+"fresh".
+
+The feed's own `lastBuildDate` is NOT the measurement — a generator can
+rebuild the feed without a new post, which is the failure this check
+exists to catch.
+"""
+from __future__ import annotations
+
+import argparse
+import email.utils
+import json
+import sys
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+DEFAULT_URL = "https://pkia.github.io/feed.xml"
+DEFAULT_MAX_HOURS = 36.0
+FETCH_TIMEOUT = 20
+USER_AGENT = "pi-cicd feed-fresh/1 (+https://github.com/pkia/pi-cicd)"
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+# ---------------------------------------------------------------- sources
+
+def load_feed(url=None, path=None):
+    """Return the feed's text. Exactly one source must be given."""
+    if path is not None:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    req = urllib.request.Request(url or DEFAULT_URL, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+# ------------------------------------------------------------------ dates
+
+def parse_date(text):
+    """RFC 822 (RSS pubDate) or ISO 8601 -> aware datetime, or None.
+
+    Naive values are read as UTC: every generator this tool has met emits
+    an offset, and assuming UTC for the ones that do not beats refusing a
+    feed over a formatting habit.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def newest_item_date(xml_text):
+    """Return (datetime, title) for the newest dated item, or raise ValueError.
+
+    Raises ValueError with a human-readable reason when the document does
+    not parse as XML or carries no dated item — the caller turns that into
+    the unmeasurable exit, never into a pass.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f"feed is not parseable XML ({exc})") from exc
+
+    dated = []
+    for item in root.iter("item"):
+        raw = item.findtext("pubDate") or item.findtext("date")
+        dt = parse_date(raw)
+        if dt is not None:
+            dated.append((dt, (item.findtext("title") or "").strip()))
+    if not dated:
+        for entry in root.iter(f"{ATOM}entry"):
+            raw = entry.findtext(f"{ATOM}published") or entry.findtext(f"{ATOM}updated")
+            dt = parse_date(raw)
+            if dt is not None:
+                dated.append((dt, (entry.findtext(f"{ATOM}title") or "").strip()))
+    if not dated:
+        raise ValueError("feed carries no dated item (no RSS pubDate, no Atom published/updated)")
+    return max(dated, key=lambda pair: pair[0])
+
+
+# ------------------------------------------------------------------ check
+
+def check(xml_text, now, max_hours):
+    """Measure one feed. Returns a result dict; never raises on bad input."""
+    result = {"state": "error", "reason": None, "newest": None, "title": None,
+              "age_hours": None, "max_hours": max_hours}
+    try:
+        newest, title = newest_item_date(xml_text)
+    except ValueError as exc:
+        result["reason"] = str(exc)
+        return result
+    age_hours = (now - newest).total_seconds() / 3600.0
+    if age_hours < 0:
+        # A clock ahead of the feed's own clock is not a stale feed; it is
+        # also not proof of freshness, so it is reported as 0 h and named.
+        result["reason"] = "newest item is dated in the future"
+        age_hours = 0.0
+    result.update(state="stale" if age_hours > max_hours else "fresh",
+                  newest=newest, title=title, age_hours=age_hours)
+    return result
+
+
+def format_line(result):
+    if result["state"] == "error":
+        return f"feed-fresh: UNMEASURABLE — {result['reason']}"
+    when = result["newest"].isoformat()
+    age = result["age_hours"]
+    if result["state"] == "fresh":
+        return (f"feed-fresh: OK — newest post {when}, {age:.1f} h old "
+                f"(limit {result['max_hours']:g} h)")
+    return (f"feed-fresh: STALE — newest post {when}, {age:.1f} h old, "
+            f"limit {result['max_hours']:g} h: the devlog has not posted for "
+            f"{age:.1f} h")
+
+
+def parse_now(value):
+    if not value:
+        return datetime.now(timezone.utc)
+    dt = parse_date(value)
+    if dt is None:
+        raise argparse.ArgumentTypeError(f"not a date: {value!r}")
+    return dt
+
+
+def json_safe(result):
+    out = dict(result)
+    if out["newest"] is not None:
+        out["newest"] = out["newest"].isoformat()
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="feed-fresh",
+        description="Fail when the published feed's newest item is too old.",
+    )
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--url", default=None, help=f"feed URL (default {DEFAULT_URL})")
+    src.add_argument("--file", default=None, help="read the feed from a local file")
+    ap.add_argument("--max-hours", type=float, default=DEFAULT_MAX_HOURS,
+                    help=f"staleness limit in hours (default {DEFAULT_MAX_HOURS:g})")
+    ap.add_argument("--now", default=None,
+                    help="evaluate as of this time (RFC 822 or ISO 8601); default: now")
+    ap.add_argument("--json", action="store_true", help="machine-readable result on stdout")
+    ap.add_argument("-v", "--verbose", action="store_true", help="print the source used")
+    args = ap.parse_args(argv)
+
+    now = parse_now(args.now)
+    try:
+        text = load_feed(args.url, args.file)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        reason = getattr(exc, "reason", exc)
+        result = {"state": "error", "reason": f"could not read feed: {reason}",
+                  "newest": None, "title": None, "age_hours": None,
+                  "max_hours": args.max_hours}
+    else:
+        result = check(text, now, args.max_hours)
+
+    if args.verbose:
+        source = args.file or args.url or DEFAULT_URL
+        print(f"feed-fresh: source {source}; evaluated at {now.isoformat()}", file=sys.stderr)
+    line = format_line(result)
+    if args.json:
+        # Machine output stays parseable: the JSON owns stdout, and a fault
+        # line rides stderr beside it (the 2026-10-12 lesson: --json that
+        # also prints the human line is not machine output).
+        print(json.dumps(json_safe(result), sort_keys=True))
+        if result["state"] != "fresh":
+            print(line, file=sys.stderr)
+    elif result["state"] == "fresh":
+        print(line)
+    else:
+        # Faults on stderr, the OK line on stdout — the repo's convention
+        # (staleness, pi-doctor): a caller can branch on the stream too.
+        print(line, file=sys.stderr)
+    return {"fresh": 0, "stale": 1, "error": 2}[result["state"]]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
