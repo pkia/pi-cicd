@@ -101,7 +101,8 @@ def test_service_probe_nags_a_probe_row_for_a_retired_unit(
         tmp_path, monkeypatch, capsys):
     """A retired unit still in PROBE_HTTP is named at once, not in 1000 sweeps."""
     sp = _service_probe()
-    monkeypatch.setattr(sp, "http_probe", lambda url, timeout: (True, 1, None))
+    monkeypatch.setattr(sp, "http_probe",
+                        lambda url, timeout, headers=None: (True, 1, None))
     cfg = tmp_path / "service-probe.conf"
     cfg.write_text("PROBE_HTTP=cs2-dash=http://127.0.0.1:9/healthz\n",
                    encoding="utf-8")

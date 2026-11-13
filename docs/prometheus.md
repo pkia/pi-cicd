@@ -36,6 +36,30 @@ instead: `prom-dash` (step 2, shipped) — zero extra resident daemons.
   `node_systemd_unit_state` exposes every unit's state — ~990 series,
   i.e. per-service health over time, the raw material for the dashboard
   graph the devlogs quote)
+- `cluster` — the coordinator's `GET /metrics` (cluster-prototype,
+  shipped 2026-11-03), `127.0.0.1:8800`: `cluster_queue_depth`,
+  `cluster_units`/`cluster_jobs` by status, per-worker
+  `cluster_worker_last_seen_seconds` and `cluster_worker_healthy`
+  (0/1, the same verdict /health serves). The route is bearer-authed
+  like every coordinator route, so the job reads the token at scrape
+  time from `/etc/cluster-metrics.token` — `credentials_file`, never an
+  inline value, and nothing secret in this repo.
+
+## The cluster job's owner step (why it is guarded)
+
+Prometheus validates referenced credential files when it loads a
+config, so installing the yml before the token file exists would take
+the whole metrics stack down at its next load — not just the new
+target. `install.sh` therefore guards the order: it installs the
+coordinator's own `var/token` to `/etc/cluster-metrics.token`
+(root:prometheus 0640) first, copies the yml second, and skips the copy
+with a loud note if no token exists anywhere. Applied by re-running
+`install.sh` on the box (the same pass that ships every other unit);
+until then the live `/etc` config is untouched and the graphs simply
+do not see the cluster yet. Note the endpoint itself only exists from
+the coordinator's next restart after the 2026-11-03 `GET /metrics`
+ship — until that restart the target scrapes 404 and shows DOWN,
+loudly, which is the truthful state of the world.
 
 `up` returns 1 for both jobs; every unit on the box, including the
 pi-cicd ones (`project-guard`, `service-probe`, `pi-doctor`,
@@ -106,3 +130,47 @@ scrape target down. State + rendered summary in
 `~/.local/state/metric-alert/`. systemd timer every 5 min, offset 4 min
 from service-probe so the two sweeps never stack — probe answers "is it
 up", metric-alert answers "is it healthy".
+
+## Step 4 — shipped 2026-11-05: the cluster console page (`/consoles/cluster.html`)
+
+Grafana stayed false (no such Debian package), but Prometheus serves
+its own console templates, and the package ships example skeletons
+nobody used — `/etc/prometheus/consoles/` and
+`/etc/prometheus/console_libraries/` (empty by default, examples under
+`/usr/share/doc/prometheus/examples/`). The cluster numbers get one of
+those pages: `prometheus/consoles/cluster.html` in this repo,
+installed to `/etc/prometheus/consoles/cluster.html`.
+
+- **Served by the running Prometheus.** `prometheus-consoles.conf` (a
+  systemd drop-in, installed next to `bind-local.conf`) adds
+  `--web.console.templates=/etc/prometheus/consoles
+  --web.console.libraries=/etc/prometheus/console_libraries` to the
+  daemon's flags; the page is then at
+  `http://127.0.0.1:9090/consoles/cluster.html`, loopback-only like
+  the rest of this stack. A drop-in's ExecStart replaces rather than
+  merges, so the file repeats the loopback flags from bind-local.conf
+  — `tests/test_prometheus_console.py` pins that union so the repeat
+  cannot silently drop a flag.
+- **Libraries.** The page uses the package's own `prom.lib`/`menu.lib`
+  templates (the standard console look, same as the shipped node
+  examples). install.sh copies them from the examples directory into
+  `/etc/prometheus/console_libraries/` and says so loudly if they are
+  missing.
+- **What it shows.** Queue depth (number + time-series graph), unit and
+  job counts by status, and per-worker last-seen / healthy /
+  units-done — all queried at render time from the same exposition
+  /health derives from, so the page cannot disagree with /health. A
+  worker past the stale threshold renders the unhealthy verdict in a
+  warning banner above the table, not just a 0 in a cell.
+- **Empty store.** Before the first successful cluster scrape the page
+  renders its named empty state — a warning box naming the two owner
+  steps (the coordinator serving `/metrics`, the token at
+  `/etc/cluster-metrics.token`) — and does not error; the tables print
+  their own no-data rows. The drills run the real prometheus binary
+  against a canned `/metrics` stand-in for exactly these two cases:
+  `test_console_renders_real_numbers_from_a_running_scrape` and
+  `test_empty_store_renders_its_empty_state_without_erroring`.
+- **install.sh try-restarts prometheus** after installing the drop-in:
+  a config reload cannot pick up new flags. Loopback-only daemon,
+  sub-second gap; the restart is part of the owner's install.sh pass,
+  not a scheduled-unit change.

@@ -69,18 +69,62 @@ echo "project-guard timer installed and active"
 # packages, loopback-bound, minimal scrape config. Requires the packages:
 #   sudo apt install prometheus prometheus-node-exporter
 # Grafana dashboard + alerting are step 2 (docs/prometheus.md).
+#
+# The `cluster` scrape job (2026-11-03) polls the coordinator's
+# bearer-authed GET /metrics with the token read at scrape time from
+# /etc/cluster-metrics.token. Prometheus validates referenced credential
+# files at config load, so that file MUST exist before the yml that
+# names it is copied — otherwise the whole metrics stack refuses its
+# next load. Guarded below: token first (from the coordinator's own
+# var/token, root:prometheus 0640 — never inline, never in a repo),
+# yml second; no token found -> the yml copy is skipped with a loud
+# note and the previously-installed config keeps running.
 if command -v prometheus >/dev/null 2>&1; then
     sudo mkdir -p /etc/prometheus \
         /etc/systemd/system/prometheus.service.d \
         /etc/systemd/system/prometheus-node-exporter.service.d
-    sudo cp "$REPO_DIR/prometheus/prometheus.yml" /etc/prometheus/prometheus.yml
+    if [ -f "$HOME/cluster-prototype/var/token" ]; then
+        sudo install -m 0640 -o root -g prometheus \
+            "$HOME/cluster-prototype/var/token" /etc/cluster-metrics.token
+        echo "cluster scrape token installed (/etc/cluster-metrics.token, root:prometheus 0640)"
+    elif [ ! -f /etc/cluster-metrics.token ]; then
+        echo "NOTE: no coordinator token at ~/cluster-prototype/var/token and" \
+             "/etc/cluster-metrics.token absent — prometheus.yml NOT updated (the" \
+             "cluster job names that file and Prometheus validates it at load)." \
+             "Run the coordinator once, then re-run install.sh."
+    fi
+    if [ -f /etc/cluster-metrics.token ]; then
+        sudo cp "$REPO_DIR/prometheus/prometheus.yml" /etc/prometheus/prometheus.yml
+    fi
     sudo cp "$REPO_DIR/prometheus/prometheus-bind-local.conf" \
         /etc/systemd/system/prometheus.service.d/bind-local.conf
     sudo cp "$REPO_DIR/prometheus/node-exporter-bind-local.conf" \
         /etc/systemd/system/prometheus-node-exporter.service.d/bind-local.conf
+    # Console page for the cluster numbers (2026-11-05): /consoles/cluster.html,
+    # served from /etc/prometheus/consoles with the console flags from
+    # consoles.conf. The page builds on the package's own example libraries
+    # (prom.lib, menu.lib — shipped unused until now). A reload cannot pick
+    # up new flags, so the unit is try-restarted below (loopback-only,
+    # sub-second gap) as part of this owner-run pass.
+    sudo install -m 0644 "$REPO_DIR/prometheus/consoles/cluster.html" \
+        /etc/prometheus/consoles/cluster.html
+    if [ -d /usr/share/doc/prometheus/examples/console_libraries ]; then
+        sudo install -m 0644 \
+            /usr/share/doc/prometheus/examples/console_libraries/prom.lib \
+            /usr/share/doc/prometheus/examples/console_libraries/menu.lib \
+            /etc/prometheus/console_libraries/
+    else
+        echo "NOTE: prometheus example console libraries not found -" \
+             "/consoles/cluster.html will fail to render until prom.lib and" \
+             "menu.lib are installed to /etc/prometheus/console_libraries/"
+    fi
+    sudo install -m 0644 "$REPO_DIR/prometheus/prometheus-consoles.conf" \
+        /etc/systemd/system/prometheus.service.d/consoles.conf
     sudo systemctl daemon-reload
     sudo systemctl enable --quiet --now prometheus prometheus-node-exporter
-    echo "prometheus + node_exporter enabled (loopback-bound)"
+    sudo systemctl try-restart prometheus 2>/dev/null || true
+    sudo systemctl reload prometheus 2>/dev/null || true
+    echo "prometheus + node_exporter enabled (loopback-bound, /consoles/cluster.html)"
 else
     echo "note: prometheus not installed - run: sudo apt install prometheus prometheus-node-exporter"
 fi
