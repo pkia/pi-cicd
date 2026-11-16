@@ -28,6 +28,7 @@ ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
 ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
 ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
 ln -sf "$REPO_DIR/service-probe" "$BIN_DIR/service-probe"
+ln -sf "$REPO_DIR/dns-check"    "$BIN_DIR/dns-check"
 ln -sf "$REPO_DIR/chaos-drill"   "$BIN_DIR/chaos-drill"
 ln -sf "$REPO_DIR/pipeline-check" "$BIN_DIR/pipeline-check"
 ln -sf "$REPO_DIR/pi-doctor"     "$BIN_DIR/pi-doctor"
@@ -41,6 +42,7 @@ ln -sf "$REPO_DIR/feed-fresh" "$BIN_DIR/feed-fresh"
 chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
          "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
          "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
+         "$REPO_DIR/dns-check" \
          "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
          "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode" \
          "$REPO_DIR/decommission" "$REPO_DIR/staleness" \
@@ -251,6 +253,23 @@ sudo cp "$REPO_DIR/systemd/feed-fresh.service" \
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now feed-fresh.timer
 echo "feed-fresh timer installed and active"
+
+# ntfy boot ordering: /etc/ntfy/server.yml binds a fixed Tailscale address
+# (listen-http: 100.x.y.z:6839). On a reboot ntfy can start before tailscale0
+# carries that address, fail to bind, and exhaust the default 5-restart limit —
+# the service then stays dead while everything else comes up (2026-11-16).
+# Conditioned on ntfy being installed and bound to a tailnet address, so a LAN-
+# or 0.0.0.0-bound host does not get a pointless dependency on tailscaled.
+if [ -f /etc/ntfy/server.yml ] && grep -qE '^listen-http: *100\.' /etc/ntfy/server.yml; then
+    sudo mkdir -p /etc/systemd/system/ntfy.service.d
+    sudo install -m 0644 "$REPO_DIR/systemd/ntfy.service.d/10-tailscale-bind.conf" \
+        /etc/systemd/system/ntfy.service.d/10-tailscale-bind.conf
+    sudo systemctl daemon-reload
+    sudo systemctl restart ntfy
+    echo "ntfy started after tailscaled (tailnet bind drop-in installed)"
+else
+    echo "note: ntfy not installed or not bound to a tailnet address - drop-in skipped"
+fi
 
 echo
 echo "done. try:  new-project my-app --port 8100"
