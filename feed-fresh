@@ -207,10 +207,15 @@ def main(argv=None):
     if args.verbose:
         source = args.file or args.url or DEFAULT_URL
         print(f"feed-fresh: source {source}; evaluated at {now.isoformat()}", file=sys.stderr)
-    if args.json:
-        print(json.dumps(json_safe(result), sort_keys=True))
     line = format_line(result)
-    if result["state"] == "fresh":
+    if args.json:
+        # Machine output stays parseable: the JSON owns stdout, and a fault
+        # line rides stderr beside it (the 2026-10-12 lesson: --json that
+        # also prints the human line is not machine output).
+        print(json.dumps(json_safe(result), sort_keys=True))
+        if result["state"] != "fresh":
+            print(line, file=sys.stderr)
+    elif result["state"] == "fresh":
         print(line)
     else:
         # Faults on stderr, the OK line on stdout — the repo's convention

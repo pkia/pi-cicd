@@ -1,0 +1,94 @@
+#!/bin/sh
+# dns-check — read-only verdict: is it the IP path or name resolution?
+#
+# Born from the 2026-11-16 outage: the wired profile was manual IPv4 with an
+# empty ipv4.dns, so NetworkManager wrote a nameserver-less /etc/resolv.conf.
+# Raw IPs still answered, every hostname failed, and Hermes could not reach
+# any model provider. Nothing here changes state: it reports, and it prints
+# the recovery commands for a human to run deliberately.
+#
+# Exit: 0 healthy | 1 name resolution broken | 2 IP egress broken | 3 both
+#
+# Env overrides exist for testing: DNS_CHECK_URL (raw-IP endpoint),
+# DNS_CHECK_HOST (name that must resolve), DNS_CHECK_TIMEOUT.
+
+set -u
+
+PROBE_URL="${DNS_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
+PROBE_HOST="${DNS_CHECK_HOST:-api.deepseek.com}"
+TIMEOUT="${DNS_CHECK_TIMEOUT:-6}"
+
+ip_ok=0
+curl -s -o /dev/null --max-time "$TIMEOUT" "$PROBE_URL" 2>/dev/null && ip_ok=1
+
+dns_ok=0
+getent hosts "$PROBE_HOST" >/dev/null 2>&1 && dns_ok=1
+
+active_conn() {
+    nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null |
+        awk -F: '$2 == "eth0" { print $1; exit }'
+}
+
+conn_dns() {
+    [ -n "${1:-}" ] || { echo "(no active eth0 profile)"; return; }
+    nmcli -t -f ipv4.method,ipv4.dns,ipv4.ignore-auto-dns \
+        connection show "$1" 2>/dev/null | sed 's/^/    /'
+}
+
+printf 'dns-check  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ "$ip_ok" = 1 ]; then
+    printf '  IP egress   (%s, DNS not used) : OK\n' "$PROBE_URL"
+else
+    printf '  IP egress   (%s, DNS not used) : FAIL\n' "$PROBE_URL"
+fi
+if [ "$dns_ok" = 1 ]; then
+    printf '  resolution  (%s) : OK\n' "$PROBE_HOST"
+else
+    printf '  resolution  (%s) : FAIL\n' "$PROBE_HOST"
+fi
+
+CONN="$(active_conn)"
+
+if [ "$ip_ok" = 1 ] && [ "$dns_ok" = 1 ]; then
+    echo "  VERDICT: healthy — IP path and name resolution both work."
+    exit 0
+fi
+
+if [ "$ip_ok" = 1 ]; then
+    echo
+    echo "  VERDICT: DNS CONFIG BROKEN — packets leave the box, names do not resolve."
+    echo "  That combination is a resolver problem, not a connectivity problem."
+    echo
+    echo "  /etc/resolv.conf:"
+    sed 's/^/    /' /etc/resolv.conf 2>/dev/null || echo "    (missing)"
+    echo "  NetworkManager profile \"${CONN}\":"
+    conn_dns "$CONN"
+    echo
+    echo "  Safe recovery (dns-check has changed nothing; run these by hand):"
+    echo "    sudo nmcli connection modify \"${CONN}\" ipv4.dns \"1.1.1.1 8.8.8.8\" ipv4.ignore-auto-dns yes"
+    echo "    sudo nmcli connection up \"${CONN}\""
+    echo "    dns-check    # confirm"
+    echo
+    echo "  Before anything heavier: a dropped tunnel is NOT this failure. If the"
+    echo "  Surfshark kill switch were down, the IP egress line above would FAIL too."
+    echo "  Do not restart NetworkManager, wg-quick@wgsurf0 or tailscaled to 'fix'"
+    echo "  this — check the profile's ipv4.dns first."
+    exit 1
+fi
+
+if [ "$dns_ok" = 1 ]; then
+    echo
+    echo "  VERDICT: odd — names resolve but the raw-IP probe failed."
+    echo "  Check the probe endpoint ($PROBE_URL) and its firewall/tunnel path."
+    exit 2
+fi
+
+echo
+echo "  VERDICT: NO EGRESS — both the IP path and name resolution failed."
+echo "  Likely the tunnel or the link, not DNS. Check, in order:"
+echo "    systemctl status wg-quick@wgsurf0 vpn-guard.timer"
+echo "    cat /run/vpn-guard/status.json"
+echo "    ip -4 addr show eth0 ; ip route"
+echo "  (The Surfshark kill switch blacks out IPv4/IPv6 egress while the tunnel"
+echo "  is down, so a dead tunnel looks exactly like this.)"
+exit 3

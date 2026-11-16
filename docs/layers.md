@@ -83,6 +83,18 @@ when green. Config `/etc/loop-heartbeat.conf` keeps the alert target
 and second channel (WhatsApp + ntfy `loop-heartbeat` topic) out of the
 public repo. Poll-based by design: it watches the loop from outside.
 
+## feed-fresh — the devlog's heartbeat tripwire
+
+Hourly. Fetches the published feed, reads the newest **item's** date
+(never `lastBuildDate` — a generator can rebuild a feed around a dead
+post), and fails the unit when the newest post is older than 36 hours,
+printing one line that names the hours since the last post and the
+limit. Stateless on purpose: no state file, no cache, no dedupe, so the
+verdict cannot be silenced by a stale file — the only trace is the line,
+and the failed unit is the signal pi-doctor's `sys:failed-unit` finding
+picks up in the daily audit. Exit 0 fresh, 1 stale, 2 unmeasurable (a
+feed nobody can fetch or date is never a pass).
+
 ## Notifications & mute — ntfy backbone and the kill switch
 
 Self-hosted ntfy (Debian package) on the tailnet only (`:6839`),
