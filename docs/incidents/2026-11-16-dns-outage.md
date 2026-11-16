@@ -144,9 +144,9 @@ plus the recovery commands, exit 0/1/2/3 for healthy / DNS / egress / both.
 ## Outstanding risks
 
 - Reboot survival verified by inspection only (see above).
-- `dns-check` is written and committed to the repo but **not installed** as
-  `~/.local/bin/dns-check`, and has not been executed yet — installing needs an
-  approval that was not given at the time of writing.
+- `dns-check` is installed as `~/.local/bin/dns-check` (symlink into this
+  repo, 2026-11-16 00:54) and was executed by the daily audit at 06:31 with
+  exit 0 — IP egress OK, `api.deepseek.com` resolving, verdict healthy.
 - service-probe's alert text names the failing probe (`dns-system DOWN: Name or
   service not known`) but does not include the recovery commands; the runbook
   lives here and in the `homelab-vpn` skill.
