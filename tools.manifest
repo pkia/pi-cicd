@@ -1,0 +1,30 @@
+# The repo-root tools, one name per line — the single list.
+#
+# Two readers consume this file and neither keeps its own copy:
+#   * install.sh links each name into ~/.local/bin (and chmods it), and
+#     refuses to run when the repo root holds a tool this file omits;
+#   * tests/test_install_sh.py parses it and drives
+#     `install.sh --check-tools`, so the test and the installer share one
+#     rule instead of restating it.
+#
+# A new tool at the repo root means one added line here. Anything with an
+# extension (foo.py, install.sh) is a library or a script rather than a PATH
+# tool, and this file is data — so the scan needs no hand-kept ignore list.
+chaos-drill
+decommission
+dns-check
+feed-fresh
+journal-receipt
+loop-heartbeat
+metric-alert
+new-project
+ntfy-notify
+pi-backup
+pi-doctor
+pipeline-check
+prom-dash
+project-guard
+ram-mode
+release-watch
+service-probe
+staleness

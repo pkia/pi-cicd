@@ -156,5 +156,8 @@ docs/layers.md          one page per operational layer (deploy, guard, heartbeat
 docs/units.md           the unit index — every running unit → config, timer, topic
 docs/notifications.md   ntfy backbone: topics, auth model, runbook
 install.sh              fresh-host installer
+tools.manifest          the one list of repo-root tools: install.sh links from it
+                       (and refuses a root tool it omits), tests/test_install_sh.py
+                       parses it — add a tool here once, not in two lists
 tests/                  loop-heartbeat + ntfy-notify suites (fixtures from real hermes output)
 ```

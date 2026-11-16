@@ -13,6 +13,86 @@ BIN_DIR="$HOME/.local/bin"
     echo "expected the clone to be named pi-cicd (got $REPO_DIR)"; exit 1
 }
 
+# The one list of repo-root tools (2026-11-16). install.sh and
+# tests/test_install_sh.py used to carry a copy each, so a new tool had to
+# be added twice and the two could drift — the 11-16 red build was that
+# shape. Both readers read tools.manifest now; the installer links from it
+# AND refuses a tool at the repo root that it omits, and the test drives
+# this script's own --check-tools instead of restating the rule.
+MANIFEST="$REPO_DIR/tools.manifest"
+
+manifest_tools() {
+    # Non-comment, non-blank lines of the manifest, in file order.
+    awk '{ sub(/#.*/, ""); gsub(/[ \t\r]/, ""); if ($0 != "") print }' "$1"
+}
+
+repo_root_tools() {
+    # Every tool script at the repo root: extensionless regular files that
+    # start with a shebang. Libraries carry .py, install.sh carries .sh,
+    # and the manifest is data — so the rule needs no hand-kept ignore
+    # list to rot alongside the tools themselves.
+    local f
+    for f in "$REPO_DIR"/*; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in *.*) continue ;; esac
+        [ "$(head -c 2 "$f" 2>/dev/null)" = "#!" ] || continue
+        basename "$f"
+    done
+}
+
+check_tools() {
+    # Validates the manifest against the tree; changes nothing.
+    [ -f "$MANIFEST" ] || {
+        echo "install.sh: $MANIFEST is missing — it is the one list of" \
+             "repo-root tools that both this installer and the test read." >&2
+        exit 1
+    }
+    local listed=0 name missing="" unlisted="" dupes=""
+    local -A seen=()
+    while IFS= read -r name; do
+        listed=$((listed + 1))
+        case "$name" in
+            */*|.|..|*[[:space:]]*)
+                echo "install.sh: tools.manifest entry '$name' is not a bare name" >&2
+                exit 1 ;;
+        esac
+        [ -z "${seen[$name]:-}" ] || dupes+=" $name"
+        seen[$name]=1
+        [ -f "$REPO_DIR/$name" ] || missing+=" $name"
+    done < <(manifest_tools "$MANIFEST")
+
+    [ "$listed" -gt 0 ] || {
+        echo "install.sh: tools.manifest lists no tools" >&2; exit 1
+    }
+    for name in $(repo_root_tools); do
+        [ -n "${seen[$name]:-}" ] || unlisted+=" $name"
+    done
+
+    [ -z "$dupes" ] || {
+        echo "install.sh: tools.manifest lists duplicate(s):$dupes" >&2; exit 1
+    }
+    [ -z "$missing" ] || {
+        echo "install.sh: tools.manifest lists tool(s) that are not at the" \
+             "repo root:$missing — the manifest and the tree disagree." >&2
+        exit 1
+    }
+    [ -z "$unlisted" ] || {
+        echo "install.sh: repo root holds tool(s) missing from" \
+             "tools.manifest:$unlisted — add each name so this installer" \
+             "links it." >&2
+        exit 1
+    }
+    echo "tools.manifest: $listed tool(s) listed, every one present;" \
+         "no tool at the repo root is unlisted"
+}
+
+case "${1:-}" in
+    --check-tools) check_tools; exit 0 ;;
+    "") ;;
+    *) echo "usage: install.sh [--check-tools]" >&2; exit 2 ;;
+esac
+
+check_tools
 mkdir -p "$BIN_DIR"
 
 # State dir for the global alert-storm kill switch (ntfy_lib mute file).
@@ -21,32 +101,17 @@ mkdir -p "$BIN_DIR"
 # owner out of ntfy-notify --mute (see docs/notifications.md).
 mkdir -p "$HOME/.local/state/ntfy"
 
-ln -sf "$REPO_DIR/project-guard" "$BIN_DIR/project-guard"
-ln -sf "$REPO_DIR/new-project"   "$BIN_DIR/new-project"
-ln -sf "$REPO_DIR/loop-heartbeat" "$BIN_DIR/loop-heartbeat"
-ln -sf "$REPO_DIR/ntfy-notify"   "$BIN_DIR/ntfy-notify"
-ln -sf "$REPO_DIR/pi-backup"     "$BIN_DIR/pi-backup"
-ln -sf "$REPO_DIR/release-watch" "$BIN_DIR/release-watch"
-ln -sf "$REPO_DIR/service-probe" "$BIN_DIR/service-probe"
-ln -sf "$REPO_DIR/dns-check"    "$BIN_DIR/dns-check"
-ln -sf "$REPO_DIR/chaos-drill"   "$BIN_DIR/chaos-drill"
-ln -sf "$REPO_DIR/pipeline-check" "$BIN_DIR/pipeline-check"
-ln -sf "$REPO_DIR/pi-doctor"     "$BIN_DIR/pi-doctor"
-ln -sf "$REPO_DIR/prom-dash"     "$BIN_DIR/prom-dash"
-ln -sf "$REPO_DIR/metric-alert" "$BIN_DIR/metric-alert"
-ln -sf "$REPO_DIR/ram-mode" "$BIN_DIR/ram-mode"
-ln -sf "$REPO_DIR/decommission" "$BIN_DIR/decommission"
-ln -sf "$REPO_DIR/staleness" "$BIN_DIR/staleness"
-ln -sf "$REPO_DIR/journal-receipt" "$BIN_DIR/journal-receipt"
-ln -sf "$REPO_DIR/feed-fresh" "$BIN_DIR/feed-fresh"
-chmod +x "$REPO_DIR/loop-heartbeat" "$REPO_DIR/ntfy-notify" \
-         "$REPO_DIR/pi-backup" "$REPO_DIR/release-watch" \
-         "$REPO_DIR/service-probe" "$REPO_DIR/chaos-drill" \
-         "$REPO_DIR/dns-check" \
-         "$REPO_DIR/pipeline-check" "$REPO_DIR/pi-doctor" \
-         "$REPO_DIR/prom-dash" "$REPO_DIR/metric-alert" "$REPO_DIR/ram-mode" \
-         "$REPO_DIR/decommission" "$REPO_DIR/staleness" \
-         "$REPO_DIR/journal-receipt" "$REPO_DIR/feed-fresh"
+ln_manifest_tools() {
+    # Link and mark executable each tool the manifest lists. One loop, not
+    # eighteen hand-written lines: the manifest is the list.
+    local tool
+    while IFS= read -r tool; do
+        ln -sf "$REPO_DIR/$tool" "$BIN_DIR/$tool"
+        chmod +x "$REPO_DIR/$tool"
+    done < <(manifest_tools "$MANIFEST")
+}
+
+ln_manifest_tools
 echo "tools linked into $BIN_DIR"
 
 # Sane git defaults (no identity guessing: gh first, then a local fallback).
