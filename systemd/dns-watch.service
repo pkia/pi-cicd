@@ -1,0 +1,19 @@
+[Unit]
+Description=DNS watch - run dns-check hourly, page once per verdict change
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+# Absolute path, not %h: a system unit resolves %h from the manager, not User=
+# (the 2026-09-26 cs2-train trap). The tool links into ~/.local/bin via
+# install.sh, and its own config is /etc/dns-watch.conf (owner-provided; the
+# unit runs fine without one, it just cannot page).
+Environment=PATH=/home/ev/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ev/.local/bin/dns-watch
+# A broken verdict is a finding, not a crash: the unit fails on every hourly
+# fire while resolution stays broken (pi-doctor's sys:failed-unit line names
+# it), and paging is the fast path through ntfy. No restart loop.
+Restart=no
+TimeoutStartSec=180

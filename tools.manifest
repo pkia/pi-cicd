@@ -13,6 +13,7 @@
 chaos-drill
 decommission
 dns-check
+dns-watch
 feed-fresh
 journal-receipt
 loop-heartbeat

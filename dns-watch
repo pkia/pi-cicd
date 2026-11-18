@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""dns-watch — run [dns-check] on a timer, page once per state change.
+
+The 2026-11-16 outage (docs/incidents/2026-11-16-dns-outage.md) was
+discovered the hard way: Hermes failed to reach a model provider at
+23:35, and nothing on the box had said "name resolution is dead".
+`dns-check` was written that morning — a read-only verdict that names
+which half broke and prints the recovery commands — but a tool nobody
+runs at 23:35 is a tool that reports nothing.
+
+dns-watch is the timer half. Each run:
+
+  1. executes `dns-check` once, verbatim, at its own exit code;
+  2. compares that verdict with the last one recorded in its state file;
+  3. publishes **one** ntfy message when the verdict *changes*, and
+     nothing at all while it stays the same.
+
+Edge-triggered on purpose (the 2026-08-30 lesson, metric-alert's shape):
+a standing failure must not page every hour, and a recovery must not be
+silent.
+
+    dns-watch [--config FILE] [--state FILE] [--dry-run] [-v]
+
+Verdict states: healthy | dns | egress | both | probe-error, mapped from
+dns-check's own codes (0/1/2/3; anything else — a missing interpreter, a
+kill — is probe-error, named with the rc).
+
+Exit codes: dns-check's verdict passes through unchanged (0 healthy,
+1 resolution broken, 2 egress broken, 3 both), and **4** when the probe
+itself could not run. A failing unit is a record the daily pi-doctor
+audit names; the page is the fast path.
+
+The probe stays read-only. dns-watch's only write is its own state file
+(`~/.local/state/dns-watch/state.json`, temp file + atomic rename), and
+`--dry-run` does not even do that. Config (optional, /etc/dns-watch.conf,
+KEY=VALUE, `#` comments, last occurrence wins — parse_env_lists' rule):
+
+    NTFY_URL=http://127.0.0.1:6839
+    NTFY_TOKEN=replace-me
+    NTFY_TOPIC=services          # existing provisioned topic
+    STATE=~/.local/state/dns-watch/state.json
+    DNS_CHECK=dns-check          # absolute path if not on PATH
+    TIMEOUT_SECS=15              # publish timeout, never unbounded
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+import ntfy_lib
+
+DEFAULT_CONFIG = "/etc/dns-watch.conf"
+DEFAULT_STATE = "~/.local/state/dns-watch/state.json"
+DEFAULT_TOPIC = "services"
+DEFAULT_DNS_CHECK = "dns-check"
+DEFAULT_TIMEOUT = 15
+PROBE_TIMEOUT = 120
+
+#: dns-check's own contract, spelled where the mapping is built.
+VERDICTS = {
+    0: ("healthy", "healthy", "IP path and name resolution both work"),
+    1: ("dns", "DNS BROKEN", "packets leave the box, names do not resolve"),
+    2: ("egress", "EGRESS BROKEN", "names resolve but the raw-IP probe fails"),
+    3: ("both", "NO EGRESS", "both the IP path and name resolution failed"),
+}
+PROBE_ERROR = "probe-error"
+BROKEN = ("dns", "egress", "both", PROBE_ERROR)
+
+TAGS = {
+    "healthy": ["white_check_mark"],
+    "dns": ["warning", "dns"],
+    "egress": ["warning", "dns"],
+    "both": ["rotating_light", "dns"],
+    PROBE_ERROR: ["warning", "dns"],
+}
+
+
+# ---------------------------------------------------------------- config
+
+def parse_env_lists(path):
+    """KEY=VALUE lines -> dict, last occurrence wins (repeated keys accumulate
+    in the source order, and the board's own configs rely on the LAST one)."""
+    cfg = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cfg[key.strip()] = value.strip()
+    return cfg
+
+
+def load_config(path):
+    cfg = parse_env_lists(path)
+    return {
+        "ntfy_url": cfg.get("NTFY_URL", ""),
+        "ntfy_token": cfg.get("NTFY_TOKEN", ""),
+        "topic": cfg.get("NTFY_TOPIC") or DEFAULT_TOPIC,
+        "state": os.path.expanduser(cfg.get("STATE") or DEFAULT_STATE),
+        "dns_check": cfg.get("DNS_CHECK") or DEFAULT_DNS_CHECK,
+        "timeout": _number(cfg.get("TIMEOUT_SECS"), DEFAULT_TIMEOUT),
+    }
+
+
+def _number(value, default):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+# ----------------------------------------------------------------- state
+
+def load_state(path):
+    """state.json -> dict; missing or corrupt -> {} with a named warning."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return {}
+    except ValueError:
+        print(f"dns-watch: state file corrupt at {path} — starting fresh",
+              file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(path, state):
+    """Atomic write (temp file + rename). False on failure, named."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except OSError as exc:
+        print(f"dns-watch: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+
+
+# ----------------------------------------------------------------- probe
+
+def run_probe(command):
+    """Execute dns-check once. -> (rc or None, combined output)."""
+    try:
+        proc = subprocess.run([command], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True,
+                              timeout=PROBE_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"dns-check could not run: {exc}"
+    return proc.returncode, proc.stdout or ""
+
+
+def classify(rc, output):
+    """dns-check's exit code -> (state, title, detail)."""
+    if rc in VERDICTS:
+        return VERDICTS[rc]
+    return (PROBE_ERROR, "DNS WATCH PROBE ERROR",
+            f"dns-check exited {rc!r} — the probe itself did not complete")
+
+
+# ------------------------------------------------------------------ page
+
+def headline(output):
+    """The probe's own VERDICT line, when it printed one."""
+    for line in reversed(output.splitlines()):
+        if "VERDICT" in line:
+            return line.strip()
+    return ""
+
+
+def build_message(state, title, detail, output, since=None):
+    lines = [f"dns-watch: {title} — {detail}."]
+    if state == "healthy":
+        if since:
+            lines.append(f"Back to healthy after {since}.")
+        lines.append("The next page comes only on the next change.")
+    else:
+        lines.append("Paged once per state change — this will stay quiet "
+                     "until it changes.")
+    verdict = headline(output)
+    if verdict:
+        lines.append("")
+        lines.append(verdict)
+    body = output.strip()
+    if body and body != verdict:
+        lines.append("")
+        lines.append(body)
+    message = "\n".join(lines)
+    return message if len(message) <= 3500 else message[:3490] + "\n…"
+
+
+def page(cfg, title, message, tags, dry_run=False):
+    """Publish via the shared ntfy_lib; True on any 2xx or muted."""
+    if dry_run:
+        print(f"dns-watch: would page {title!r} (dry run)")
+        return True
+    if not (cfg["ntfy_url"] and cfg["ntfy_token"]):
+        print("dns-watch: NTFY_URL/NTFY_TOKEN not configured — "
+              "page not published", file=sys.stderr)
+        return False
+    payload = {"topic": cfg["topic"], "message": message, "title": title,
+               "tags": tags}
+    return ntfy_lib.publish(
+        cfg["ntfy_url"], {"Authorization": f"Bearer {cfg['ntfy_token']}"},
+        payload, timeout=cfg["timeout"], _urlopen=urllib.request.urlopen)
+
+
+# ------------------------------------------------------------------ core
+
+def decide(prev, state):
+    """Should this run page? (bool, reason)
+
+    First run: silent when healthy (a fresh install on a working box is
+    not news), a page when broken (the operator just learned). After
+    that: page exactly on a change, recovery included.
+    """
+    if prev is None:
+        return state != "healthy", "first run"
+    if prev == state:
+        return False, "unchanged"
+    return True, f"{prev} -> {state}"
+
+
+def run(cfg, state_path, dry_run=False, verbose=False, now=None):
+    now = now or datetime.now(timezone.utc)
+    rc, output = run_probe(cfg["dns_check"])
+    state_word, title, detail = classify(rc, output)
+
+    if verbose:
+        print(f"dns-watch: probe {cfg['dns_check']} rc={rc} -> {state_word}",
+              file=sys.stderr)
+    if output.strip():
+        print(output.rstrip())
+
+    previous = load_state(state_path)
+    prev = previous.get("status")
+    should, reason = decide(prev, state_word)
+
+    since = previous.get("since")
+    if prev != state_word:
+        since = now.isoformat(timespec="seconds")
+
+    record = {
+        "status": state_word,
+        "exit_code": rc,
+        "since": since,
+        "checked_at": now.isoformat(timespec="seconds"),
+        "pages": int(previous.get("pages", 0)) + (1 if should else 0),
+    }
+
+    if should:
+        message = build_message(state_word, title, detail, output,
+                                since=previous.get("since"))
+        published = page(cfg, f"dns-watch: {title}", message,
+                         TAGS.get(state_word, []), dry_run=dry_run)
+        if not published:
+            # The page is the fast path; the verdict still stands, and the
+            # journal keeps the line. Do not pretend the page landed.
+            record["pages"] -= 1
+    if verbose:
+        print(f"dns-watch: {state_word} ({reason}) — "
+              f"{'paged' if should else 'silent'}", file=sys.stderr)
+
+    if not dry_run and not save_state(state_path, record):
+        print("dns-watch: verdict not recorded — the next run will page "
+              "again", file=sys.stderr)
+
+    print(f"dns-watch: {state_word.upper()} — {detail}"
+          f"{' (paged)' if should else ''}")
+    return 4 if rc is None else rc
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="dns-watch",
+        description="Run dns-check hourly; page once per verdict change.",
+    )
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"KEY=VALUE config (default {DEFAULT_CONFIG})")
+    ap.add_argument("--state", default=None,
+                    help=f"state file (default {DEFAULT_STATE})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the decision; publish and write nothing")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="report the probe's rc and the paging decision")
+    args = ap.parse_args(argv)
+
+    cfg = load_config(args.config)
+    state_path = os.path.expanduser(args.state) if args.state else cfg["state"]
+    return run(cfg, state_path, dry_run=args.dry_run, verbose=args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

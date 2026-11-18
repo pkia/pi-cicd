@@ -1,0 +1,21 @@
+# dns-watch — example config (copy to /etc/dns-watch.conf, mode 600).
+# See the tool's docstring and docs/layers.md ("DNS watching").
+#
+# Without this file dns-watch still runs and still exits with dns-check's
+# verdict — it just cannot page. The unit's failure is what pi-doctor names;
+# the page is the fast path.
+
+# ntfy backbone (publisher user token — never a subscriber token).
+NTFY_URL=http://127.0.0.1:6839
+NTFY_TOKEN=replace-me
+# Existing, already-provisioned topic: no new ACL grant, no ntfy restart.
+NTFY_TOPIC=services
+
+# Where the last verdict is remembered (one small JSON, rewritten atomically).
+STATE=~/.local/state/dns-watch/state.json
+
+# The probe. Absolute path if dns-check is not on the unit's PATH.
+DNS_CHECK=dns-check
+
+# Publish timeout in seconds — never unbounded (ntfy_lib's rule).
+TIMEOUT_SECS=15

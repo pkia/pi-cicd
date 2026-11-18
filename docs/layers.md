@@ -95,6 +95,31 @@ and the failed unit is the signal pi-doctor's `sys:failed-unit` finding
 picks up in the daily audit. Exit 0 fresh, 1 stale, 2 unmeasurable (a
 feed nobody can fetch or date is never a pass).
 
+## DNS watching — dns-check and dns-watch
+
+`dns-check` is the read-only verdict: it probes a raw-IP endpoint and one
+hostname, and names which half broke — **DNS CONFIG BROKEN** (packets
+leave, names do not resolve: a resolver problem), **EGRESS BROKEN** (the
+raw-IP probe fails while names resolve) or **NO EGRESS** (both). When
+the resolver half fails it quotes `/etc/resolv.conf` and marks the
+header-only file that caused the 2026-11-16 outage
+(`docs/incidents/2026-11-16-dns-outage.md`), where NetworkManager wrote a
+nameserver-less file from a manual profile with an empty `ipv4.dns`. It
+prints the recovery commands and runs none of them.
+
+`dns-watch` is the timer half: hourly, it runs `dns-check` once and
+**pages one ntfy message only when the verdict changes** — a standing
+failure is one message, not one an hour, and a recovery gets its own
+"healthy" page. The first healthy run on an empty state is silent (a
+fresh install is not news); the first broken one pages. Its only write is
+`~/.local/state/dns-watch/state.json`, written atomically; `--dry-run`
+publishes and writes nothing. The unit's exit code is dns-check's verdict
+(1/2/3 when broken) or 4 when the probe itself could not run, so the
+daily pi-doctor audit also names a broken box even if the page is muted
+or unconfigured. Paging needs `/etc/dns-watch.conf`
+(`templates/dns-watch.conf.example`); without it the verdict still runs
+and still fails — it just cannot page.
+
 ## Notifications & mute — ntfy backbone and the kill switch
 
 Self-hosted ntfy (Debian package) on the tailnet only (`:6839`),

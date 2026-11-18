@@ -1,0 +1,14 @@
+[Unit]
+Description=Check DNS/egress health every hour (pages only on a change)
+
+[Timer]
+# The 2026-11-16 outage ran ~23:35 -> 00:07 unnoticed. An hourly check costs
+# two loopback-ish probes; the page is edge-triggered, so a standing failure
+# is one message, not one an hour.
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
