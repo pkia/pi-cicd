@@ -17,6 +17,7 @@ jobs:
           for f in new-project project-guard install.sh templates/deploy.sh; do
             bash -n "$f" || fail=1
           done
+          sh -n dns-check || fail=1
           [ $fail = 0 ] || exit 1
 
       - name: Byte-compile loop-heartbeat
@@ -36,6 +37,9 @@ jobs:
 
       - name: Byte-compile feed-fresh
         run: python3 -m compileall -q feed-fresh
+
+      - name: Byte-compile dns-watch
+        run: python3 -m compileall -q dns-watch
 
       - name: Install borg for pi-backup tests
         run: sudo apt-get install -y borgbackup >/dev/null

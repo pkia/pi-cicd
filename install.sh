@@ -319,6 +319,21 @@ sudo systemctl daemon-reload
 sudo systemctl enable --quiet --now feed-fresh.timer
 echo "feed-fresh timer installed and active"
 
+# dns-watch: dns-check on a timer, paging once per verdict change. Born from
+# the 2026-11-16 outage (docs/incidents/2026-11-16-dns-outage.md): the profile
+# wrote a header-only /etc/resolv.conf, every hostname died, and nothing on the
+# box said so until Hermes failed to reach a model provider. The probe stays
+# read-only; dns-watch's only write is ~/.local/state/dns-watch/state.json.
+# Paging needs its own /etc/dns-watch.conf (templates/dns-watch.conf.example);
+# without it the unit still runs and still fails on a broken verdict — it just
+# cannot page, which is the truthful state of the fast path until the owner
+# writes that file.
+sudo cp "$REPO_DIR/systemd/dns-watch.service" \
+        "$REPO_DIR/systemd/dns-watch.timer" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet --now dns-watch.timer
+echo "dns-watch timer installed and active (pages need /etc/dns-watch.conf)"
+
 # ntfy boot ordering: /etc/ntfy/server.yml binds a fixed Tailscale address
 # (listen-http: 100.x.y.z:6839). On a reboot ntfy can start before tailscale0
 # carries that address, fail to bind, and exhaust the default 5-restart limit —
