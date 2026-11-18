@@ -10,13 +10,16 @@
 # Exit: 0 healthy | 1 name resolution broken | 2 IP egress broken | 3 both
 #
 # Env overrides exist for testing: DNS_CHECK_URL (raw-IP endpoint),
-# DNS_CHECK_HOST (name that must resolve), DNS_CHECK_TIMEOUT.
+# DNS_CHECK_HOST (name that must resolve), DNS_CHECK_TIMEOUT,
+# DNS_CHECK_RESOLV_CONF (the file the verdict quotes; it never replaces
+# the resolver the box actually uses — getent still asks the real one).
 
 set -u
 
 PROBE_URL="${DNS_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
 PROBE_HOST="${DNS_CHECK_HOST:-api.deepseek.com}"
 TIMEOUT="${DNS_CHECK_TIMEOUT:-6}"
+RESOLV_CONF="${DNS_CHECK_RESOLV_CONF:-/etc/resolv.conf}"
 
 ip_ok=0
 curl -s -o /dev/null --max-time "$TIMEOUT" "$PROBE_URL" 2>/dev/null && ip_ok=1
@@ -59,8 +62,13 @@ if [ "$ip_ok" = 1 ]; then
     echo "  VERDICT: DNS CONFIG BROKEN — packets leave the box, names do not resolve."
     echo "  That combination is a resolver problem, not a connectivity problem."
     echo
-    echo "  /etc/resolv.conf:"
-    sed 's/^/    /' /etc/resolv.conf 2>/dev/null || echo "    (missing)"
+    echo "  $RESOLV_CONF:"
+    sed 's/^/    /' "$RESOLV_CONF" 2>/dev/null || echo "    (missing)"
+    NS_COUNT="$(grep -c '^[[:space:]]*nameserver' "$RESOLV_CONF" 2>/dev/null || true)"
+    if [ "${NS_COUNT:-0}" = "0" ]; then
+        echo "    (header-only — no nameserver line; this is the"
+        echo "     2026-11-16 shape: NetworkManager wrote an empty profile)"
+    fi
     echo "  NetworkManager profile \"${CONN}\":"
     conn_dns "$CONN"
     echo
