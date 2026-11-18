@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -152,6 +153,24 @@ def save_state(path, state):
 
 # ----------------------------------------------------------------- probe
 
+def resolve_probe(configured):
+    """Find dns-check: an explicit config value first (verbatim when it
+    carries a path separator), then PATH, then the copy that ships beside
+    this script — the repo is the source both symlinks point at, so a test
+    (or a fresh checkout) runs even when nothing is installed on PATH.
+    """
+    if configured and os.sep in configured:
+        return configured
+    wanted = configured or DEFAULT_DNS_CHECK
+    found = shutil.which(wanted)
+    if found:
+        return found
+    sibling = Path(__file__).resolve().parent / wanted
+    if sibling.is_file():
+        return str(sibling)
+    return wanted
+
+
 def run_probe(command):
     """Execute dns-check once. -> (rc or None, combined output)."""
     try:
@@ -236,11 +255,12 @@ def decide(prev, state):
 
 def run(cfg, state_path, dry_run=False, verbose=False, now=None):
     now = now or datetime.now(timezone.utc)
-    rc, output = run_probe(cfg["dns_check"])
+    probe = resolve_probe(cfg["dns_check"])
+    rc, output = run_probe(probe)
     state_word, title, detail = classify(rc, output)
 
     if verbose:
-        print(f"dns-watch: probe {cfg['dns_check']} rc={rc} -> {state_word}",
+        print(f"dns-watch: probe {probe} rc={rc} -> {state_word}",
               file=sys.stderr)
     if output.strip():
         print(output.rstrip())

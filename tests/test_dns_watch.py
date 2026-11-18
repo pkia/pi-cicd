@@ -298,6 +298,22 @@ def test_default_state_expands_home(tmp_path):
     assert not (cwd / "~").exists()
 
 
+def test_probe_resolves_beside_the_script_when_not_on_path(tmp_path):
+    """CI has no ~/.local/bin and no installed dns-check: with PATH stripped
+    of it, the copy shipped beside dns-watch must be the one that runs."""
+    with Sink() as sink:
+        conf, env, _ = write_env(tmp_path, sink.url, host=BROKEN_HOST)
+        env["PATH"] = "/usr/bin:/bin"          # curl/getent live here
+        proc = subprocess.run([str(TOOL), "--config", str(conf),
+                               "--state", str(tmp_path / "s.json"), "-v"],
+                              env=env, cwd=str(tmp_path),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=120, check=False)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert len(sink.posts) == 1
+    assert str(PROBE) in proc.stderr      # the resolved path is named -v
+
+
 # -------------------------------------------------------------- read-only
 
 BANNED = ("tee", "sed -i", "mv ", "cp ", "rm ", "touch ", "truncate",
