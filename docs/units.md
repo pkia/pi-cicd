@@ -30,7 +30,7 @@ messaging platform via `hermes send`.
 | pi-backup | systemd | daily 03:30 | `/etc/pi-backup.conf` (600, root) | borg repo `/var/backups/pi-borg` | `backups` | `systemctl list-timers pi-backup*` |
 | pi-backup-drill | systemd | Sun 05:30 | same | same | `backups` | `journalctl -u pi-backup-drill` |
 | release-watch | systemd | 10:12 / 22:12 | sources in code | `~/.local/state/release-watch/state.json` | `releases` | `release-watch --list` |
-| service-probe | systemd | every 5 min | probe list in code (chaos-drill drives a shadow copy) | `~/.local/state/service-probe/status.json` | `services` | `service-probe --list` |
+| service-probe | systemd | every 5 min | `/etc/service-probe.conf` (chaos-drill drives a shadow copy) | `~/.local/state/service-probe/status.json` | `services` | `service-probe --list` |
 | chaos-drill | systemd | nightly 04:45 | drill manifest in code | `~/.local/state/chaos-drill/status.json` | `chaos` | `chaos-drill --list` |
 | ram-mode | helper | on demand (`ram-mode focus` / `restore`) | `~/.config/ram-mode/units.conf` (unit lists, auto-created) | `~/.local/state/ram-mode/stopped` + `ram-mode.log` | — (suspends service-probe rows instead) | `ram-mode status` |
 
