@@ -28,6 +28,7 @@ LOG="$LOG_DIR/project-guard.log"
 EXCLUDE=(AIS-catcher-src AdGuardHome)
 DENY_LIST="${GUARD_DENY_LIST:-$HOME_DIR/.config/project-guard/deny-list}"
 DENY_STATE="$LOG_DIR/project-guard-denied.state"
+READONLY_STATE="$LOG_DIR/project-guard-readonly.state"
 MAX_FILE_BYTES=20971520          # 20 MB - larger files get gitignored
 SECRET_NAME_RE='(^|/)([^/]*key[^/]*\.(txt|json|pem)|[^/]*secret[^/]*|[^/]*token[^/]*|.*\.env|.*\.pem|.*\.p12|id_rsa.*|id_ed25519.*|[^/]*credential[^/]*)$'
 SECRET_CONTENT_RE='(ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
@@ -106,6 +107,40 @@ deny_note() {   # $1 = directory, $2 = pattern: report the skip once, not 144x/d
     log "adopt $(basename "$1") SKIPPED: deny-list pattern '$2' matched ($DENY_LIST) - nothing versioned"
     mkdir -p "$(dirname "$DENY_STATE")"
     printf '%s\n' "$key" >> "$DENY_STATE"
+}
+
+# --- origin write access ---------------------------------------------------
+# A clone of someone else's repo (e.g. an upstream mirror) has no push
+# permission: `git push` answers 403 and the guard used to log a false
+# "diverged from origin? - needs a human" every 10 minutes, forever
+# (2026-11-19: 12k lines across camofox-browser, hermes-webui, ps5overdrive
+# and relapse-host). Ask GitHub once per sweep instead; unknown = try.
+origin_readonly() {   # in a repo dir; true when origin cannot be pushed to
+    local url owner repo perm
+    url=$(git remote get-url origin 2>/dev/null) || return 1
+    case "$url" in
+        https://github.com/*/*) url=${url#https://github.com/} ;;
+        git@github.com:*)       url=${url#git@github.com:} ;;
+        *) return 1 ;;
+    esac
+    owner=${url%%/*}
+    repo=${url#*/}
+    repo=${repo%.git}
+    if [ -z "$owner" ] || [ -z "$repo" ]; then return 1; fi
+    [ -z "$GH_USER" ] && return 1
+    [ "$owner" = "$GH_USER" ] && return 1
+    perm=$(gh api "repos/$owner/$repo" -q .permissions.push 2>/dev/null) || return 1
+    [ "$perm" = "false" ]
+}
+
+readonly_note() {   # $1 = repo dir, $2 = origin url: report the skip once
+    local key; key="${1%/}|$2"
+    if [ -f "$READONLY_STATE" ] && grep -Fxq "$key" "$READONLY_STATE" 2>/dev/null; then
+        return 0
+    fi
+    log "$(basename "$1"): origin $2 is read-only (upstream mirror) - pushes skipped"
+    mkdir -p "$(dirname "$READONLY_STATE")"
+    printf '%s\n' "$key" >> "$READONLY_STATE"
 }
 
 looks_secret() {
@@ -226,9 +261,18 @@ backup_repo() {   # $1 = directory that already has .git
         fi
     fi
 
+    # Someone else's repo: pushes can only 403, and a CI commit added here
+    # would never leave the box. Note it once and keep local backups only.
+    local readonly=no origin_url
+    origin_url=$(git remote get-url origin 2>/dev/null)
+    if origin_readonly; then
+        readonly=yes
+        readonly_note "$dir" "$origin_url"
+    fi
+
     # Every managed repo goes through CI: if a code repo has no workflow,
     # add the standard one so the pipeline applies to everything.
-    if ! ls .github/workflows/*.yml >/dev/null 2>&1 && is_project_dir "$PWD"; then
+    if [ "$readonly" = no ] && ! ls .github/workflows/*.yml >/dev/null 2>&1 && is_project_dir "$PWD"; then
         write_standard_ci
         git add .github
         git commit -q -m "ci: standard CI workflow (added by project-guard)" \
@@ -239,11 +283,11 @@ backup_repo() {   # $1 = directory that already has .git
     # name (projects may use master or feature branches; deploy tooling
     # deliberately targets main - backup should capture whatever is real).
     CUR_BRANCH=$(git branch --show-current 2>/dev/null)
-    if [ -n "$CUR_BRANCH" ]; then
+    if [ -n "$CUR_BRANCH" ] && [ "$readonly" = no ]; then
         if ! git push -q origin "$CUR_BRANCH" 2>>"$LOG"; then
             log "$name: push of $CUR_BRANCH rejected (diverged from origin?) - needs a human"
         fi
-    else
+    elif [ -z "$CUR_BRANCH" ]; then
         log "$name: detached HEAD (deploy rollback window?) - skipping branch push"
     fi
 
@@ -276,7 +320,9 @@ backup_repo() {   # $1 = directory that already has .git
     commit=$(git commit-tree "$tree" -p "$parent" \
         -m "autosave $(date '+%F %T') - working tree snapshot" 2>>"$LOG") || return
     git update-ref refs/heads/autosave "$commit"
-    if git push -q origin refs/heads/autosave 2>>"$LOG"; then
+    if [ "$readonly" = yes ]; then
+        log "$name: autosaved ${#paths[@]} changed path(s) -> autosave@${commit:0:12} (local only, read-only origin)"
+    elif git push -q origin refs/heads/autosave 2>>"$LOG"; then
         log "$name: autosaved ${#paths[@]} changed path(s) -> autosave@${commit:0:12}"
     else
         log "$name: autosave committed locally but push failed"
