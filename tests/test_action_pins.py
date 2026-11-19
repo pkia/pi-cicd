@@ -151,6 +151,26 @@ def test_docker_digest_passes_and_docker_tag_faults(tmp_path):
     assert "alpine" in bad.stderr and "tag" in bad.stderr
 
 
+def test_value_on_the_following_line_is_read(tmp_path):
+    text = (
+        "name: CI\non: push\njobs:\n  check:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses:\n"
+        "          actions/checkout@v4\n"
+    )
+    write_workflow(tmp_path, text=text)
+    r = run(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "ci.yml:7" in r.stderr and "actions/checkout" in r.stderr
+
+
+def test_flow_mapping_step_is_read(tmp_path):
+    write_workflow(tmp_path, text=steps("{uses: actions/checkout@v4}"))
+    r = run(tmp_path)
+    assert r.returncode == 1
+    assert "ci.yml:7" in r.stderr and "checkout" in r.stderr
+
+
 def test_no_workflows_is_unmeasurable_not_a_pass(tmp_path):
     r = run(tmp_path)
     assert r.returncode == 2

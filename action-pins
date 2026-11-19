@@ -43,6 +43,10 @@ naive grep gets wrong, handled here instead:
   * a block scalar (`run: |`) holds text, not keys — a `uses:` line indented
     inside a `run: |` block is shell script, not an action.
 
+It also reads the two shapes a line-oriented grep misses: `uses:` whose value
+sits on the following, more-indented line, and the flow mapping
+`- {uses: x@v4}`.
+
 So the reader tracks block-scalar indentation and quote state rather than
 matching the token anywhere on a line.
 """
@@ -59,6 +63,7 @@ TAG_RE = re.compile(r"^v?\d+(\.\d+)*(rc\d+|beta\d+|alpha\d+)?$", re.I)
 DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 BLOCK_START_RE = re.compile(r"^[|>][+-]?[0-9]?\s*$")
 KEY_RE = re.compile(r"^\s*(?:-\s+)?uses\s*:\s*(.*)$")
+FLOW_USE_RE = re.compile(r"\{\s*uses\s*:\s*([^,}]+?)\s*[,}]")
 
 
 class Line:
@@ -157,6 +162,7 @@ def scan_workflow(path, display):
     text = path.read_text(encoding="utf-8", errors="replace")
     refs = []
     block_indent = None  # indentation of the key that opened a block scalar
+    pending = None  # (line, indent) of a `uses:` whose value is on the next line
     for lineno, raw in enumerate(text.splitlines(), 1):
         if block_indent is not None:
             if not raw.strip():
@@ -167,25 +173,43 @@ def scan_workflow(path, display):
             block_indent = None
         code, open_quote = strip_comment(raw)
         if not code.strip():
-            continue
+            continue  # a blank or comment-only line does not end a pending value
+        indent = len(code) - len(code.lstrip())
+        if pending is not None:
+            uses_line, uses_indent = pending
+            if indent > uses_indent and not open_quote:
+                value = unquote(code.strip())
+                action, ref, kind, pinned = classify(value)
+                refs.append(Line(display, uses_line, action, ref, kind, pinned))
+                pending = None
+                continue
+            pending = None
         match = KEY_RE.match(code)
         if match:
             value = match.group(1).strip()
             if not value:
-                continue  # `uses:` with the value on the next line — rare, unmeasured
-            if open_quote or not unquote(value):
+                # `uses:` with its value on the following, more-indented line
+                pending = (lineno, indent)
+                continue
+            if open_quote:
                 continue
             action, ref, kind, pinned = classify(unquote(value))
+            refs.append(Line(display, lineno, action, ref, kind, pinned))
+            continue
+        # A flow mapping may carry the key inline: `- {uses: x@v4}`.
+        flow = FLOW_USE_RE.search(code)
+        if flow and not open_quote:
+            action, ref, kind, pinned = classify(unquote(flow.group(1).strip()))
             refs.append(Line(display, lineno, action, ref, kind, pinned))
             continue
         # A block scalar's header determines whether the following lines are
         # text. Only the header line itself can open one.
         stripped = code.rstrip()
-        head_indent = len(code) - len(code.lstrip())
         after_colon = stripped.rsplit(":", 1)[-1].strip() if ":" in stripped else ""
         if BLOCK_START_RE.match(after_colon):
-            block_indent = head_indent
+            block_indent = indent
     return refs
+
 
 
 def workflows_in(root):
