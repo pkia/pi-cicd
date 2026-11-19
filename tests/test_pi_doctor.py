@@ -455,6 +455,31 @@ def test_still_restored_reading_waits_for_the_correction(monkeypatch):
     assert state["dark_window_pending"]["boot_id"] == "boot-cut"
 
 
+def test_ticking_restored_clock_resolves_instead_of_hanging(monkeypatch):
+    """fake-hwclock restores the saved time and the kernel ticks from it, so
+    the boot run writes saved+uptime, not saved. Reading that back as the loss
+    instant makes the gap negative for the whole boot (live: 2026-11-16 boot,
+    gap -20.5 s, never resolved). The saved value is the loss instant."""
+    from datetime import datetime, timedelta
+    saved = datetime(2026, 9, 25, 6, 30, 0)
+    monkeypatch.setattr(doc, "_boot_id", lambda path=None: "boot-tick")
+    monkeypatch.setattr(doc, "_clock_saved", lambda path=None: saved.timestamp())
+    monkeypatch.setattr(doc, "_read_uptime", lambda path=None: 20.0)
+    state = {}
+    # boot run: clock already ticks from the restored value
+    doc.check_dark_window(now=saved + timedelta(seconds=20), state=state, save=False)
+    reading = state["dark_window_pending"]
+    assert reading["restored_ts"] == (saved + timedelta(seconds=20)).timestamp()
+    assert reading["clock_mtime"] == saved.timestamp()
+
+    # correction lands an hour later; the box really booted 22 s after loss
+    monkeypatch.setattr(doc, "_read_uptime", lambda path=None: 3622.0)
+    now = saved + timedelta(seconds=22 + 3600 + 22)
+    line, window = doc.check_dark_window(now=now, state=state, save=False)
+    assert (line, window) == (None, None)          # ordinary reboot, quiet
+    assert "dark_window_pending" not in state
+
+
 def test_unmeasured_reading_is_named_when_its_boot_is_over(monkeypatch):
     """A reading the correction never reached is reported, not silently
     dropped — an unmeasured blackout must not look like a quiet boot."""
