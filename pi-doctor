@@ -675,6 +675,7 @@ BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 DARK_THRESHOLD_S = 300          # 5 min: a clean reboot is seconds
 DARK_MAX_S = 7 * 86400          # older than this is a stale file, not a window
 DARK_LEDGER_MAX = 20
+CLOCK_SKEW_TOL_S = 5             # shutdown-write vs boot-instant clock error
 DARK_PENDING_KEY = "dark_window_pending"
 
 
@@ -766,12 +767,24 @@ def resolve_dark_window(now, uptime_s, pending, threshold_s=DARK_THRESHOLD_S,
     restored = pending.get("restored_ts")
     if restored is None:
         return "none", None
+    # fake-hwclock restores the saved time and the kernel then ticks from it,
+    # so a boot run 20 s in writes down saved+20 rather than the saved value
+    # itself. The file mtime is the loss instant; without this clamp the
+    # subtraction below stays negative for the whole boot and the reading is
+    # never resolved (seen live 2026-11-16 -> 11-19, gap -20.5 s).
+    saved = pending.get("clock_mtime")
+    if saved is not None and saved < restored:
+        restored = saved
     boot_wall = now.timestamp() - uptime_s
     gap = boot_wall - restored
     if gap < 0:
-        # `now - uptime` still lands before the saved value: the clock is
-        # (still) the restored one, so there is nothing to measure yet.
-        return "unresolved", None
+        if gap < -CLOCK_SKEW_TOL_S:
+            # `now - uptime` still lands before the saved value: the clock is
+            # (still) the restored one, so there is nothing to measure yet.
+            return "unresolved", None
+        # A few seconds of negative gap is clock error between the shutdown
+        # write and the boot instant, not a blackout.
+        gap = 0.0
     if gap < threshold_s or gap > max_s:
         return "none", None
     return "window", _window(restored, boot_wall, gap, "restored-clock")
