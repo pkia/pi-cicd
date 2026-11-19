@@ -10,6 +10,7 @@
 # A new tool at the repo root means one added line here. Anything with an
 # extension (foo.py, install.sh) is a library or a script rather than a PATH
 # tool, and this file is data — so the scan needs no hand-kept ignore list.
+action-pins
 chaos-drill
 decommission
 dns-check

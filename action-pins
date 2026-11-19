@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""action-pins — every `uses:` in every workflow, and what its ref can do.
+
+A GitHub Actions step that says `uses: actions/checkout@v4` is pinned to a
+major tag, and a major tag is a moving pointer: the action's maintainer can
+retag it, and the code that runs in this repo's CI changes without a commit
+here. Only a full commit SHA is immovable. With one workflow and one `uses:`
+line this is trivial to check by eye; with twenty it is not, and the one that
+is not pinned is invisible.
+
+    action-pins [--dir REPO] [--json]
+
+Reads every `*.yml` / `*.yaml` under `<dir>/.github/workflows`, prints one
+row per action reference with its ref type, and exits nonzero when any ref
+is not a full SHA.
+
+Ref types reported:
+
+    sha     40 (or 64) hex characters — immovable
+    tag     a version-ish ref (`v4`, `v4.1.7`, `1.2`) — the maintainer can retag
+    branch  anything else (`main`, `master`, a feature branch) — moves on push
+    digest  `docker://image@sha256:<64 hex>` — immovable
+    local   `./path` inside the repo — nothing upstream to move
+    none    a remote action with no `@ref` — resolves to its default branch
+
+Exit codes (the contract a caller branches on):
+    0  every action reference is pinned to a full SHA (or is local)
+    1  at least one moving ref; every fault names file, line and action
+    2  unmeasurable — the directory or a workflow file could not be read, or
+       there is no workflow to read (a vacuous pass is not a pass)
+
+Read-only by construction: it parses text and writes nothing, spawns nothing.
+
+Parsing, and why it is not a YAML library: this repo is stdlib-only, and the
+one structure that matters is a `uses:` key. Three cases YAML decides that a
+naive grep gets wrong, handled here instead:
+
+  * a comment is a `#` preceded by whitespace (or at line start), and is not
+    a comment inside a quoted scalar — `uses: "x@v4"  # later` is a v4 ref,
+    while `# - uses: x@v4` is a comment and not a step at all;
+  * a quoted value is the value — `uses: "actions/checkout@v4"` pins exactly
+    what the unquoted spelling pins;
+  * a block scalar (`run: |`) holds text, not keys — a `uses:` line indented
+    inside a `run: |` block is shell script, not an action.
+
+So the reader tracks block-scalar indentation and quote state rather than
+matching the token anywhere on a line.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
+TAG_RE = re.compile(r"^v?\d+(\.\d+)*(rc\d+|beta\d+|alpha\d+)?$", re.I)
+DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
+BLOCK_START_RE = re.compile(r"^[|>][+-]?[0-9]?\s*$")
+KEY_RE = re.compile(r"^\s*(?:-\s+)?uses\s*:\s*(.*)$")
+
+
+class Line:
+    __slots__ = ("file", "lineno", "action", "ref", "kind", "pinned")
+
+    def __init__(self, file, lineno, action, ref, kind, pinned):
+        self.file = file
+        self.lineno = lineno
+        self.action = action
+        self.ref = ref
+        self.kind = kind
+        self.pinned = pinned
+
+    def as_dict(self):
+        return {
+            "file": self.file,
+            "line": self.lineno,
+            "action": self.action,
+            "ref": self.ref,
+            "type": self.kind,
+            "pinned": self.pinned,
+        }
+
+
+def strip_comment(text):
+    """Remove a YAML comment: `#` at line start or after whitespace.
+
+    Quote-aware: a `#` inside '...' or "..." belongs to the scalar. Returns
+    (code, in_quote) — in_quote is True when the line ends inside a quoted
+    scalar, which for a one-line `uses:` means the value was malformed.
+    """
+    out = []
+    quote = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(text):
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            out.append(ch)
+        else:
+            if ch in ("'", '"'):
+                quote = ch
+                out.append(ch)
+            elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
+                break
+            else:
+                out.append(ch)
+        i += 1
+    return "".join(out), quote is not None
+
+
+def unquote(value):
+    """YAML scalar → string, for the two quote styles that occur here."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        inner = value[1:-1]
+        if value[0] == "'":
+            return inner.replace("''", "'")
+        return (
+            inner.replace('\\"', '"')
+            .replace("\\t", "\t")
+            .replace("\\n", "\n")
+            .replace("\\\\", "\\")
+        )
+    return value
+
+
+def classify(uses):
+    """(action, ref, kind, pinned) for one `uses:` value."""
+    if uses.startswith("./") or uses.startswith("../"):
+        return uses, "", "local", True
+    if uses.startswith("docker://"):
+        if DIGEST_RE.search(uses):
+            image, _, digest = uses[len("docker://") :].rpartition("@")
+            return f"docker://{image}", digest, "digest", True
+        image, sep, ref = uses[len("docker://") :].rpartition(":")
+        if sep and "/" not in ref:  # docker://alpine:3 — a moving image tag
+            return f"docker://{image}", ref, "tag", False
+        return uses, "", "none", False
+    action, sep, ref = uses.rpartition("@")
+    if not sep or not action:
+        return uses, "", "none", False
+    if SHA_RE.match(ref):
+        return action, ref, "sha", True
+    if TAG_RE.match(ref):
+        return action, ref, "tag", False
+    return action, ref, "branch", False
+
+
+def scan_workflow(path, display):
+    """Every action reference in one workflow file, in file order."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    refs = []
+    block_indent = None  # indentation of the key that opened a block scalar
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if block_indent is not None:
+            if not raw.strip():
+                continue
+            indent = len(raw) - len(raw.lstrip())
+            if indent > block_indent:
+                continue
+            block_indent = None
+        code, open_quote = strip_comment(raw)
+        if not code.strip():
+            continue
+        match = KEY_RE.match(code)
+        if match:
+            value = match.group(1).strip()
+            if not value:
+                continue  # `uses:` with the value on the next line — rare, unmeasured
+            if open_quote or not unquote(value):
+                continue
+            action, ref, kind, pinned = classify(unquote(value))
+            refs.append(Line(display, lineno, action, ref, kind, pinned))
+            continue
+        # A block scalar's header determines whether the following lines are
+        # text. Only the header line itself can open one.
+        stripped = code.rstrip()
+        head_indent = len(code) - len(code.lstrip())
+        after_colon = stripped.rsplit(":", 1)[-1].strip() if ":" in stripped else ""
+        if BLOCK_START_RE.match(after_colon):
+            block_indent = head_indent
+    return refs
+
+
+def workflows_in(root):
+    wf_dir = root / ".github" / "workflows"
+    if not wf_dir.is_dir():
+        return []
+    found = [p for p in wf_dir.iterdir() if p.is_file() and p.suffix in (".yml", ".yaml")]
+    return sorted(found, key=lambda p: p.name)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="List every workflow `uses:` ref and its pin type; "
+        "exit 1 when any ref is not a full SHA."
+    )
+    ap.add_argument(
+        "--dir",
+        default=str(Path(__file__).resolve().parent),
+        help="repo to inspect (default: the repo this tool lives in)",
+    )
+    ap.add_argument("--json", action="store_true", help="machine-readable output on stdout")
+    args = ap.parse_args(argv)
+
+    root = Path(args.dir).expanduser()
+    if not root.is_dir():
+        print(f"action-pins: {root} is not a directory", file=sys.stderr)
+        return 2
+    files = workflows_in(root)
+    if not files:
+        print(
+            f"action-pins: no workflow files under {root / '.github' / 'workflows'} "
+            "— nothing measured",
+            file=sys.stderr,
+        )
+        return 2
+
+    refs = []
+    for path in files:
+        display = str(path.relative_to(root))
+        try:
+            refs.extend(scan_workflow(path, display))
+        except OSError as exc:
+            print(f"action-pins: cannot read {display}: {exc}", file=sys.stderr)
+            return 2
+
+    moving = [r for r in refs if not r.pinned]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "workflows": [str(p.relative_to(root)) for p in files],
+                    "refs": [r.as_dict() for r in refs],
+                    "pinned": len(refs) - len(moving),
+                    "moving": len(moving),
+                    "ok": not moving,
+                },
+                indent=2,
+            )
+        )
+        return 0 if not moving else 1
+
+    width = max((len(r.kind) for r in refs), default=4)
+    for r in refs:
+        print(f"{r.file}:{r.lineno}  {r.kind:<{width}}  {r.action}"
+              + (f"@{r.ref}" if r.ref else ""))
+    print(f"--- {len(refs)} action reference(s) in {len(files)} workflow file(s)")
+    if moving:
+        for r in moving:
+            what = f"@{r.ref}" if r.ref else " (no ref — resolves to its default branch)"
+            print(
+                f"FAIL {r.file}:{r.lineno} — {r.action} is pinned to {what}, "
+                f"a moving {r.kind}",
+                file=sys.stderr,
+            )
+        print(f"--- {len(moving)} moving ref(s); {len(refs) - len(moving)} pinned", file=sys.stderr)
+        return 1
+    print("OK — every action reference is pinned to a full SHA (or is local)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
