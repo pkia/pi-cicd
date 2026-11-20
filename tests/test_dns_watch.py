@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -124,10 +125,10 @@ def write_env(tmp_path, sink_url, *, host, resolv=HEADER_ONLY,
 
 def run_tool(tmp_path, sink_url, *, host=HEALTHY_HOST, state=None,
              dry_run=False, resolv=HEADER_ONLY, probe_url=None,
-             dns_check=None, cwd=None):
+             dns_check=None, cwd=None, extra=""):
     conf, env, resolv_file = write_env(
         tmp_path, sink_url, host=host, resolv=resolv,
-        probe_url=probe_url, dns_check=dns_check)
+        probe_url=probe_url, dns_check=dns_check, extra=extra)
     state = state or (tmp_path / "state.json")
     argv = [str(TOOL), "--config", str(conf), "--state", str(state), "-v"]
     if dry_run:
@@ -230,7 +231,7 @@ def test_one_stalled_connect_is_retried_not_paged(tmp_path):
     hits = {"n": 0}
 
     class StallsOnce(BaseHTTPRequestHandler):
-        def do_GET(self):                            # noqa: N802
+        def do_GET(self):
             with lock:
                 hits["n"] += 1
                 n = hits["n"]
@@ -360,6 +361,215 @@ def test_probe_resolves_beside_the_script_when_not_on_path(tmp_path):
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert len(sink.posts) == 1
     assert str(PROBE) in proc.stderr      # the resolved path is named -v
+
+
+# ------------------------------------------------------------- page ledger
+
+def ledger_of(state):
+    """The ledger that belongs beside this run's state file."""
+    return Path(state).with_name("pages.log")
+
+
+def ledger_lines(path):
+    if not Path(path).exists():
+        return []
+    return [line for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def test_six_changes_write_six_ledger_lines(tmp_path):
+    """The row's headline: a flapping night is a countable list, not a count."""
+    with Sink() as sink:
+        for host in (BROKEN_HOST, HEALTHY_HOST) * 3:
+            run_tool(tmp_path, sink.url, host=host)
+        assert len(sink.posts) == 6
+    lines = ledger_lines(ledger_of(tmp_path / "state.json"))
+    assert len(lines) == 6, lines
+    verdicts = [line.split()[1] for line in lines]
+    assert verdicts == ["dns", "healthy"] * 3
+    codes = [line.split()[2] for line in lines]
+    assert codes == ["rc=1", "rc=0"] * 3
+    # A ledger that silently dropped the retry column would pass the count.
+    assert all("retry=no" in line for line in lines)
+    # Timestamps are ISO-8601 UTC and in order.
+    stamps = [line.split()[0] for line in lines]
+    assert all(re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$", s)
+               for s in stamps), stamps
+    assert stamps == sorted(stamps)
+
+
+def test_unchanged_runs_leave_the_ledger_byte_identical(tmp_path):
+    with Sink() as sink:
+        run_tool(tmp_path, sink.url, host=BROKEN_HOST)
+        ledger = ledger_of(tmp_path / "state.json")
+        before = ledger.read_bytes()
+        for _ in range(2):
+            run_tool(tmp_path, sink.url, host=BROKEN_HOST)
+        assert len(sink.posts) == 1
+    assert ledger.read_bytes() == before
+    assert read_state(tmp_path / "state.json")["pages"] == 1
+
+
+def test_ledger_rotates_at_its_cap_instead_of_growing(tmp_path):
+    """Cap 3: the fourth page rotates pages.log -> pages.log.1, and the live
+    file never holds more than the cap."""
+    with Sink() as sink:
+        for host in (BROKEN_HOST, HEALTHY_HOST) * 2:
+            run_tool(tmp_path, sink.url, host=host,
+                     extra="LEDGER_MAX_LINES=3")
+        assert len(sink.posts) == 4
+    ledger = ledger_of(tmp_path / "state.json")
+    live, previous = ledger_lines(ledger), ledger_lines(str(ledger) + ".1")
+    assert len(live) == 1, live
+    assert len(previous) == 3, previous
+    assert live[0].split()[1] == "healthy"
+    assert len(live) <= 3
+
+
+def test_history_on_an_empty_ledger_prints_a_dated_header(tmp_path):
+    ledger = tmp_path / "nothing-yet.log"
+    proc = subprocess.run([str(TOOL), "--config", str(tmp_path / "no.conf"),
+                           "--ledger", str(ledger), "--history"],
+                          env=dict(os.environ), cwd=str(tmp_path),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=60, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    header = proc.stdout.splitlines()[0]
+    assert re.search(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", header), header
+    assert "last 24 h" in header
+    assert "0 page(s) in the last 24 h" in proc.stdout
+    assert not ledger.exists()          # --history writes nothing
+
+
+def test_history_shows_the_last_24h_across_both_generations(tmp_path):
+    ledger = tmp_path / "pages.log"
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+    old = (now - timedelta(hours=30)).isoformat(timespec="seconds")
+    ledger.write_text(f"{fresh}  egress       rc=2    retry=no\n"
+                      f"{old}  dns          rc=1    retry=no\n"
+                      "not a ledger line\n", encoding="utf-8")
+    Path(str(ledger) + ".1").write_text(
+        f"{fresh}  healthy      rc=0    retry=yes\n", encoding="utf-8")
+    proc = subprocess.run([str(TOOL), "--config", str(tmp_path / "no.conf"),
+                           "--ledger", str(ledger), "--history"],
+                          env=dict(os.environ), cwd=str(tmp_path),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=60, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "egress" in proc.stdout
+    assert "retry=yes" in proc.stdout          # the rotated generation
+    assert old not in proc.stdout               # outside the window
+    assert "2 page(s) in the last 24 h" in proc.stdout
+    assert "1 unreadable line(s) skipped" in proc.stdout
+    assert str(ledger) in proc.stdout
+
+
+def test_history_runs_no_probe(tmp_path):
+    """`--history` reads, it does not measure: a missing probe is not an error."""
+    ledger = tmp_path / "pages.log"
+    ledger.write_text(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+                      "  healthy      rc=0    retry=no\n", encoding="utf-8")
+    conf = tmp_path / "dns-watch.conf"
+    conf.write_text("DNS_CHECK=/no/such/probe\n", encoding="utf-8")
+    proc = subprocess.run([str(TOOL), "--config", str(conf),
+                           "--ledger", str(ledger), "--history"],
+                          env=dict(os.environ), cwd=str(tmp_path),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=60, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "PROBE ERROR" not in proc.stdout
+    assert "could not run" not in proc.stdout
+
+
+def test_a_retried_ok_is_recorded_as_retry_yes(tmp_path):
+    """Cross-tool control: the retry column reads dns-check's own note.
+
+    dns-check (a different language, its own wording) says when its OK came
+    from the second attempt; the ledger must carry that across the boundary,
+    so a drift in either half reddens this test rather than silently
+    recording `retry=no`.
+    """
+    lock = threading.Lock()
+    hits = {"n": 0}
+
+    class StallsOnce(BaseHTTPRequestHandler):
+        def do_GET(self):
+            with lock:
+                hits["n"] += 1
+                n = hits["n"]
+            try:
+                if n == 1:
+                    time.sleep(4)          # past the 3s DNS_CHECK_TIMEOUT
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, format, *args):
+            pass
+
+    probe = ThreadingHTTPServer(("127.0.0.1", 0), StallsOnce)
+    thread = threading.Thread(target=probe.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = probe.server_address[:2]
+        with Sink() as sink:
+            run_tool(tmp_path, sink.url, host=BROKEN_HOST)      # one page
+            proc, state, _ = run_tool(tmp_path, sink.url,
+                                      host=HEALTHY_HOST,
+                                      probe_url=f"http://{host}:{port}/")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "(retry; first attempt failed)" in proc.stdout
+        lines = ledger_lines(ledger_of(state))
+    finally:
+        probe.shutdown()
+        probe.server_close()
+        thread.join(timeout=5)
+    assert len(lines) == 2, lines
+    assert lines[1].split()[1] == "healthy"
+    assert "rc=0" in lines[1]
+    assert "retry=yes" in lines[1]
+    assert "retry=no" in lines[0]
+
+
+def test_an_unpublished_page_writes_no_ledger_line(tmp_path):
+    """No ntfy config -> no page -> no ledger line (and `pages` stays 0)."""
+    conf = tmp_path / "dns-watch.conf"
+    conf.write_text("NTFY_URL=\nNTFY_TOKEN=\n", encoding="utf-8")
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text(HEADER_ONLY, encoding="utf-8")
+    env = dict(os.environ)
+    env.update({"DNS_CHECK_URL": "http://127.0.0.1:1/", "DNS_CHECK_HOST": "localhost",
+                "DNS_CHECK_TIMEOUT": "2", "DNS_CHECK_RESOLV_CONF": str(resolv),
+                "NTFY_MUTE_FILE": str(tmp_path / "no-such-mute")})
+    state = tmp_path / "state.json"
+    proc = subprocess.run([str(TOOL), "--config", str(conf), "--state",
+                           str(state), "-v"], env=env, cwd=str(REPO),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=120, check=False)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "page not published" in proc.stderr
+    assert read_state(state)["pages"] == 0
+    assert not ledger_of(state).exists()
+
+
+def test_dry_run_writes_no_ledger(tmp_path):
+    with Sink() as sink:
+        proc, state, _ = run_tool(tmp_path, sink.url, host=BROKEN_HOST,
+                                  dry_run=True)
+        assert proc.returncode == 1
+        assert sink.posts == []
+    assert not ledger_of(state).exists()
+
+
+def test_ledger_default_lands_beside_the_state_file(tmp_path):
+    with Sink() as sink:
+        _, state, _ = run_tool(tmp_path, sink.url, host=BROKEN_HOST)
+    assert ledger_of(state).is_file()
+    assert len(ledger_lines(ledger_of(state))) == 1
 
 
 # -------------------------------------------------------------- read-only

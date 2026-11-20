@@ -13,13 +13,18 @@ dns-watch is the timer half. Each run:
   1. executes `dns-check` once, verbatim, at its own exit code;
   2. compares that verdict with the last one recorded in its state file;
   3. publishes **one** ntfy message when the verdict *changes*, and
-     nothing at all while it stays the same.
+     nothing at all while it stays the same;
+  4. appends one line to the page ledger for each page it actually
+     publishes — the timestamp, verdict, exit code and whether the probe's
+     retry was used — so a night of flapping is a countable list instead of
+     a `pages` counter.
 
 Edge-triggered on purpose (the 2026-08-30 lesson, metric-alert's shape):
 a standing failure must not page every hour, and a recovery must not be
 silent.
 
-    dns-watch [--config FILE] [--state FILE] [--dry-run] [-v]
+    dns-watch [--config FILE] [--state FILE] [--ledger FILE] [--dry-run] [-v]
+    dns-watch --history [--ledger FILE]
 
 Verdict states: healthy | dns | egress | both | probe-error, mapped from
 dns-check's own codes (0/1/2/3; anything else — a missing interpreter, a
@@ -30,15 +35,19 @@ Exit codes: dns-check's verdict passes through unchanged (0 healthy,
 itself could not run. A failing unit is a record the daily pi-doctor
 audit names; the page is the fast path.
 
-The probe stays read-only. dns-watch's only write is its own state file
-(`~/.local/state/dns-watch/state.json`, temp file + atomic rename), and
-`--dry-run` does not even do that. Config (optional, /etc/dns-watch.conf,
+The probe stays read-only. dns-watch's only writes are its own state file
+(`~/.local/state/dns-watch/state.json`, temp file + atomic rename) and its
+page ledger (`pages.log` beside the state file, one line per *page*, so a
+flapping night is countable: `--history` prints the last 24 h), and
+`--dry-run` does not even do those. Config (optional, /etc/dns-watch.conf,
 KEY=VALUE, `#` comments, last occurrence wins — parse_env_lists' rule):
 
     NTFY_URL=http://127.0.0.1:6839
     NTFY_TOKEN=replace-me
     NTFY_TOPIC=services          # existing provisioned topic
     STATE=~/.local/state/dns-watch/state.json
+    LEDGER=~/.local/state/dns-watch/pages.log   # default: beside STATE
+    LEDGER_MAX_LINES=2000        # past this, pages.log -> pages.log.1
     DNS_CHECK=dns-check          # absolute path if not on PATH
     TIMEOUT_SECS=15              # publish timeout, never unbounded
 """
@@ -51,7 +60,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import ntfy_lib
@@ -62,6 +71,18 @@ DEFAULT_TOPIC = "services"
 DEFAULT_DNS_CHECK = "dns-check"
 DEFAULT_TIMEOUT = 15
 PROBE_TIMEOUT = 120
+
+#: The ledger's default name, resolved beside the state file (one directory,
+#: one fact — an operator moving STATE takes the ledger along).
+LEDGER_NAME = "pages.log"
+DEFAULT_LEDGER_MAX = 2000
+HISTORY_HOURS = 24
+
+#: dns-check's own retry note (`dns-check`, the IP egress line). Duplicated
+#: in another language on purpose: a test drives the real probe through a
+#: server that stalls its first attempt, so if that wording drifts the
+#: ledger's `retry=` column goes red instead of quietly reading `no`.
+RETRY_MARKER = "(retry; first attempt failed)"
 
 #: dns-check's own contract, spelled where the mapping is built.
 VERDICTS = {
@@ -108,6 +129,8 @@ def load_config(path):
         "ntfy_token": cfg.get("NTFY_TOKEN", ""),
         "topic": cfg.get("NTFY_TOPIC") or DEFAULT_TOPIC,
         "state": os.path.expanduser(cfg.get("STATE") or DEFAULT_STATE),
+        "ledger": os.path.expanduser(cfg.get("LEDGER") or ""),
+        "ledger_max": _count(cfg.get("LEDGER_MAX_LINES"), DEFAULT_LEDGER_MAX),
         "dns_check": cfg.get("DNS_CHECK") or DEFAULT_DNS_CHECK,
         "timeout": _number(cfg.get("TIMEOUT_SECS"), DEFAULT_TIMEOUT),
     }
@@ -116,6 +139,15 @@ def load_config(path):
 def _number(value, default):
     try:
         number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def _count(value, default):
+    """A positive whole number of lines, or the default (named, not silent)."""
+    try:
+        number = int(str(value).strip())
     except (TypeError, ValueError):
         return default
     return number if number > 0 else default
@@ -149,6 +181,101 @@ def save_state(path, state):
     except OSError as exc:
         print(f"dns-watch: cannot write {path}: {exc}", file=sys.stderr)
         return False
+
+
+# ---------------------------------------------------------------- ledger
+
+def ledger_path(cfg, state_path, explicit=None):
+    """--ledger, then config LEDGER, then `pages.log` beside the state file."""
+    if explicit:
+        return os.path.expanduser(explicit)
+    if cfg.get("ledger"):
+        return cfg["ledger"]
+    return str(Path(state_path).with_name(LEDGER_NAME))
+
+
+def ledger_line(now, state_word, rc, retry):
+    """One page, one line: when, what, at which exit code, retried or not."""
+    return "{ts}  {state:<11}  rc={rc:<3}  retry={retry}".format(
+        ts=now.isoformat(timespec="seconds"), state=state_word,
+        rc="-" if rc is None else rc, retry=retry)
+
+
+def retry_used(output):
+    """Did dns-check reach its OK on the retry? (`no` when it says nothing.)"""
+    return "yes" if RETRY_MARKER in output else "no"
+
+
+def read_ledger(path):
+    """Ledger lines, oldest first; a missing file is an empty ledger."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line.rstrip() for line in text.splitlines() if line.strip()]
+
+
+def append_ledger(path, line, cap):
+    """Append one line, rotating to `<name>.1` when appending would pass the
+    cap. -> (ok, rotated)
+
+    Rotation keeps exactly one previous generation, so the pair on disk is
+    bounded at 2*cap lines and the file never grows without limit; `--history`
+    reads both generations, so a rotation mid-window loses nothing.
+    """
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rotated = False
+        if len(read_ledger(p)) + 1 > cap:
+            p.replace(p.with_name(p.name + ".1"))
+            rotated = True
+        with open(p, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        return True, rotated
+    except OSError as exc:
+        print(f"dns-watch: cannot write ledger {path}: {exc}", file=sys.stderr)
+        return False, False
+
+
+def parse_ledger_line(line):
+    """-> (stamp, verdict, rc, retry) or (None,) when the line is not ours."""
+    parts = line.split()
+    if len(parts) < 4 or not parts[2].startswith("rc=") \
+            or not parts[3].startswith("retry="):
+        return (None,)
+    try:
+        stamp = datetime.fromisoformat(parts[0])
+    except ValueError:
+        return (None,)
+    if stamp.tzinfo is None:                 # a hand-edited line: read as UTC
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (stamp, parts[1], parts[2][3:], parts[3][6:])
+
+
+def print_history(path, now=None, hours=HISTORY_HOURS):
+    """`--history`: the last `hours` of pages, one line each. Writes nothing."""
+    now = now or datetime.now(timezone.utc)
+    window = now - timedelta(hours=hours)
+    print(f"dns-watch page ledger — {now.isoformat(timespec='seconds')} "
+          f"(last {hours} h, since {window.isoformat(timespec='seconds')})")
+    lines = read_ledger(str(path) + ".1") + read_ledger(path)
+    shown = unreadable = 0
+    for line in lines:
+        parsed = parse_ledger_line(line)
+        if parsed[0] is None:
+            unreadable += 1
+            continue
+        if parsed[0] < window:
+            continue
+        print(line)
+        shown += 1
+    summary = (f"{shown} page(s) in the last {hours} h — {len(lines)} "
+               f"line(s) in {path}")
+    if unreadable:
+        summary += f", {unreadable} unreadable line(s) skipped"
+    print(summary)
+    return 0
 
 
 # ----------------------------------------------------------------- probe
@@ -253,8 +380,10 @@ def decide(prev, state):
     return True, f"{prev} -> {state}"
 
 
-def run(cfg, state_path, dry_run=False, verbose=False, now=None):
+def run(cfg, state_path, dry_run=False, verbose=False, now=None,
+        ledger_file=None):
     now = now or datetime.now(timezone.utc)
+    ledger_file = ledger_file or ledger_path(cfg, state_path)
     probe = resolve_probe(cfg["dns_check"])
     rc, output = run_probe(probe)
     state_word, title, detail = classify(rc, output)
@@ -281,12 +410,13 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None):
         "pages": int(previous.get("pages", 0)) + (1 if should else 0),
     }
 
+    paged = False
     if should:
         message = build_message(state_word, title, detail, output,
                                 since=previous.get("since"))
-        published = page(cfg, f"dns-watch: {title}", message,
-                         TAGS.get(state_word, []), dry_run=dry_run)
-        if not published:
+        paged = page(cfg, f"dns-watch: {title}", message,
+                     TAGS.get(state_word, []), dry_run=dry_run)
+        if not paged:
             # The page is the fast path; the verdict still stands, and the
             # journal keeps the line. Do not pretend the page landed.
             record["pages"] -= 1
@@ -297,6 +427,15 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None):
     if not dry_run and not save_state(state_path, record):
         print("dns-watch: verdict not recorded — the next run will page "
               "again", file=sys.stderr)
+
+    # The ledger counts *pages*, not runs: an unchanged verdict writes
+    # nothing, which is what makes "two runs with no change" byte-identical.
+    if paged and not dry_run:
+        line = ledger_line(now, state_word, rc, retry_used(output))
+        _, rotated = append_ledger(ledger_file, line, cfg["ledger_max"])
+        if rotated and verbose:
+            print(f"dns-watch: ledger reached {cfg['ledger_max']} line(s) — "
+                  f"rotated to {Path(ledger_file).name}.1", file=sys.stderr)
 
     print(f"dns-watch: {state_word.upper()} — {detail}"
           f"{' (paged)' if should else ''}")
@@ -312,6 +451,12 @@ def main(argv=None):
                     help=f"KEY=VALUE config (default {DEFAULT_CONFIG})")
     ap.add_argument("--state", default=None,
                     help=f"state file (default {DEFAULT_STATE})")
+    ap.add_argument("--ledger", default=None,
+                    help=f"page ledger (default {LEDGER_NAME} beside the "
+                         "state file)")
+    ap.add_argument("--history", action="store_true",
+                    help=f"print the ledger's last {HISTORY_HOURS} h, one line "
+                         "per page, and exit (runs no probe)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the decision; publish and write nothing")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -320,7 +465,11 @@ def main(argv=None):
 
     cfg = load_config(args.config)
     state_path = os.path.expanduser(args.state) if args.state else cfg["state"]
-    return run(cfg, state_path, dry_run=args.dry_run, verbose=args.verbose)
+    ledger_file = ledger_path(cfg, state_path, args.ledger)
+    if args.history:
+        return print_history(ledger_file)
+    return run(cfg, state_path, dry_run=args.dry_run, verbose=args.verbose,
+               ledger_file=ledger_file)
 
 
 if __name__ == "__main__":
