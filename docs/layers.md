@@ -19,6 +19,19 @@ restart, health-check ≤ 30 s; on failure roll back to the previous
 commit and record `.deploy_failed` so a bad commit is never retried
 until something newer lands. A deploy is idempotent.
 
+## Action pins — what CI actually executes
+
+`action-pins` reads every `*.yml`/`*.yaml` under `.github/workflows`,
+prints one row per `uses:` with its ref type (`sha`, `tag`, `branch`,
+`digest`, `local`) and exits 1 when any ref can move. A major tag like
+`@v4` is a pointer its maintainer can retag, so the code running in this
+repo's CI can change without a commit here; only a full commit SHA is
+immovable. The gate runs in CI (`Action pin audit`) and is report-only
+otherwise — no unit, no state, no writes; the one thing it does is refuse
+a moving ref. It reads YAML the way YAML reads it: comments, quoted
+values, and `uses:`-looking text inside `run: |` blocks are handled, so
+the gate neither vouches for a comment nor faults a shell line.
+
 ## project-guard — the "no work is lost" engine
 
 Oneshot every 10 minutes. For each code directory under `$HOME` (and

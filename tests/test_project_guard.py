@@ -96,6 +96,53 @@ def test_path_patterns_and_nested_projects():
         assert "deny-list pattern" in _log(home)
 
 
+def test_read_only_upstream_is_skipped_not_called_diverged(tmp_path):
+    """A mirror of someone else's repo cannot be pushed to.
+
+    Before this, every sweep logged a false "diverged from origin? - needs a
+    human" for it (12k lines by 2026-11-19). gh is stubbed: logged in as pkia,
+    .permissions.push false for the upstream repo.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    proj = _project(str(home), "upstream-mirror")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "auth status") exit 0 ;;\n'
+        '  "api user") echo pkia; exit 0 ;;\n'
+        '  "api repos/"*) [ "$3" = "-q" ] && echo false; exit 0 ;;\n'
+        "esac\n"
+        "exit 1\n"
+    )
+    gh.chmod(0o755)
+    subprocess.run(["git", "-C", str(proj), "init", "-q", "-b", "main"], check=True)
+    subprocess.run(["git", "-C", str(proj), "remote", "add", "origin",
+                    "https://github.com/someone-else/upstream-mirror.git"], check=True)
+    subprocess.run(["git", "-C", str(proj), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True, env=dict(os.environ, **IDENTITY))
+    head_before = subprocess.run(["git", "-C", str(proj), "rev-parse", "HEAD"],
+                                 check=True, capture_output=True, text=True).stdout
+
+    env = dict(os.environ, GUARD_HOME=str(home), HOME=str(home), **IDENTITY)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    r = subprocess.run([str(SCRIPT)], capture_output=True, text=True,
+                       timeout=120, env=env)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+
+    log = _log(str(home))
+    assert "read-only (upstream mirror) - pushes skipped" in log
+    assert "needs a human" not in log
+    head_after = subprocess.run(["git", "-C", str(proj), "rev-parse", "HEAD"],
+                                check=True, capture_output=True, text=True).stdout
+    assert head_after == head_before, "no CI commit on a repo that can never take it"
+    assert (home / ".local/state/project-guard-readonly.state").exists()
+
+
 def test_existing_repo_is_still_backed_up_despite_a_deny_list_hit():
     """The deny-list filters adoption only — autosave must keep running."""
     with tempfile.TemporaryDirectory() as home:

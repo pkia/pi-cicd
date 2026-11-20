@@ -39,6 +39,7 @@ REQUIRED_COLUMNS = {"Unit", "Kind", "Schedule", "Config", "State", "Topic", "Ver
 # Every ## section docs/layers.md must carry.
 EXPECTED_LAYERS = {
     "Deploy",
+    "Action pins",
     "project-guard",
     "pipeline-check",
     "pi-doctor",

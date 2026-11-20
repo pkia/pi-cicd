@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -218,7 +219,54 @@ def test_alternation_pages_every_change(tmp_path):
         assert "healthy" in titles[3]
 
 
-def test_egress_failure_is_named_separately(tmp_path):
+def test_one_stalled_connect_is_retried_not_paged(tmp_path):
+    """A single blackholed connect is a flake, not an outage (2026-11-20).
+
+    Overnight the raw-IP probe hit its 6s timeout at 02:45 and 04:45 while
+    vpn-guard read the exit IP as protected in the same minute — so dns-check
+    retries once, and an OK reached on the retry says so.
+    """
+    lock = threading.Lock()
+    hits = {"n": 0}
+
+    class StallsOnce(BaseHTTPRequestHandler):
+        def do_GET(self):                            # noqa: N802
+            with lock:
+                hits["n"] += 1
+                n = hits["n"]
+            try:
+                if n == 1:
+                    time.sleep(4)        # past the 3s DNS_CHECK_TIMEOUT
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except (BrokenPipeError, ConnectionResetError):
+                pass                     # the timed-out first client is gone
+
+        def log_message(self, format, *args):
+            pass
+
+    probe = ThreadingHTTPServer(("127.0.0.1", 0), StallsOnce)
+    thread = threading.Thread(target=probe.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = probe.server_address[:2]
+        with Sink() as sink:
+            proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                      probe_url=f"http://{host}:{port}/")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "VERDICT: healthy" in proc.stdout
+        assert "(retry; first attempt failed)" in proc.stdout
+        assert hits["n"] == 2
+        assert read_state(state)["status"] == "healthy"
+    finally:
+        probe.shutdown()
+        probe.server_close()
+        thread.join(timeout=5)
+
+
+def test_both_probe_attempts_failing_still_exits_egress(tmp_path):
     """Names resolve, the raw-IP probe fails -> exit 2, its own title."""
     with Sink() as sink:
         proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
