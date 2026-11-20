@@ -323,7 +323,8 @@ echo "feed-fresh timer installed and active"
 # the 2026-11-16 outage (docs/incidents/2026-11-16-dns-outage.md): the profile
 # wrote a header-only /etc/resolv.conf, every hostname died, and nothing on the
 # box said so until Hermes failed to reach a model provider. The probe stays
-# read-only; dns-watch's only write is ~/.local/state/dns-watch/state.json.
+# read-only; dns-watch writes only its state file and the page ledger beside
+# it (~/.local/state/dns-watch/{state.json,pages.log}; `--history` reads them).
 # Paging needs its own /etc/dns-watch.conf (templates/dns-watch.conf.example);
 # without it the unit still runs and still fails on a broken verdict — it just
 # cannot page, which is the truthful state of the fast path until the owner

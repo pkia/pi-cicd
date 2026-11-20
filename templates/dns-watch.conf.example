@@ -14,6 +14,12 @@ NTFY_TOPIC=services
 # Where the last verdict is remembered (one small JSON, rewritten atomically).
 STATE=~/.local/state/dns-watch/state.json
 
+# The page ledger: one line per page — timestamp, verdict, exit code, whether
+# dns-check's retry was used. Default: pages.log beside STATE. `dns-watch
+# --history` prints the last 24 h; past LEDGER_MAX_LINES it rotates to .1.
+#LEDGER=~/.local/state/dns-watch/pages.log
+#LEDGER_MAX_LINES=2000
+
 # The probe. Absolute path if dns-check is not on the unit's PATH.
 DNS_CHECK=dns-check
 
