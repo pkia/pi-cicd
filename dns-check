@@ -22,7 +22,21 @@ TIMEOUT="${DNS_CHECK_TIMEOUT:-6}"
 RESOLV_CONF="${DNS_CHECK_RESOLV_CONF:-/etc/resolv.conf}"
 
 ip_ok=0
-curl -s -o /dev/null --max-time "$TIMEOUT" "$PROBE_URL" 2>/dev/null && ip_ok=1
+ip_tries=0
+# One retry before the verdict: a single dropped TCP connect over the VPN
+# tunnel paged "EGRESS BROKEN" at 02:45 and 04:45 on 2026-11-20 while
+# vpn-guard read the exit IP as protected in the same minute. A real outage
+# still fails both attempts, so the verdict semantics do not change.
+for attempt in 1 2; do
+    ip_tries=$attempt
+    if curl -s -o /dev/null --max-time "$TIMEOUT" "$PROBE_URL" 2>/dev/null; then
+        ip_ok=1
+        break
+    fi
+    [ "$attempt" = 1 ] && sleep 2
+done
+ip_note=""
+[ "$ip_ok" = 1 ] && [ "$ip_tries" = 2 ] && ip_note=" (retry; first attempt failed)"
 
 dns_ok=0
 getent hosts "$PROBE_HOST" >/dev/null 2>&1 && dns_ok=1
@@ -40,7 +54,7 @@ conn_dns() {
 
 printf 'dns-check  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ "$ip_ok" = 1 ]; then
-    printf '  IP egress   (%s, DNS not used) : OK\n' "$PROBE_URL"
+    printf '  IP egress   (%s, DNS not used) : OK%s\n' "$PROBE_URL" "$ip_note"
 else
     printf '  IP egress   (%s, DNS not used) : FAIL\n' "$PROBE_URL"
 fi
