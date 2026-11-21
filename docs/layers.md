@@ -110,12 +110,17 @@ feed nobody can fetch or date is never a pass).
 
 ## DNS watching — dns-check and dns-watch
 
-`dns-check` is the read-only verdict: it probes a raw-IP endpoint and one
+`dns-check` is the read-only verdict: it probes raw-IP endpoints and one
 hostname, and names which half broke — **DNS CONFIG BROKEN** (packets
-leave, names do not resolve: a resolver problem), **EGRESS BROKEN** (the
-raw-IP probe fails while names resolve) or **NO EGRESS** (both). When
-the resolver half fails it quotes `/etc/resolv.conf` and marks the
-header-only file that caused the 2026-11-16 outage
+leave, names do not resolve: a resolver problem), **EGRESS BROKEN** (every
+raw-IP endpoint fails while names resolve) or **NO EGRESS** (both). The IP
+half carries two endpoints on different networks, tried in order and over
+two passes: a single address that a route drops is a fallback (the OK line
+says `fallback` and names the endpoint that answered), a whole failed pass
+is the retry the 2026-11-20 overnight pages taught it to make, and only
+every endpoint failing both times is EGRESS — so one blackholed address is
+not an outage. When the resolver half fails it quotes `/etc/resolv.conf`
+and marks the header-only file that caused the 2026-11-16 outage
 (`docs/incidents/2026-11-16-dns-outage.md`), where NetworkManager wrote a
 nameserver-less file from a manual profile with an empty `ipv4.dns`. It
 prints the recovery commands and runs none of them.

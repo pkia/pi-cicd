@@ -9,34 +9,54 @@
 #
 # Exit: 0 healthy | 1 name resolution broken | 2 IP egress broken | 3 both
 #
-# Env overrides exist for testing: DNS_CHECK_URL (raw-IP endpoint),
+# Two raw-IP endpoints, on different networks, tried in order: one address
+# that a route or a firewall drops (a blackhole) is a fallback, not an
+# outage, and the verdict always names the endpoint that answered. The run
+# makes two passes over the list — a single stalled connect is a flake, as
+# the 2026-11-20 pages proved — and only a whole failed pass is a retry.
+#
+# Env overrides exist for testing: DNS_CHECK_URLS (ordered, space-separated
+# endpoint list; it wins over DNS_CHECK_URL), DNS_CHECK_URL (the older
+# single-endpoint spelling — the whole list when DNS_CHECK_URLS is unset),
 # DNS_CHECK_HOST (name that must resolve), DNS_CHECK_TIMEOUT,
 # DNS_CHECK_RESOLV_CONF (the file the verdict quotes; it never replaces
 # the resolver the box actually uses — getent still asks the real one).
 
 set -u
 
-PROBE_URL="${DNS_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
+DEFAULT_PROBE_URLS="https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/"
+PROBE_URLS="${DNS_CHECK_URLS:-${DNS_CHECK_URL:-$DEFAULT_PROBE_URLS}}"
 PROBE_HOST="${DNS_CHECK_HOST:-api.deepseek.com}"
 TIMEOUT="${DNS_CHECK_TIMEOUT:-6}"
 RESOLV_CONF="${DNS_CHECK_RESOLV_CONF:-/etc/resolv.conf}"
 
 ip_ok=0
 ip_tries=0
-# One retry before the verdict: a single dropped TCP connect over the VPN
-# tunnel paged "EGRESS BROKEN" at 02:45 and 04:45 on 2026-11-20 while
-# vpn-guard read the exit IP as protected in the same minute. A real outage
-# still fails both attempts, so the verdict semantics do not change.
-for attempt in 1 2; do
-    ip_tries=$attempt
-    if curl -s -o /dev/null --max-time "$TIMEOUT" "$PROBE_URL" 2>/dev/null; then
-        ip_ok=1
-        break
-    fi
-    [ "$attempt" = 1 ] && sleep 2
+ip_url=""
+ip_failures=0
+for pass in 1 2; do
+    failed=0
+    for url in $PROBE_URLS; do
+        if curl -s -o /dev/null --max-time "$TIMEOUT" "$url" 2>/dev/null; then
+            ip_ok=1
+            ip_url="$url"
+            ip_tries=$pass
+            ip_failures=$failed
+            break
+        fi
+        failed=$((failed + 1))
+    done
+    [ "$ip_ok" = 1 ] && break
+    [ "$pass" = 1 ] && sleep 2
 done
 ip_note=""
-[ "$ip_ok" = 1 ] && [ "$ip_tries" = 2 ] && ip_note=" (retry; first attempt failed)"
+if [ "$ip_ok" = 1 ]; then
+    if [ "$ip_tries" = 2 ]; then
+        ip_note=" (retry; first attempt failed)"
+    elif [ "$ip_failures" -gt 0 ]; then
+        ip_note=" (fallback; $ip_failures endpoint(s) failed first)"
+    fi
+fi
 
 dns_ok=0
 getent hosts "$PROBE_HOST" >/dev/null 2>&1 && dns_ok=1
@@ -54,9 +74,12 @@ conn_dns() {
 
 printf 'dns-check  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ "$ip_ok" = 1 ]; then
-    printf '  IP egress   (%s, DNS not used) : OK%s\n' "$PROBE_URL" "$ip_note"
+    printf '  IP egress   (%s, DNS not used) : OK%s\n' "$ip_url" "$ip_note"
 else
-    printf '  IP egress   (%s, DNS not used) : FAIL\n' "$PROBE_URL"
+    printf '  IP egress   (no endpoint answered, DNS not used) : FAIL\n'
+    for url in $PROBE_URLS; do
+        printf '                tried %s\n' "$url"
+    done
 fi
 if [ "$dns_ok" = 1 ]; then
     printf '  resolution  (%s) : OK\n' "$PROBE_HOST"
@@ -101,7 +124,10 @@ fi
 if [ "$dns_ok" = 1 ]; then
     echo
     echo "  VERDICT: odd — names resolve but the raw-IP probe failed."
-    echo "  Check the probe endpoint ($PROBE_URL) and its firewall/tunnel path."
+    echo "  Check the probe endpoints and their firewall/tunnel path:"
+    for url in $PROBE_URLS; do
+        echo "    $url"
+    done
     exit 2
 fi
 
@@ -111,6 +137,7 @@ echo "  Likely the tunnel or the link, not DNS. Check, in order:"
 echo "    systemctl status wg-quick@wgsurf0 vpn-guard.timer"
 echo "    cat /run/vpn-guard/status.json"
 echo "    ip -4 addr show eth0 ; ip route"
+echo "  Endpoints tried (all of them failed): $PROBE_URLS"
 echo "  (The Surfshark kill switch blacks out IPv4/IPv6 egress while the tunnel"
 echo "  is down, so a dead tunnel looks exactly like this.)"
 exit 3

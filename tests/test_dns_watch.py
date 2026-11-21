@@ -1,10 +1,10 @@
 """dns-watch — the timer half of dns-check, proven by execution.
 
 Every test drives the real CLIs in a subprocess: dns-watch as the unit
-runs it, dns-check with its own documented env overrides (DNS_CHECK_URL,
-DNS_CHECK_HOST, DNS_CHECK_TIMEOUT, DNS_CHECK_RESOLV_CONF), and a local
-HTTP sink standing in for ntfy. Nothing here touches the network beyond
-loopback, and nothing writes outside tmp_path.
+runs it, dns-check with its own documented env overrides (DNS_CHECK_URLS,
+DNS_CHECK_URL, DNS_CHECK_HOST, DNS_CHECK_TIMEOUT, DNS_CHECK_RESOLV_CONF),
+and a local HTTP sink standing in for ntfy. Nothing here touches the
+network beyond loopback, and nothing writes outside tmp_path.
 
 The acceptance pair from the board's 11-18 row lives in
 test_first_broken_run_pages_once / test_five_more_broken_runs_stay_silent
@@ -13,7 +13,11 @@ test_probe_source_is_read_only + test_probe_run_leaves_tree_byte_identical,
 and the 11-20 page ledger in test_six_changes_write_six_ledger_lines /
 test_unchanged_runs_leave_the_ledger_byte_identical /
 test_ledger_rotates_at_its_cap_instead_of_growing /
-test_history_on_an_empty_ledger_prints_a_dated_header.
+test_history_on_an_empty_ledger_prints_a_dated_header. The 11-21
+two-endpoint row lives in test_one_blackholed_endpoint_is_a_fallback /
+test_both_endpoints_refused_is_egress /
+test_both_endpoints_refused_twice_pages_once /
+test_default_list_probes_two_endpoints_over_two_passes.
 """
 
 import hashlib
@@ -103,7 +107,7 @@ class Sink:
 
 
 def write_env(tmp_path, sink_url, *, host, resolv=HEADER_ONLY,
-              probe_url=None, extra="", dns_check=None):
+              probe_url=None, probe_urls=None, extra="", dns_check=None):
     """Config file + env for one dns-watch run, both inside tmp_path."""
     conf = tmp_path / "dns-watch.conf"
     lines = [f"NTFY_URL={sink_url}", "NTFY_TOKEN=drill-token",
@@ -116,23 +120,30 @@ def write_env(tmp_path, sink_url, *, host, resolv=HEADER_ONLY,
     resolv_file = tmp_path / "resolv.conf"
     resolv_file.write_text(resolv, encoding="utf-8")
     env = dict(os.environ)
+    # A developer's own override must never decide a test's verdict.
+    env.pop("DNS_CHECK_URL", None)
+    env.pop("DNS_CHECK_URLS", None)
     env.update({
-        "DNS_CHECK_URL": probe_url or (sink_url + "/ip"),
         "DNS_CHECK_HOST": host,
         "DNS_CHECK_TIMEOUT": "3",
         "DNS_CHECK_RESOLV_CONF": str(resolv_file),
         # The box's real mute file must never silence a test run.
         "NTFY_MUTE_FILE": str(tmp_path / "no-such-mute"),
     })
+    if probe_urls is not None:
+        env["DNS_CHECK_URLS"] = probe_urls
+    else:
+        env["DNS_CHECK_URL"] = probe_url or (sink_url + "/ip")
     return conf, env, resolv_file
 
 
 def run_tool(tmp_path, sink_url, *, host=HEALTHY_HOST, state=None,
              dry_run=False, resolv=HEADER_ONLY, probe_url=None,
-             dns_check=None, cwd=None, extra=""):
+             probe_urls=None, dns_check=None, cwd=None, extra=""):
     conf, env, resolv_file = write_env(
         tmp_path, sink_url, host=host, resolv=resolv,
-        probe_url=probe_url, dns_check=dns_check, extra=extra)
+        probe_url=probe_url, probe_urls=probe_urls, dns_check=dns_check,
+        extra=extra)
     state = state or (tmp_path / "state.json")
     argv = [str(TOOL), "--config", str(conf), "--state", str(state), "-v"]
     if dry_run:
@@ -281,6 +292,131 @@ def test_both_probe_attempts_failing_still_exits_egress(tmp_path):
         assert "EGRESS BROKEN" in sink.posts[0]["title"]
         assert "odd" in sink.posts[0]["message"]
         assert read_state(state)["status"] == "egress"
+
+
+# ------------------------------------------------------- two endpoints (11-21)
+
+# Nothing listens on port 1: the connect is refused, fast and deterministically.
+DEAD_ENDPOINT = "http://127.0.0.1:1/"
+
+
+def test_one_blackholed_endpoint_is_a_fallback(tmp_path):
+    """The row's headline: one dead address is not an outage.
+
+    The first endpoint refuses, the second answers -> healthy, and the line
+    names the endpoint that answered (never the one that did not).
+    """
+    with Sink() as sink:
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                  probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sink.posts == []                      # healthy, nothing to page
+        line = [l for l in proc.stdout.splitlines() if "IP egress" in l]
+        assert len(line) == 1, proc.stdout
+        assert sink.url + "/ip" in line[0]           # the working endpoint
+        assert DEAD_ENDPOINT not in line[0]
+        assert "fallback; 1 endpoint(s) failed first" in line[0]
+        assert "retry;" not in proc.stdout
+        assert read_state(state)["status"] == "healthy"
+
+
+def test_recovery_page_names_the_endpoint_that_answered(tmp_path):
+    """The page and the ledger carry the same answer as the console line.
+
+    A fault is already standing, then the probe recovers via its second
+    endpoint: one recovery page, and it names the endpoint that answered.
+    A fallback is not a retry, so the ledger's column stays honest.
+    """
+    with Sink() as sink:
+        run_tool(tmp_path, sink.url, host=BROKEN_HOST)      # page 1
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                  probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert len(sink.posts) == 2
+        assert "healthy" in sink.posts[1]["title"]
+        assert sink.url + "/ip" in sink.posts[1]["message"]
+        lines = ledger_lines(ledger_of(state))
+    assert len(lines) == 2, lines
+    assert lines[1].split()[1] == "healthy"
+    assert "rc=0" in lines[1]
+    assert "retry=no" in lines[1]
+
+
+def test_both_endpoints_refused_is_egress(tmp_path):
+    """Both refused -> EGRESS, and the verdict names every endpoint tried."""
+    with Sink() as sink:
+        proc, state, _ = run_tool(
+            tmp_path, sink.url, host=HEALTHY_HOST,
+            probe_urls=f"{DEAD_ENDPOINT} http://127.0.0.1:2/")
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert len(sink.posts) == 1
+        assert "EGRESS BROKEN" in sink.posts[0]["title"]
+        for url in (DEAD_ENDPOINT, "http://127.0.0.1:2/"):
+            assert url in proc.stdout
+        assert read_state(state)["status"] == "egress"
+
+
+def test_both_endpoints_refused_twice_pages_once(tmp_path):
+    """Two runs, both endpoints dead both times: one page, not two."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(2):
+            proc, state, _ = run_tool(
+                tmp_path, sink.url, host=HEALTHY_HOST,
+                probe_urls=f"{DEAD_ENDPOINT} http://127.0.0.1:2/")
+            assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert len(sink.posts) == 1, [p["title"] for p in sink.posts]
+    assert read_state(state)["pages"] == 1
+
+
+def test_probe_urls_wins_over_the_single_url_spelling(tmp_path):
+    """Both env spellings set: the list decides, the old one is ignored."""
+    with Sink() as sink:
+        conf, env, _ = write_env(tmp_path, sink.url, host=HEALTHY_HOST,
+                                 probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip")
+        env["DNS_CHECK_URL"] = "http://127.0.0.1:2/"     # would fail on its own
+        proc = subprocess.run([str(PROBE)], env=env, cwd=str(REPO),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=120, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert sink.url + "/ip" in proc.stdout
+
+
+def test_default_list_probes_two_endpoints_over_two_passes(tmp_path):
+    """With no override the probe carries two endpoints on different networks
+    and makes two passes over both before it calls EGRESS.
+
+    Hermetic: a stub curl on PATH records the URL it was asked for and
+    fails; a stub getent answers, so the verdict is egress-only (rc 2).
+    Pins the default list itself — a changed endpoint is a reviewed change.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls.log"
+    stubs = {
+        "curl": ("#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n"
+                 f"printf '%s\\n' \"$last\" >> {calls}\nexit 7\n"),
+        "getent": "#!/bin/sh\nexit 0\n",
+    }
+    for name, body in stubs.items():
+        path = bindir / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+    conf, env, _ = write_env(tmp_path, "http://127.0.0.1:1", host=HEALTHY_HOST)
+    env.pop("DNS_CHECK_URL", None)
+    env.pop("DNS_CHECK_URLS", None)
+    env["PATH"] = f"{bindir}:/usr/bin:/bin"
+    proc = subprocess.run([str(PROBE)], env=env, cwd=str(tmp_path),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=60, check=False)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    urls = [line for line in calls.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    assert urls == ["https://1.1.1.1/cdn-cgi/trace", "https://8.8.8.8/",
+                    "https://1.1.1.1/cdn-cgi/trace", "https://8.8.8.8/"], urls
+    assert "no endpoint answered" in proc.stdout
+    for url in urls[:2]:
+        assert f"tried {url}" in proc.stdout
 
 
 def test_dry_run_publishes_and_writes_nothing(tmp_path):
