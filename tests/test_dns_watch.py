@@ -6,10 +6,14 @@ DNS_CHECK_HOST, DNS_CHECK_TIMEOUT, DNS_CHECK_RESOLV_CONF), and a local
 HTTP sink standing in for ntfy. Nothing here touches the network beyond
 loopback, and nothing writes outside tmp_path.
 
-The acceptance pair from the board row lives in
+The acceptance pair from the board's 11-18 row lives in
 test_first_broken_run_pages_once / test_five_more_broken_runs_stay_silent
-/ test_recovery_pages_once, and the read-only half in
-test_probe_source_is_read_only + test_probe_run_leaves_tree_byte_identical.
+/ test_recovery_pages_once, the read-only half in
+test_probe_source_is_read_only + test_probe_run_leaves_tree_byte_identical,
+and the 11-20 page ledger in test_six_changes_write_six_ledger_lines /
+test_unchanged_runs_leave_the_ledger_byte_identical /
+test_ledger_rotates_at_its_cap_instead_of_growing /
+test_history_on_an_empty_ledger_prints_a_dated_header.
 """
 
 import hashlib

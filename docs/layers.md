@@ -124,9 +124,15 @@ prints the recovery commands and runs none of them.
 **pages one ntfy message only when the verdict changes** — a standing
 failure is one message, not one an hour, and a recovery gets its own
 "healthy" page. The first healthy run on an empty state is silent (a
-fresh install is not news); the first broken one pages. Its only write is
-`~/.local/state/dns-watch/state.json`, written atomically; `--dry-run`
-publishes and writes nothing. The unit's exit code is dns-check's verdict
+fresh install is not news); the first broken one pages. Its writes are
+`~/.local/state/dns-watch/state.json`, written atomically, and the page
+ledger `pages.log` beside it — **one line per page** (timestamp, verdict,
+exit code, whether the probe's retry was used), rotating to `pages.log.1`
+at `LEDGER_MAX_LINES` (default 2000) so it never grows without limit.
+`dns-watch --history` prints the last 24 h one line each, reading both
+generations, and exits 0 on an empty ledger — so "it flapped four times
+overnight" is a list, not a `pages` counter. `--dry-run` publishes and
+writes neither file. The unit's exit code is dns-check's verdict
 (1/2/3 when broken) or 4 when the probe itself could not run, so the
 daily pi-doctor audit also names a broken box even if the page is muted
 or unconfigured. Paging needs `/etc/dns-watch.conf`
