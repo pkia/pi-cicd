@@ -17,7 +17,12 @@ test_history_on_an_empty_ledger_prints_a_dated_header. The 11-21
 two-endpoint row lives in test_one_blackholed_endpoint_is_a_fallback /
 test_both_endpoints_refused_is_egress /
 test_both_endpoints_refused_twice_pages_once /
-test_default_list_probes_two_endpoints_over_two_passes.
+test_default_list_probes_two_endpoints_over_two_passes, and the 11-22
+record-every-run row in test_a_three_hour_old_run_is_stale /
+test_a_fresh_run_passes /
+test_a_missing_state_file_is_unmeasurable_not_fresh /
+test_a_state_file_the_tool_cannot_date_is_unmeasurable /
+test_history_prints_the_age_of_the_newest_run.
 """
 
 import hashlib
@@ -569,6 +574,7 @@ def test_ledger_rotates_at_its_cap_instead_of_growing(tmp_path):
 def test_history_on_an_empty_ledger_prints_a_dated_header(tmp_path):
     ledger = tmp_path / "nothing-yet.log"
     proc = subprocess.run([str(TOOL), "--config", str(tmp_path / "no.conf"),
+                           "--state", str(tmp_path / "state.json"),
                            "--ledger", str(ledger), "--history"],
                           env=dict(os.environ), cwd=str(tmp_path),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -592,6 +598,7 @@ def test_history_shows_the_last_24h_across_both_generations(tmp_path):
     Path(str(ledger) + ".1").write_text(
         f"{fresh}  healthy      rc=0    retry=yes\n", encoding="utf-8")
     proc = subprocess.run([str(TOOL), "--config", str(tmp_path / "no.conf"),
+                           "--state", str(tmp_path / "state.json"),
                            "--ledger", str(ledger), "--history"],
                           env=dict(os.environ), cwd=str(tmp_path),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -613,6 +620,7 @@ def test_history_runs_no_probe(tmp_path):
     conf = tmp_path / "dns-watch.conf"
     conf.write_text("DNS_CHECK=/no/such/probe\n", encoding="utf-8")
     proc = subprocess.run([str(TOOL), "--config", str(conf),
+                           "--state", str(tmp_path / "state.json"),
                            "--ledger", str(ledger), "--history"],
                           env=dict(os.environ), cwd=str(tmp_path),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -796,3 +804,174 @@ def test_watch_run_writes_only_its_state(tmp_path):
     assert snapshot(tree) == before
     assert not str(state).startswith(str(tree))
     assert Path(state).is_file()
+
+
+# ------------------------------------------- the run's age and --stale verdict
+# The 11-22 row: an empty ledger is ambiguous — "nothing changed" and "the
+# timer stopped firing three days ago" look identical on disk. `checked_at`
+# advances on every run that saves state, so the newest run's age is the fact
+# that tells them apart: --history prints it, --stale turns it into an exit
+# code the morning audit can read.
+
+def write_run_state(path, hours_ago=0.0, **extra):
+    """A state file as `run()` writes it, stamped `hours_ago` in the past."""
+    now = datetime.now(timezone.utc)
+    record = {
+        "status": "healthy",
+        "exit_code": 0,
+        "since": (now - timedelta(hours=9)).isoformat(timespec="seconds"),
+        "checked_at": (now - timedelta(hours=hours_ago))
+        .isoformat(timespec="seconds"),
+        "pages": 0,
+    }
+    record.update(extra)
+    Path(path).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n",
+                          encoding="utf-8")
+    return record
+
+
+def reader(tmp_path, *flags, state=None, conf=None):
+    """`dns-watch --history/--stale` — no sink, no probe, no live env."""
+    argv = [str(TOOL), "--config", str(conf or (tmp_path / "no.conf"))]
+    if state is not None:
+        argv += ["--state", str(state)]
+    argv += list(flags)
+    return subprocess.run(argv, env=dict(os.environ), cwd=str(tmp_path),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=60, check=False)
+
+
+def test_a_three_hour_old_run_is_stale(tmp_path):
+    """The row's headline: three hours with no run is a fault, not silence."""
+    state = tmp_path / "state.json"
+    write_run_state(state, hours_ago=3.5)
+    before = state.read_bytes()
+    proc = reader(tmp_path, "--stale", state=state)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "STALE — newest run 3.5 h ago" in proc.stderr
+    assert "limit 2 h" in proc.stderr
+    assert str(state) in proc.stderr           # names what it measured
+    assert proc.stdout == ""                   # a fault never reads as OK
+    assert state.read_bytes() == before        # a reader writes nothing
+
+
+def test_a_fresh_run_passes(tmp_path):
+    state = tmp_path / "state.json"
+    write_run_state(state, hours_ago=0.4)
+    proc = reader(tmp_path, "--stale", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == (
+        "dns-watch: OK — newest run 0.4 h ago, limit 2 h"), proc.stdout
+    assert proc.stderr == ""
+
+
+def test_a_missing_state_file_is_unmeasurable_not_fresh(tmp_path):
+    """The whole point of the row: no state is `cannot measure`, not `fine`."""
+    state = tmp_path / "never-written.json"
+    proc = reader(tmp_path, "--stale", state=state)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "UNMEASURABLE" in proc.stderr
+    assert str(state) in proc.stderr
+    assert proc.stdout == ""
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("content, named", [
+    ("{not json", "is not JSON"),
+    ('["a list"]', "is not an object"),
+    ('{"status": "healthy"}', "carries no checked_at"),
+    ('{"checked_at": "yesterday"}', "unparseable checked_at"),
+])
+def test_a_state_file_the_tool_cannot_date_is_unmeasurable(tmp_path, content,
+                                                           named):
+    state = tmp_path / "state.json"
+    state.write_text(content, encoding="utf-8")
+    proc = reader(tmp_path, "--stale", state=state)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "UNMEASURABLE" in proc.stderr and named in proc.stderr
+    assert str(state) in proc.stderr
+
+
+def test_stale_after_moves_the_limit_and_config_sets_the_default(tmp_path):
+    state = tmp_path / "state.json"
+    write_run_state(state, hours_ago=3.5)
+    lenient = reader(tmp_path, "--stale-after", "4", state=state)
+    assert lenient.returncode == 0, lenient.stdout + lenient.stderr
+    assert "limit 4 h" in lenient.stdout
+    strict = reader(tmp_path, "--stale-after", "1", state=state)
+    assert strict.returncode == 1, strict.stdout + strict.stderr
+    assert "limit 1 h" in strict.stderr
+    # The flag's bare form reads the config, not a hardcoded 2 h.
+    conf = tmp_path / "dns-watch.conf"
+    conf.write_text("STALE_AFTER_HOURS=5\n", encoding="utf-8")
+    configured = reader(tmp_path, "--stale", state=state, conf=conf)
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    assert "limit 5 h" in configured.stdout
+
+
+def test_a_bad_stale_after_is_refused(tmp_path):
+    state = tmp_path / "state.json"
+    write_run_state(state, hours_ago=0.1)
+    proc = reader(tmp_path, "--stale-after", "0", state=state)
+    assert proc.returncode == 2
+    assert "must be greater than zero" in proc.stderr
+
+
+def test_a_future_stamp_is_not_stale(tmp_path):
+    """A clock that stepped back must not page as a dead timer."""
+    state = tmp_path / "state.json"
+    write_run_state(state, hours_ago=-1.0)
+    proc = reader(tmp_path, "--stale", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "-1.0 h ago" in proc.stdout
+
+
+def test_history_prints_the_age_of_the_newest_run(tmp_path):
+    """The row's other half: the reading, without changing --history's exit."""
+    state = tmp_path / "state.json"
+    record = write_run_state(state, hours_ago=3.5)
+    ledger = tmp_path / "pages.log"
+    proc = reader(tmp_path, "--history", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"newest run: {record['checked_at']} (3.5 h ago)" in proc.stdout
+    assert "0 page(s) in the last 24 h" in proc.stdout
+    assert not ledger.exists()                 # --history writes nothing
+    # The age line sits above the ledger lines, not buried in the summary.
+    assert proc.stdout.index("newest run:") < proc.stdout.index("0 page(s)")
+
+
+def test_history_names_a_missing_state_file_instead_of_guessing(tmp_path):
+    state = tmp_path / "absent.json"
+    proc = reader(tmp_path, "--history", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "newest run: none —" in proc.stdout
+    assert str(state) in proc.stdout
+
+
+def test_the_readers_run_no_probe_and_write_nothing(tmp_path):
+    """Both readers are cheap and inert: a broken DNS_CHECK cannot matter."""
+    state = tmp_path / "state.json"
+    write_run_state(state, hours_ago=3.5)
+    ledger = tmp_path / "pages.log"
+    ledger.write_text(
+        f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+        "  healthy      rc=0    retry=no\n", encoding="utf-8")
+    conf = tmp_path / "dns-watch.conf"
+    conf.write_text("DNS_CHECK=/no/such/probe\n", encoding="utf-8")
+
+    def snapshot():
+        return {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                for p in (state, ledger)}
+
+    before = snapshot()
+    stale = reader(tmp_path, "--stale", state=state, conf=conf)
+    history = reader(tmp_path, "--history", state=state, conf=conf)
+    both = reader(tmp_path, "--history", "--stale", state=state, conf=conf)
+    assert stale.returncode == 1
+    assert history.returncode == 0
+    assert both.returncode == 1                 # the verdict decides the exit
+    assert "newest run:" in both.stdout         # and the history still prints
+    assert snapshot() == before
+    assert not (tmp_path / "state.json.tmp").exists()
+    assert "could not run" not in (stale.stderr + history.stdout
+                                   + both.stderr)

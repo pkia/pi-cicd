@@ -136,8 +136,16 @@ exit code, whether the probe's retry was used), rotating to `pages.log.1`
 at `LEDGER_MAX_LINES` (default 2000) so it never grows without limit.
 `dns-watch --history` prints the last 24 h one line each, reading both
 generations, and exits 0 on an empty ledger — so "it flapped four times
-overnight" is a list, not a `pages` counter. `--dry-run` publishes and
-writes neither file. The unit's exit code is dns-check's verdict
+overnight" is a list, not a `pages` counter. Since the ledger records
+*pages*, a quiet night is byte-identical to a timer that stopped firing, so
+`--history` also prints the newest run's own `checked_at` age, and
+`dns-watch --stale` turns that age into one line and one exit code — 0
+fresh, 1 STALE, 2 unmeasurable (a missing or unreadable state file names
+its path; "cannot measure" is not a pass), limit `STALE_AFTER_HOURS`
+(default 2 h against the hourly timer) or `--stale-after HOURS`. Both
+readers run no probe and write nothing, so the morning audit can call
+`--stale` cheaply. `--dry-run` publishes and writes neither file. The
+unit's exit code is dns-check's verdict
 (1/2/3 when broken) or 4 when the probe itself could not run, so the
 daily pi-doctor audit also names a broken box even if the page is muted
 or unconfigured. Paging needs `/etc/dns-watch.conf`
