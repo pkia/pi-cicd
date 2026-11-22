@@ -24,7 +24,8 @@
 
 set -u
 
-PROBE_URLS="${DNS_CHECK_URLS:-${DNS_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/}}"
+DEFAULT_PROBE_URLS="https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/"
+PROBE_URLS="${DNS_CHECK_URLS:-${DNS_CHECK_URL:-$DEFAULT_PROBE_URLS}}"
 PROBE_HOST="${DNS_CHECK_HOST:-api.deepseek.com}"
 TIMEOUT="${DNS_CHECK_TIMEOUT:-6}"
 RESOLV_CONF="${DNS_CHECK_RESOLV_CONF:-/etc/resolv.conf}"

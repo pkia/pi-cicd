@@ -20,6 +20,11 @@ STATE=~/.local/state/dns-watch/state.json
 #LEDGER=~/.local/state/dns-watch/pages.log
 #LEDGER_MAX_LINES=2000
 
+# How old the newest run may be before `dns-watch --stale` calls the timer
+# dead. The timer is hourly, so 2 h means a fire was missed. `--stale` exits
+# 0 fresh / 1 STALE / 2 unmeasurable (missing or unreadable state).
+#STALE_AFTER_HOURS=2
+
 # The probe. Absolute path if dns-check is not on the unit's PATH.
 DNS_CHECK=dns-check
 

@@ -24,11 +24,24 @@ a standing failure must not page every hour, and a recovery must not be
 silent.
 
     dns-watch [--config FILE] [--state FILE] [--ledger FILE] [--dry-run] [-v]
-    dns-watch --history [--ledger FILE]
+    dns-watch --history [--state FILE] [--ledger FILE]
+    dns-watch --stale [--stale-after HOURS] [--state FILE]
 
 Verdict states: healthy | dns | egress | both | probe-error, mapped from
 dns-check's own codes (0/1/2/3; anything else — a missing interpreter, a
 kill — is probe-error, named with the rc).
+
+Every run that saves state stamps `checked_at`, so the age of the newest
+run is a fact on disk even when nothing paged — the two readers that make
+it visible without a ledger line:
+
+  * `--history` prints `newest run: <stamp> (<age> ago)` above the page
+    lines (exit 0 as before, writes nothing);
+  * `--stale` (limit from `STALE_AFTER_HOURS`, default 2 h) prints one
+    line and exits 0 fresh / 1 STALE / 2 unmeasurable — a missing or
+    unreadable state file names its path rather than reading as fresh,
+    because "cannot measure" is not a pass. It runs no probe and writes
+    nothing, so the morning audit can call it cheaply.
 
 Exit codes: dns-check's verdict passes through unchanged (0 healthy,
 1 resolution broken, 2 egress broken, 3 both), and **4** when the probe
@@ -48,6 +61,7 @@ KEY=VALUE, `#` comments, last occurrence wins — parse_env_lists' rule):
     STATE=~/.local/state/dns-watch/state.json
     LEDGER=~/.local/state/dns-watch/pages.log   # default: beside STATE
     LEDGER_MAX_LINES=2000        # past this, pages.log -> pages.log.1
+    STALE_AFTER_HOURS=2          # --stale's limit (hourly timer: 2 misses)
     DNS_CHECK=dns-check          # absolute path if not on PATH
     TIMEOUT_SECS=15              # publish timeout, never unbounded
 """
@@ -77,6 +91,10 @@ PROBE_TIMEOUT = 120
 LEDGER_NAME = "pages.log"
 DEFAULT_LEDGER_MAX = 2000
 HISTORY_HOURS = 24
+
+#: `--stale`'s default limit. The timer fires hourly, so two hours without a
+#: run means a fire was missed (a reboot, a masked timer, a dead manager).
+DEFAULT_STALE_AFTER = 2.0
 
 #: dns-check's own retry note (`dns-check`, the IP egress line). Duplicated
 #: in another language on purpose: a test drives the real probe through a
@@ -131,6 +149,8 @@ def load_config(path):
         "state": os.path.expanduser(cfg.get("STATE") or DEFAULT_STATE),
         "ledger": os.path.expanduser(cfg.get("LEDGER") or ""),
         "ledger_max": _count(cfg.get("LEDGER_MAX_LINES"), DEFAULT_LEDGER_MAX),
+        "stale_after": _number(cfg.get("STALE_AFTER_HOURS"),
+                               DEFAULT_STALE_AFTER),
         "dns_check": cfg.get("DNS_CHECK") or DEFAULT_DNS_CHECK,
         "timeout": _number(cfg.get("TIMEOUT_SECS"), DEFAULT_TIMEOUT),
     }
@@ -151,6 +171,17 @@ def _count(value, default):
     except (TypeError, ValueError):
         return default
     return number if number > 0 else default
+
+
+def _hours(value):
+    """argparse type for --stale-after: a positive number of hours."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return number
 
 
 # ----------------------------------------------------------------- state
@@ -253,12 +284,73 @@ def parse_ledger_line(line):
     return (stamp, parts[1], parts[2][3:], parts[3][6:])
 
 
-def print_history(path, now=None, hours=HISTORY_HOURS):
+def newest_run(state_path):
+    """The state file's own run stamp. -> (stamp, None) or (None, reason).
+
+    Every run that saves state writes `checked_at`, so this is the one fact
+    that only advances when the timer actually fires — the ledger records
+    pages, and a quiet night is byte-identical to a dead timer's.
+    """
+    path = Path(state_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, (f"no readable state file at {state_path} "
+                      f"({exc.strerror or exc})")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None, f"state file at {state_path} is not JSON"
+    if not isinstance(data, dict):
+        return None, f"state file at {state_path} is not an object"
+    stamped = data.get("checked_at")
+    if not stamped:
+        return None, f"state file at {state_path} carries no checked_at"
+    try:
+        stamp = datetime.fromisoformat(str(stamped))
+    except ValueError:
+        return None, (f"state file at {state_path} carries an unparseable "
+                      f"checked_at {stamped!r}")
+    if stamp.tzinfo is None:                 # a hand-edited file: read as UTC
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp, None
+
+
+def format_age(stamp, now):
+    """`0.4 h ago` — signed, so a clock that stepped back is visible."""
+    return f"{(now - stamp).total_seconds() / 3600.0:.1f} h ago"
+
+
+def stale_verdict(state_path, limit_hours, now=None):
+    """One line, one exit code: 0 fresh, 1 STALE, 2 unmeasurable. Writes
+    nothing and runs no probe (feed-fresh's contract, same family)."""
+    now = now or datetime.now(timezone.utc)
+    stamp, reason = newest_run(state_path)
+    if stamp is None:
+        print(f"dns-watch: UNMEASURABLE — {reason}", file=sys.stderr)
+        return 2
+    age = format_age(stamp, now)
+    if (now - stamp).total_seconds() / 3600.0 >= limit_hours:
+        print(f"dns-watch: STALE — newest run {age}, limit "
+              f"{limit_hours:g} h ({state_path})", file=sys.stderr)
+        return 1
+    print(f"dns-watch: OK — newest run {age}, limit {limit_hours:g} h")
+    return 0
+
+
+def print_history(path, state_path=None, now=None, hours=HISTORY_HOURS):
     """`--history`: the last `hours` of pages, one line each. Writes nothing."""
     now = now or datetime.now(timezone.utc)
     window = now - timedelta(hours=hours)
     print(f"dns-watch page ledger — {now.isoformat(timespec='seconds')} "
           f"(last {hours} h, since {window.isoformat(timespec='seconds')})")
+    if state_path is not None:
+        stamp, reason = newest_run(state_path)
+        if stamp is None:
+            print(f"newest run: none — {reason}")
+        else:
+            print(f"newest run: {stamp.isoformat(timespec='seconds')} "
+                  f"({format_age(stamp, now)})")
     lines = read_ledger(str(path) + ".1") + read_ledger(path)
     shown = unreadable = 0
     for line in lines:
@@ -456,7 +548,16 @@ def main(argv=None):
                          "state file)")
     ap.add_argument("--history", action="store_true",
                     help=f"print the ledger's last {HISTORY_HOURS} h, one line "
-                         "per page, and exit (runs no probe)")
+                         "per page, and the newest run's age, then exit "
+                         "(runs no probe)")
+    ap.add_argument("--stale", action="store_true",
+                    help="print one line on the newest run's age and exit "
+                         "0 fresh / 1 stale / 2 unmeasurable (no probe, no "
+                         "writes)")
+    ap.add_argument("--stale-after", type=_hours, default=None,
+                    metavar="HOURS",
+                    help="--stale with this limit instead of "
+                         f"STALE_AFTER_HOURS ({DEFAULT_STALE_AFTER:g} h)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the decision; publish and write nothing")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -466,8 +567,14 @@ def main(argv=None):
     cfg = load_config(args.config)
     state_path = os.path.expanduser(args.state) if args.state else cfg["state"]
     ledger_file = ledger_path(cfg, state_path, args.ledger)
+    if args.stale or args.stale_after is not None:
+        limit = args.stale_after if args.stale_after is not None \
+            else cfg["stale_after"]
+        if args.history:
+            print_history(ledger_file, state_path)
+        return stale_verdict(state_path, limit)
     if args.history:
-        return print_history(ledger_file)
+        return print_history(ledger_file, state_path)
     return run(cfg, state_path, dry_run=args.dry_run, verbose=args.verbose,
                ledger_file=ledger_file)
 
