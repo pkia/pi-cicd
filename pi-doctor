@@ -585,6 +585,16 @@ def _dns_watch_tool():
     return beside if os.path.isfile(beside) else None
 
 
+def _detail(line):
+    """dns-watch's line without the verdict word the finding prefix already
+    carries (`STALE — newest run …` -> `newest run …`). Wording drift only
+    costs a doubled word, never the age/limit/path the finding needs."""
+    head, sep, rest = line.partition(" — ")
+    if sep and head.strip().upper() in ("STALE", "UNMEASURABLE"):
+        return rest.strip()
+    return line
+
+
 def check_dns_watch(tool=None, state=None):
     """Is the hourly dns verdict still being written? -> (findings, fixes).
 
