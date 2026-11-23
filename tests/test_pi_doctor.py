@@ -704,3 +704,132 @@ def test_ais_catcher_stale_death_is_still_revived(tmp_path, monkeypatch):
     assert state["started"] == 1
     assert any("revived" in s for s in x), x
 
+
+# ------------------------------------------------ dns-watch freshness
+# The daily audit reads dns-watch's own `--stale` verdict; these tests drive
+# the REAL dns-watch against state fixtures, so the rule (and its wording)
+# is the tool's, not a second copy here.
+
+def _dns_state(tmp_path, hours, name="dns-state.json"):
+    from datetime import datetime, timedelta, timezone
+    p = tmp_path / name
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours)
+    p.write_text(json.dumps({"verdict": "healthy",
+                             "checked_at": stamp.isoformat(timespec="seconds")}))
+    return p
+
+
+def test_stale_dns_verdict_names_age_limit_and_path(tmp_path):
+    import re
+    state = _dns_state(tmp_path, 3.5)
+    findings, fixes = doc.check_dns_watch(state=str(state))
+    assert fixes == []
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.startswith("sys:dns-watch-stale — "), f
+    assert "3.5 h ago" in f                         # the age
+    assert re.search(r"limit \d+(\.\d+)? h", f), f  # the limit
+    assert str(state) in f                          # the state path
+    assert "— STALE —" not in f                     # prefix carries the verdict
+    report = doc.format_report(findings, [], None)
+    assert "Needs attention:" in report and "dns-watch-stale" in report
+
+
+def test_fresh_dns_verdict_adds_nothing(tmp_path):
+    state = _dns_state(tmp_path, 0.4)
+    assert doc.check_dns_watch(state=str(state)) == ([], [])
+    report = doc.format_report([], [], None)
+    assert "dns-watch" not in report and "All projects healthy" in report
+
+
+def test_missing_dns_state_is_a_fault_never_a_pass(tmp_path):
+    missing = tmp_path / "gone.json"
+    findings, fixes = doc.check_dns_watch(state=str(missing))
+    assert fixes == []
+    assert len(findings) == 1
+    assert findings[0].startswith("sys:dns-watch-unmeasurable — "), findings
+    assert str(missing) in findings[0]
+    assert doc._key(findings[0]) == "sys:dns-watch-unmeasurable"
+
+
+def test_unreadable_dns_state_is_a_fault_naming_the_path(tmp_path):
+    junk = tmp_path / "junk.json"
+    junk.write_text("{not json")
+    findings, _ = doc.check_dns_watch(state=str(junk))
+    assert len(findings) == 1
+    assert findings[0].startswith("sys:dns-watch-unmeasurable — "), findings
+    assert str(junk) in findings[0] and "not JSON" in findings[0]
+
+
+def test_missing_dns_watch_tool_is_a_fault(monkeypatch):
+    monkeypatch.setattr(doc, "_dns_watch_tool", lambda: None)
+    findings, _ = doc.check_dns_watch()
+    assert len(findings) == 1
+    assert findings[0].startswith("sys:dns-watch-missing — "), findings
+    assert doc._key(findings[0]) == "sys:dns-watch-missing"
+
+
+def test_dns_watch_finding_key_survives_a_moving_age():
+    """The 6 h alert dedupe keys on the finding's prefix; an age that ticks
+    must not re-page every day."""
+    a = doc._key("sys:dns-watch-stale — newest run 2.6 h ago, limit 2 h (/s)")
+    b = doc._key("sys:dns-watch-stale — newest run 9.9 h ago, limit 2 h (/s)")
+    assert a == b == "sys:dns-watch-stale"
+
+
+def _quiet_audit(monkeypatch, tmp_path):
+    """main() with every other check stubbed out, so only the new reader
+    can change the report. Returns the alert log."""
+    monkeypatch.setattr(sys, "argv", ["pi-doctor", "--verbose"])
+    monkeypatch.setenv("PI_DOCTOR_STATE", str(tmp_path / "doctor-state.json"))
+    monkeypatch.setattr(doc, "check_project", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(doc, "check_system", lambda: ([], []))
+    monkeypatch.setattr(doc, "check_sdr", lambda: ([], []))
+    monkeypatch.setattr(doc, "check_mute", lambda: ([], []))
+    monkeypatch.setattr(doc, "check_boot_timer", lambda: ([], []))
+    monkeypatch.setattr(doc, "check_dark_window", lambda *a, **k: (None, None))
+    monkeypatch.setattr(doc, "_recent_heals", lambda *a, **k: 0)
+    monkeypatch.setattr(doc, "check_rtk", lambda: [])
+    alerts = []
+    monkeypatch.setattr(doc, "send_alert", lambda s, b: alerts.append((s, b)))
+    return alerts
+
+
+def test_audit_prints_the_stale_verdict_and_repeats(tmp_path, monkeypatch,
+                                                     capsys):
+    state = _dns_state(tmp_path, 3.5)
+    alerts = _quiet_audit(monkeypatch, tmp_path)
+    monkeypatch.setenv(doc.DNS_WATCH_STATE_ENV, str(state))
+
+    assert doc.main() == 0
+    first = capsys.readouterr().out
+    lines = [x for x in first.splitlines() if "dns-watch" in x]
+    assert len(lines) == 1, first
+    assert "3.5 h ago" in lines[0] and str(state) in lines[0]
+    assert len(alerts) == 1                        # the fault was paged
+
+    # an unchanged box: same verdict line, and the 6 h dedupe keeps it quiet
+    assert doc.main() == 0
+    second = capsys.readouterr().out
+    assert [x for x in second.splitlines() if "dns-watch" in x] == lines
+    assert len(alerts) == 1
+
+
+def test_fresh_verdict_leaves_the_audit_byte_identical(tmp_path, monkeypatch,
+                                                       capsys):
+    """Acceptance: with a fresh verdict the rest of the report is exactly
+    today's — compared against the same audit with the new reader absent."""
+    _quiet_audit(monkeypatch, tmp_path)
+    monkeypatch.setenv(doc.DNS_WATCH_STATE_ENV, str(_dns_state(tmp_path, 0.4)))
+
+    assert doc.main() == 0
+    with_reader = capsys.readouterr().out
+    assert "dns-watch" not in with_reader
+
+    monkeypatch.setattr(doc, "check_dns_watch", lambda *a, **k: ([], []))
+    assert doc.main() == 0
+    without_reader = capsys.readouterr().out
+
+    # the header carries the run's minute; everything below it must match
+    assert with_reader.split("\n", 1)[1] == without_reader.split("\n", 1)[1]
+
