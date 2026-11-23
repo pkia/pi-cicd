@@ -30,7 +30,8 @@ Safe fixes applied automatically:
                                                decides revert vs fix-forward)
 
 System checks: disk %, CPU temp, memory, rpi-connect leak, AdGuard DNS,
-failed units, loop-heartbeat/doctor state health.
+failed units, dns-watch's freshness verdict (`--stale`), loop-heartbeat/
+doctor state health.
 
 Output: human report; exit 0 always (never breaks cron). Alerts only on
 actionable findings; all-green runs are silent except --verbose.
@@ -40,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -172,6 +174,17 @@ def run(cmd, timeout=60):
         return p.returncode, p.stdout.strip()
     except (OSError, subprocess.SubprocessError) as e:
         return 124, str(e)
+
+
+def run_full(cmd, timeout=60):
+    """Like `run`, but keeps stderr too — some verdicts live there
+    (`dns-watch --stale` prints STALE/UNMEASURABLE on stderr and exits
+    1/2, so a caller with only stdout sees an empty string)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 124, "", str(e)
 
 
 def _dns_resolves(host="example.com") -> bool:
@@ -544,6 +557,71 @@ def check_mute(mute_file=None):
     return [], []
 
 
+# ------------------------------------------------------ dns-watch freshness
+# The hourly dns verdict has an owner-side alarm (dns-watch pages on a
+# verdict change) and a timer-side failure (the unit exits 1/2), but a
+# *stopped timer* was invisible: a quiet night and a missing run are the
+# same bytes in the ledger. `dns-watch --stale` is the reading; this puts
+# it in the morning report, so a dead timer is a named finding instead of
+# a state file nobody opens.
+
+DNS_WATCH_STATE_ENV = "PI_DOCTOR_DNS_WATCH_STATE"
+DNS_WATCH_TOOL_ENV = "PI_DOCTOR_DNS_WATCH"
+
+
+def _dns_watch_tool():
+    """Find dns-watch: explicit override, then PATH, then the copy that
+    ships beside this script (realpath first, so the installed symlink
+    resolves to the repo next to both tools). A bare name alone is not
+    enough — it resolves here and dies on a runner (2026-11-18 lesson)."""
+    override = os.environ.get(DNS_WATCH_TOOL_ENV)
+    if override:
+        return override
+    found = shutil.which("dns-watch")
+    if found:
+        return found
+    beside = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "dns-watch")
+    return beside if os.path.isfile(beside) else None
+
+
+def check_dns_watch(tool=None, state=None):
+    """Is the hourly dns verdict still being written? -> (findings, fixes).
+
+    The reading is `dns-watch --stale`'s own verdict — 0 fresh, 1 STALE,
+    2 unmeasurable — never a second implementation of its age rule (the
+    limit, the state parsing and the wording stay in one place). The
+    reader probes nothing and writes nothing, so the audit stays cheap and
+    read-only here. A fault names the age, the limit and the state path,
+    because dns-watch's line carries all three; a missing or unreadable
+    state file is a fault too — "cannot measure" is not a pass, or a
+    deleted state file would read as a healthy night.
+    """
+    tool = tool or _dns_watch_tool()
+    if not tool or not os.path.exists(tool):
+        return ([f"sys:dns-watch-missing — no dns-watch at {tool or 'PATH'} "
+                 f"or beside pi-doctor; the hourly verdict cannot be read"], [])
+    state = state or os.environ.get(DNS_WATCH_STATE_ENV)
+    # /usr/bin/python3 <tool>, not <tool>: the exec bit is an install
+    # artefact (10-13 lesson) and the repo copy is source.
+    cmd = [sys.executable, tool, "--stale"]
+    if state:
+        cmd += ["--state", state]
+    rc, out, err = run_full(cmd, timeout=30)
+    lines = (err or out or "").strip().splitlines()
+    line = lines[-1].strip() if lines else ""
+    if line.startswith("dns-watch:"):
+        line = line.split(":", 1)[1].strip()
+    if rc == 0:
+        return [], []
+    if rc == 1:
+        return [f"sys:dns-watch-stale — {_detail(line)}"], []
+    if rc == 2:
+        return [f"sys:dns-watch-unmeasurable — {_detail(line)}"], []
+    detail = line or "no output"
+    return [f"sys:dns-watch-error — --stale exited {rc}: {detail}"], []
+
+
 def check_rtk():
     """RTK (Rust Token Killer) savings summary — informational only."""
     import shutil, subprocess
@@ -904,6 +982,16 @@ def main():
         all_fixes += x
     except Exception as e:
         all_findings.append(f"doctor:mute:check-error {type(e).__name__}: {e}")
+    try:
+        # The hourly dns verdict's own age — a stopped timer used to be
+        # indistinguishable from a quiet night. `--stale` probes nothing and
+        # writes nothing, so this stays a reader.
+        f, x = check_dns_watch()
+        all_findings += f
+        all_fixes += x
+    except Exception as e:
+        all_findings.append(
+            f"doctor:dns-watch:check-error {type(e).__name__}: {e}")
     try:
         # The dark-window check is only worth anything if its unit is armed:
         # a re-image or a failed install leaves it absent and silent.
