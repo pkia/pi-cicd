@@ -75,7 +75,13 @@ not flapping, healthz answers, running commit matches `origin/main`
 as the fix), CI green, tree clean. System layer: disk, CPU temp,
 memory, failed units, the watchers' own state. Safe fixes are applied
 automatically (restart a dead service, re-run a deploy); everything
-else escalates. Deliberate states are *reported, never fixed*: units the
+else escalates. System layer continues with the hourly dns verdict's own
+age: `check_dns_watch` runs `dns-watch --stale` and turns 1 (STALE) and 2
+(unmeasurable) into findings naming the age, the limit and the state path —
+a stopped dns-watch timer used to look exactly like a quiet night. The
+verdict's rule stays in `dns-watch`; the audit only reads it (the tool
+probes nothing and writes nothing, so the check is a reader too).
+Deliberate states are *reported, never fixed*: units the
 owner parked with `ram-mode focus` (read live from
 `~/.local/state/ram-mode/stopped`, so `ram-mode restore` is picked up at
 once) and `ais-catcher` idling while a NOAA capture owns the single
@@ -144,7 +150,10 @@ fresh, 1 STALE, 2 unmeasurable (a missing or unreadable state file names
 its path; "cannot measure" is not a pass), limit `STALE_AFTER_HOURS`
 (default 2 h against the hourly timer) or `--stale-after HOURS`. Both
 readers run no probe and write nothing, so the morning audit can call
-`--stale` cheaply. `--dry-run` publishes and writes neither file. The
+`--stale` cheaply — and it does: `pi-doctor`'s daily report runs it and
+turns a STALE or unmeasurable verdict into a finding naming the age, the
+limit and the state path (a stopped timer no longer reads as a quiet
+night). `--dry-run` publishes and writes neither file. The
 unit's exit code is dns-check's verdict
 (1/2/3 when broken) or 4 when the probe itself could not run, so the
 daily pi-doctor audit also names a broken box even if the page is muted
