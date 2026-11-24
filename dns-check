@@ -34,17 +34,21 @@ ip_ok=0
 ip_tries=0
 ip_url=""
 ip_failures=0
+ip_failed_urls=""
 for pass in 1 2; do
     failed=0
+    failed_urls=""
     for url in $PROBE_URLS; do
         if curl -s -o /dev/null --max-time "$TIMEOUT" "$url" 2>/dev/null; then
             ip_ok=1
             ip_url="$url"
             ip_tries=$pass
             ip_failures=$failed
+            ip_failed_urls="$failed_urls"
             break
         fi
         failed=$((failed + 1))
+        failed_urls="${failed_urls}${failed_urls:+ }$url"
     done
     [ "$ip_ok" = 1 ] && break
     [ "$pass" = 1 ] && sleep 2
@@ -54,7 +58,10 @@ if [ "$ip_ok" = 1 ]; then
     if [ "$ip_tries" = 2 ]; then
         ip_note=" (retry; first attempt failed)"
     elif [ "$ip_failures" -gt 0 ]; then
-        ip_note=" (fallback; $ip_failures endpoint(s) failed first)"
+        # Named, not counted: "1 endpoint(s) failed" leaves the reader to
+        # guess which one, and a fallback is the one success that pages
+        # nothing — the name is the whole record.
+        ip_note=" (fallback; $ip_failed_urls failed first)"
     fi
 fi
 

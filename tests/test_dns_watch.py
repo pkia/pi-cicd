@@ -309,7 +309,8 @@ def test_one_blackholed_endpoint_is_a_fallback(tmp_path):
     """The row's headline: one dead address is not an outage.
 
     The first endpoint refuses, the second answers -> healthy, and the line
-    names the endpoint that answered (never the one that did not).
+    names both facts: the endpoint that answered, and the one that failed
+    (the failure name is what the fallback ledger records).
     """
     with Sink() as sink:
         proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
@@ -319,8 +320,7 @@ def test_one_blackholed_endpoint_is_a_fallback(tmp_path):
         line = [l for l in proc.stdout.splitlines() if "IP egress" in l]
         assert len(line) == 1, proc.stdout
         assert sink.url + "/ip" in line[0]           # the working endpoint
-        assert DEAD_ENDPOINT not in line[0]
-        assert "fallback; 1 endpoint(s) failed first" in line[0]
+        assert f"fallback; {DEAD_ENDPOINT} failed first" in line[0]
         assert "retry;" not in proc.stdout
         assert read_state(state)["status"] == "healthy"
 
