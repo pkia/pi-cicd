@@ -17,6 +17,9 @@ STATE=~/.local/state/dns-watch/state.json
 # The page ledger: one line per page — timestamp, verdict, exit code, whether
 # dns-check's retry was used. Default: pages.log beside STATE. `dns-watch
 # --history` prints the last 24 h; past LEDGER_MAX_LINES it rotates to .1.
+# The fallback ledger lands beside it as fallbacks.log (one line per run that
+# reached its OK through a later endpoint, naming the one that failed) and
+# follows --ledger when you move it.
 #LEDGER=~/.local/state/dns-watch/pages.log
 #LEDGER_MAX_LINES=2000
 

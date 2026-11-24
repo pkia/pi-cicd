@@ -122,7 +122,8 @@ leave, names do not resolve: a resolver problem), **EGRESS BROKEN** (every
 raw-IP endpoint fails while names resolve) or **NO EGRESS** (both). The IP
 half carries two endpoints on different networks, tried in order and over
 two passes: a single address that a route drops is a fallback (the OK line
-says `fallback` and names the endpoint that answered), a whole failed pass
+says `fallback` and names both the endpoint that answered and the one that
+failed), a whole failed pass
 is the retry the 2026-11-20 overnight pages taught it to make, and only
 every endpoint failing both times is EGRESS — so one blackholed address is
 not an outage. When the resolver half fails it quotes `/etc/resolv.conf`
@@ -140,9 +141,15 @@ fresh install is not news); the first broken one pages. Its writes are
 ledger `pages.log` beside it — **one line per page** (timestamp, verdict,
 exit code, whether the probe's retry was used), rotating to `pages.log.1`
 at `LEDGER_MAX_LINES` (default 2000) so it never grows without limit.
-`dns-watch --history` prints the last 24 h one line each, reading both
+A fallback used to leave no trace at all (the verdict did not change, so
+there was no page and no line), so beside it sits a second ledger,
+`fallbacks.log` — **one line per run that reached its OK through a later
+endpoint**, naming the endpoint(s) that failed and the one that answered,
+under the same cap and rotation. `dns-watch --history` prints the last
+24 h of both, oldest first, then one count per kind, reading both
 generations, and exits 0 on an empty ledger — so "it flapped four times
-overnight" is a list, not a `pages` counter. Since the ledger records
+overnight" and "it leaned on the second endpoint twice" are lists, not a
+`pages` counter. Since the page ledger records
 *pages*, a quiet night is byte-identical to a timer that stopped firing, so
 `--history` also prints the newest run's own `checked_at` age, and
 `dns-watch --stale` turns that age into one line and one exit code — 0
