@@ -309,7 +309,8 @@ def test_one_blackholed_endpoint_is_a_fallback(tmp_path):
     """The row's headline: one dead address is not an outage.
 
     The first endpoint refuses, the second answers -> healthy, and the line
-    names the endpoint that answered (never the one that did not).
+    names both facts: the endpoint that answered, and the one that failed
+    (the failure name is what the fallback ledger records).
     """
     with Sink() as sink:
         proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
@@ -319,8 +320,7 @@ def test_one_blackholed_endpoint_is_a_fallback(tmp_path):
         line = [l for l in proc.stdout.splitlines() if "IP egress" in l]
         assert len(line) == 1, proc.stdout
         assert sink.url + "/ip" in line[0]           # the working endpoint
-        assert DEAD_ENDPOINT not in line[0]
-        assert "fallback; 1 endpoint(s) failed first" in line[0]
+        assert f"fallback; {DEAD_ENDPOINT} failed first" in line[0]
         assert "retry;" not in proc.stdout
         assert read_state(state)["status"] == "healthy"
 
@@ -718,6 +718,189 @@ def test_ledger_default_lands_beside_the_state_file(tmp_path):
         _, state, _ = run_tool(tmp_path, sink.url, host=BROKEN_HOST)
     assert ledger_of(state).is_file()
     assert len(ledger_lines(ledger_of(state))) == 1
+
+
+# ------------------------------------------------ fallback ledger (11-24)
+# The row: a dead endpoint that a live one covers is a success that pages
+# nothing — the verdict did not change — so it used to leave no record at
+# all. Each run that used a fallback writes one line, naming the endpoint
+# that failed; `--history` prints those lines and their count.
+
+def fallbacks_of(state):
+    return Path(state).with_name("fallbacks.log")
+
+
+def test_a_fallback_with_an_unchanged_verdict_writes_one_record(tmp_path):
+    """The headline: the verdict does not move, the fallback is still counted.
+
+    First a plain healthy run (no record, no file), then a healthy run whose
+    OK came from the second endpoint: no page — but exactly one line naming
+    the endpoint that failed and the one that answered.
+    """
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        run_tool(tmp_path, sink.url, host=HEALTHY_HOST)
+        assert not fallbacks_of(state).exists()
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                  probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sink.posts == []                 # unchanged: nothing to page
+        answered = sink.url + "/ip"
+    lines = ledger_lines(fallbacks_of(state))
+    assert len(lines) == 1, lines
+    parts = lines[0].split()
+    assert parts[1] == "fallback"
+    assert parts[2] == f"failed={DEAD_ENDPOINT}"
+    assert parts[3] == f"answered={answered}"
+    assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$", parts[0])
+    assert not ledger_of(state).exists()        # no page, no page line
+    assert read_state(state)["pages"] == 0
+
+
+def test_every_failed_endpoint_is_named_not_just_counted(tmp_path):
+    """Two dead endpoints before a live one: both names land in the record."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        proc, state, _ = run_tool(
+            tmp_path, sink.url, host=HEALTHY_HOST,
+            probe_urls=f"{DEAD_ENDPOINT} http://127.0.0.1:2/ {sink.url}/ip")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    parts = ledger_lines(fallbacks_of(state))[0].split()
+    assert parts[2] == f"failed={DEAD_ENDPOINT},http://127.0.0.1:2/"
+    assert parts[3] == f"answered={sink.url}/ip"
+
+
+def test_a_plain_healthy_run_writes_nothing_new(tmp_path):
+    """Clause: a plain healthy run still writes nothing.
+
+    Two direct-endpoint healthy runs: no page ledger, no fallback ledger, no
+    page counted — only the state file that every run stamps.
+    """
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(2):
+            proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not ledger_of(state).exists()
+    assert not fallbacks_of(state).exists()
+    assert read_state(state)["pages"] == 0
+
+
+def test_both_endpoints_refused_twice_is_still_one_page(tmp_path):
+    """Clause: the fault path did not gain a record — nothing answered, so
+    there is no fallback; two refused runs are still one page, one line."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(2):
+            proc, state, _ = run_tool(
+                tmp_path, sink.url, host=HEALTHY_HOST,
+                probe_urls=f"{DEAD_ENDPOINT} http://127.0.0.1:2/")
+            assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert len(sink.posts) == 1
+    assert not fallbacks_of(state).exists()
+    assert len(ledger_lines(ledger_of(state))) == 1
+    assert read_state(state)["pages"] == 1
+
+
+def test_a_recovery_through_a_fallback_records_both_and_leaves_retry_alone(
+        tmp_path):
+    """A changed verdict pages *and* falls back: the page ledger's retry
+    column still reads `no` — a fallback is not a retry, the 11-21 rule."""
+    with Sink() as sink:
+        run_tool(tmp_path, sink.url, host=BROKEN_HOST)          # page 1
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                  probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert len(sink.posts) == 2
+        assert sink.url + "/ip" in sink.posts[1]["message"]
+    pages = ledger_lines(ledger_of(state))
+    assert len(pages) == 2, pages
+    assert pages[1].split()[1] == "healthy"
+    assert "retry=no" in pages[1]
+    fallbacks = ledger_lines(fallbacks_of(state))
+    assert len(fallbacks) == 1, fallbacks
+    assert DEAD_ENDPOINT in fallbacks[0]
+
+
+def test_dry_run_records_no_fallback(tmp_path):
+    with Sink() as sink:
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                  probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip",
+                                  dry_run=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not fallbacks_of(state).exists()
+
+
+def test_the_fallback_ledger_rotates_at_its_cap(tmp_path):
+    """Clause: cap rotation still holds — on the new file too, same cap."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(3):
+            proc, state, _ = run_tool(
+                tmp_path, sink.url, host=HEALTHY_HOST,
+                probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip",
+                extra="LEDGER_MAX_LINES=2")
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+    fb = fallbacks_of(state)
+    live, previous = ledger_lines(fb), ledger_lines(str(fb) + ".1")
+    assert len(live) == 1, live
+    assert len(previous) == 2, previous
+    assert len(live) <= 2
+    assert all(line.split()[1] == "fallback" for line in live + previous)
+    assert not ledger_of(state).exists()
+
+
+def test_history_prints_the_fallback_count_and_writes_nothing(tmp_path):
+    """Clause: `--history` prints the count beside the page count, shows the
+    fallback lines in the window, and leaves both files byte-identical."""
+    state = tmp_path / "state.json"
+    ledger, fb = ledger_of(state), fallbacks_of(state)
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+    old = (now - timedelta(hours=30)).isoformat(timespec="seconds")
+    ledger.write_text(f"{fresh}  healthy      rc=0    retry=no\n",
+                      encoding="utf-8")
+    fb.write_text(
+        f"{fresh}  fallback     failed={DEAD_ENDPOINT}  "
+        "answered=http://127.0.0.1:9/ip\n"
+        f"{old}  fallback     failed=http://10.0.0.1/  "
+        "answered=http://10.0.0.2/\n"
+        "not a fallback line\n", encoding="utf-8")
+    before = (ledger.read_bytes(), fb.read_bytes())
+    proc = reader(tmp_path, "--history", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 page(s) in the last 24 h" in proc.stdout
+    assert "1 fallback(s) in the last 24 h" in proc.stdout
+    assert f"3 line(s) in {fb}" in proc.stdout
+    assert DEAD_ENDPOINT in proc.stdout            # the failed endpoint, named
+    assert "http://10.0.0.1/" not in proc.stdout   # outside the window
+    assert "1 unreadable line(s) skipped" in proc.stdout
+    assert (ledger.read_bytes(), fb.read_bytes()) == before
+
+
+def test_an_existing_ledger_without_a_fallback_file_still_reads(tmp_path):
+    """Clause: an existing ledger parses unchanged.
+
+    A pages.log written before this change — no fallbacks.log beside it, a
+    `retry=yes` line and a junk line — reads exactly as it did, plus a
+    honest zero fallback count.
+    """
+    state = tmp_path / "state.json"
+    ledger = ledger_of(state)
+    now = datetime.now(timezone.utc)
+    stamp = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+    ledger.write_text(f"{stamp}  healthy      rc=0    retry=yes\n"
+                      f"{stamp}  egress       rc=2    retry=no\n"
+                      "not a ledger line\n", encoding="utf-8")
+    before = ledger.read_bytes()
+    proc = reader(tmp_path, "--history", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "retry=yes" in proc.stdout
+    assert "2 page(s) in the last 24 h" in proc.stdout
+    assert "0 fallback(s) in the last 24 h" in proc.stdout
+    assert str(fallbacks_of(state)) in proc.stdout
+    assert "1 unreadable line(s) skipped" in proc.stdout
+    assert ledger.read_bytes() == before
 
 
 # -------------------------------------------------------------- read-only

@@ -17,7 +17,12 @@ dns-watch is the timer half. Each run:
   4. appends one line to the page ledger for each page it actually
      publishes — the timestamp, verdict, exit code and whether the probe's
      retry was used — so a night of flapping is a countable list instead of
-     a `pages` counter.
+     a `pages` counter;
+  5. appends one line to the *fallback* ledger for each run that reached
+     its OK through a second endpoint, naming the endpoint that failed —
+     because that run changes nothing else: the verdict may be identical, so
+     there is no page and no page-ledger line, and without this record the
+     fallback leaves no trace anywhere.
 
 Edge-triggered on purpose (the 2026-08-30 lesson, metric-alert's shape):
 a standing failure must not page every hour, and a recovery must not be
@@ -49,10 +54,13 @@ itself could not run. A failing unit is a record the daily pi-doctor
 audit names; the page is the fast path.
 
 The probe stays read-only. dns-watch's only writes are its own state file
-(`~/.local/state/dns-watch/state.json`, temp file + atomic rename) and its
+(`~/.local/state/dns-watch/state.json`, temp file + atomic rename), its
 page ledger (`pages.log` beside the state file, one line per *page*, so a
-flapping night is countable: `--history` prints the last 24 h), and
-`--dry-run` does not even do those. Config (optional, /etc/dns-watch.conf,
+flapping night is countable: `--history` prints the last 24 h) and its
+fallback ledger (`fallbacks.log` beside the page ledger, one line per run
+that used a second endpoint — `--history` prints those lines and their
+count after the page count), and `--dry-run` does not even do those. Config
+(optional, /etc/dns-watch.conf,
 KEY=VALUE, `#` comments, last occurrence wins — parse_env_lists' rule):
 
     NTFY_URL=http://127.0.0.1:6839
@@ -89,6 +97,10 @@ PROBE_TIMEOUT = 120
 #: The ledger's default name, resolved beside the state file (one directory,
 #: one fact — an operator moving STATE takes the ledger along).
 LEDGER_NAME = "pages.log"
+#: The fallback ledger's name, resolved beside the page ledger for the same
+#: reason: a fallback leaves no page, so without a line of its own it leaves
+#: no record at all.
+FALLBACKS_NAME = "fallbacks.log"
 DEFAULT_LEDGER_MAX = 2000
 HISTORY_HOURS = 24
 
@@ -101,6 +113,13 @@ DEFAULT_STALE_AFTER = 2.0
 #: server that stalls its first attempt, so if that wording drifts the
 #: ledger's `retry=` column goes red instead of quietly reading `no`.
 RETRY_MARKER = "(retry; first attempt failed)"
+
+#: dns-check's fallback note — the endpoints that failed, named inside it.
+#: A fallback is the one success that pages nothing (the verdict did not
+#: change), so this line is the only place it can be recorded; a drift in
+#: dns-check's wording reddens the fallback tests rather than silencing it.
+FALLBACK_PREFIX = "(fallback; "
+FALLBACK_SUFFIX = " failed first)"
 
 #: dns-check's own contract, spelled where the mapping is built.
 VERDICTS = {
@@ -237,6 +256,71 @@ def retry_used(output):
     return "yes" if RETRY_MARKER in output else "no"
 
 
+def fallback_endpoints(output):
+    """The endpoints dns-check named as failed, from its fallback note.
+
+    `[]` when this run reached its OK on the first endpoint — the plain case
+    — or when the note is absent, so the recorder stays silent for it.
+    """
+    for line in output.splitlines():
+        start = line.find(FALLBACK_PREFIX)
+        if start < 0:
+            continue
+        rest = line[start + len(FALLBACK_PREFIX):]
+        stop = rest.find(FALLBACK_SUFFIX)
+        if stop < 0:
+            continue
+        named = rest[:stop].split()
+        if named:
+            return named
+    return []
+
+
+def answered_endpoint(output):
+    """The endpoint dns-check's IP egress line says answered, or ""."""
+    for line in output.splitlines():
+        if "IP egress" not in line:
+            continue
+        start = line.find("(")
+        stop = line.find(",", start + 1)
+        if 0 <= start < stop:
+            return line[start + 1:stop].strip()
+    return ""
+
+
+def fallback_path(ledger_file):
+    """The fallback ledger lives beside the page ledger: one directory, one
+    fact, so `--ledger` moves both and nothing can drift apart."""
+    return str(Path(ledger_file).with_name(FALLBACKS_NAME))
+
+
+def fallback_line(now, failed, answered):
+    """One fallback, one line: when, which endpoint(s) failed, which answered.
+
+    The marker word `fallback` sits in the verdict column's place, so a
+    reader of either file can tell the two kinds apart by one field.
+    """
+    return "{ts}  {mark:<11}  failed={failed}  answered={answered}".format(
+        ts=now.isoformat(timespec="seconds"), mark="fallback",
+        failed=",".join(failed) or "?", answered=answered or "?")
+
+
+def parse_fallback_line(line):
+    """-> (stamp, failed, answered) or (None,) when the line is not ours."""
+    parts = line.split()
+    if len(parts) != 4 or parts[1] != "fallback" \
+            or not parts[2].startswith("failed=") \
+            or not parts[3].startswith("answered="):
+        return (None,)
+    try:
+        stamp = datetime.fromisoformat(parts[0])
+    except ValueError:
+        return (None,)
+    if stamp.tzinfo is None:                 # a hand-edited line: read as UTC
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (stamp, parts[2][len("failed="):], parts[3][len("answered="):])
+
+
 def read_ledger(path):
     """Ledger lines, oldest first; a missing file is an empty ledger."""
     try:
@@ -338,8 +422,10 @@ def stale_verdict(state_path, limit_hours, now=None):
     return 0
 
 
-def print_history(path, state_path=None, now=None, hours=HISTORY_HOURS):
-    """`--history`: the last `hours` of pages, one line each. Writes nothing."""
+def print_history(path, state_path=None, now=None, hours=HISTORY_HOURS,
+                  fallbacks_file=None):
+    """`--history`: the last `hours` of pages *and* fallbacks, one line each,
+    oldest first, then one count per kind. Writes nothing."""
     now = now or datetime.now(timezone.utc)
     window = now - timedelta(hours=hours)
     print(f"dns-watch page ledger — {now.isoformat(timespec='seconds')} "
@@ -351,6 +437,7 @@ def print_history(path, state_path=None, now=None, hours=HISTORY_HOURS):
         else:
             print(f"newest run: {stamp.isoformat(timespec='seconds')} "
                   f"({format_age(stamp, now)})")
+    entries = []
     lines = read_ledger(str(path) + ".1") + read_ledger(path)
     shown = unreadable = 0
     for line in lines:
@@ -360,13 +447,36 @@ def print_history(path, state_path=None, now=None, hours=HISTORY_HOURS):
             continue
         if parsed[0] < window:
             continue
-        print(line)
+        entries.append((parsed[0], line))
         shown += 1
+    fallback_shown = fallback_unreadable = fallback_total = 0
+    if fallbacks_file is not None:
+        fb_lines = (read_ledger(str(fallbacks_file) + ".1")
+                    + read_ledger(fallbacks_file))
+        fallback_total = len(fb_lines)
+        for line in fb_lines:
+            parsed = parse_fallback_line(line)
+            if parsed[0] is None:
+                fallback_unreadable += 1
+                continue
+            if parsed[0] < window:
+                continue
+            entries.append((parsed[0], line))
+            fallback_shown += 1
+    for _, line in sorted(entries, key=lambda entry: entry[0]):
+        print(line)
     summary = (f"{shown} page(s) in the last {hours} h — {len(lines)} "
                f"line(s) in {path}")
     if unreadable:
         summary += f", {unreadable} unreadable line(s) skipped"
     print(summary)
+    if fallbacks_file is not None:
+        fb_summary = (f"{fallback_shown} fallback(s) in the last {hours} h — "
+                      f"{fallback_total} line(s) in {fallbacks_file}")
+        if fallback_unreadable:
+            fb_summary += (f", {fallback_unreadable} unreadable line(s) "
+                           f"skipped")
+        print(fb_summary)
     return 0
 
 
@@ -473,9 +583,10 @@ def decide(prev, state):
 
 
 def run(cfg, state_path, dry_run=False, verbose=False, now=None,
-        ledger_file=None):
+        ledger_file=None, fallback_file=None):
     now = now or datetime.now(timezone.utc)
     ledger_file = ledger_file or ledger_path(cfg, state_path)
+    fallback_file = fallback_file or fallback_path(ledger_file)
     probe = resolve_probe(cfg["dns_check"])
     rc, output = run_probe(probe)
     state_word, title, detail = classify(rc, output)
@@ -529,6 +640,24 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None,
             print(f"dns-watch: ledger reached {cfg['ledger_max']} line(s) — "
                   f"rotated to {Path(ledger_file).name}.1", file=sys.stderr)
 
+    # A fallback is the one success that changes nothing downstream: the
+    # verdict may be exactly what it was, so no page and no page-ledger line.
+    # Without a record of its own it is invisible — so each run that used one
+    # writes one countable line naming the endpoint that failed. Rotation is
+    # the page ledger's rule, applied to the same cap.
+    failed = fallback_endpoints(output)
+    if failed and not dry_run:
+        line = fallback_line(now, failed, answered_endpoint(output))
+        _, rotated = append_ledger(fallback_file, line, cfg["ledger_max"])
+        if verbose:
+            print(f"dns-watch: fallback — {', '.join(failed)} failed, "
+                  f"{answered_endpoint(output) or 'no named endpoint'} "
+                  f"answered (recorded)", file=sys.stderr)
+            if rotated:
+                print(f"dns-watch: fallback ledger reached "
+                      f"{cfg['ledger_max']} line(s) — rotated to "
+                      f"{Path(fallback_file).name}.1", file=sys.stderr)
+
     print(f"dns-watch: {state_word.upper()} — {detail}"
           f"{' (paged)' if should else ''}")
     return 4 if rc is None else rc
@@ -567,16 +696,19 @@ def main(argv=None):
     cfg = load_config(args.config)
     state_path = os.path.expanduser(args.state) if args.state else cfg["state"]
     ledger_file = ledger_path(cfg, state_path, args.ledger)
+    fallback_file = fallback_path(ledger_file)
     if args.stale or args.stale_after is not None:
         limit = args.stale_after if args.stale_after is not None \
             else cfg["stale_after"]
         if args.history:
-            print_history(ledger_file, state_path)
+            print_history(ledger_file, state_path,
+                          fallbacks_file=fallback_file)
         return stale_verdict(state_path, limit)
     if args.history:
-        return print_history(ledger_file, state_path)
+        return print_history(ledger_file, state_path,
+                             fallbacks_file=fallback_file)
     return run(cfg, state_path, dry_run=args.dry_run, verbose=args.verbose,
-               ledger_file=ledger_file)
+               ledger_file=ledger_file, fallback_file=fallback_file)
 
 
 if __name__ == "__main__":
