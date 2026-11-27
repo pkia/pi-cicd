@@ -22,7 +22,13 @@ record-every-run row in test_a_three_hour_old_run_is_stale /
 test_a_fresh_run_passes /
 test_a_missing_state_file_is_unmeasurable_not_fresh /
 test_a_state_file_the_tool_cannot_date_is_unmeasurable /
-test_history_prints_the_age_of_the_newest_run.
+test_history_prints_the_age_of_the_newest_run. The 11-27 repeating-fallback
+row lives in test_third_consecutive_fallback_pages_once_then_stays_silent /
+test_a_single_fallback_is_a_ledger_line_and_no_page /
+test_a_run_with_no_fallback_resets_the_streak /
+test_a_streak_is_keyed_on_the_endpoint_that_failed /
+test_a_streak_page_joins_the_page_count_and_ledger /
+test_history_shows_the_streak_beside_the_fallback_count.
 """
 
 import hashlib

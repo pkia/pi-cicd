@@ -158,8 +158,9 @@ with no state edit. That page lands in `pages.log` under the verdict word
 mistaking it for a changed probe. `dns-watch --history` prints the last
 24 h of both, oldest first, then one count per kind and the current
 fallback streak (read from the state, so an ended streak shows as none),
-generations, and exits 0 on an empty ledger — so "it flapped four times
-overnight" and "it leaned on the second endpoint twice" are lists, not a
+reading both generations, and exits 0 on an empty ledger — so "it flapped
+four times overnight" and "it leaned on the second endpoint twice" are
+lists, not a
 `pages` counter. Since the page ledger records
 *pages*, a quiet night is byte-identical to a timer that stopped firing, so
 `--history` also prints the newest run's own `checked_at` age, and
