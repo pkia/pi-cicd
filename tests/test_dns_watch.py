@@ -832,21 +832,26 @@ def test_dry_run_records_no_fallback(tmp_path):
 
 
 def test_the_fallback_ledger_rotates_at_its_cap(tmp_path):
-    """Clause: cap rotation still holds — on the new file too, same cap."""
+    """Clause: cap rotation still holds — on the new file too, same cap.
+
+    Two runs at a cap of one rather than three at a cap of two: the third
+    identical fallback is the streak page's own case (below), so keeping this
+    test at two runs keeps rotation a separate, single-purpose probe.
+    """
     state = tmp_path / "state.json"
     with Sink() as sink:
-        for _ in range(3):
+        for _ in range(2):
             proc, state, _ = run_tool(
                 tmp_path, sink.url, host=HEALTHY_HOST,
                 probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip",
-                extra="LEDGER_MAX_LINES=2")
+                extra="LEDGER_MAX_LINES=1")
             assert proc.returncode == 0, proc.stdout + proc.stderr
     fb = fallbacks_of(state)
     live, previous = ledger_lines(fb), ledger_lines(str(fb) + ".1")
     assert len(live) == 1, live
-    assert len(previous) == 2, previous
-    assert len(live) <= 2
+    assert len(previous) == 1, previous
     assert all(line.split()[1] == "fallback" for line in live + previous)
+    assert read_state(state)["fallback_streak"]["runs"] == 2
     assert not ledger_of(state).exists()
 
 
