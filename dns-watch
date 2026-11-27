@@ -23,6 +23,11 @@ dns-watch is the timer half. Each run:
      because that run changes nothing else: the verdict may be identical, so
      there is no page and no page-ledger line, and without this record the
      fallback leaves no trace anywhere.
+  6. counts the *run* of consecutive fallbacks to the same endpoint in the
+     state file, and pages **once** when it reaches `FALLBACK_STREAK_PAGES_AT`
+     (default 3) — one dead endpoint covered by a live one is not news, a
+     week of it is. The streak resets on any run that did not fall back, so
+     a repair clears it without anyone touching the state.
 
 Edge-triggered on purpose (the 2026-08-30 lesson, metric-alert's shape):
 a standing failure must not page every hour, and a recovery must not be
@@ -69,6 +74,7 @@ KEY=VALUE, `#` comments, last occurrence wins — parse_env_lists' rule):
     STATE=~/.local/state/dns-watch/state.json
     LEDGER=~/.local/state/dns-watch/pages.log   # default: beside STATE
     LEDGER_MAX_LINES=2000        # past this, pages.log -> pages.log.1
+    FALLBACK_STREAK_PAGES_AT=3   # page once when this many fallbacks in a row
     STALE_AFTER_HOURS=2          # --stale's limit (hourly timer: 2 misses)
     DNS_CHECK=dns-check          # absolute path if not on PATH
     TIMEOUT_SECS=15              # publish timeout, never unbounded
@@ -103,6 +109,14 @@ LEDGER_NAME = "pages.log"
 FALLBACKS_NAME = "fallbacks.log"
 DEFAULT_LEDGER_MAX = 2000
 HISTORY_HOURS = 24
+
+#: How many consecutive fallbacks to the same endpoint before the phone hears
+#: about it. One is a route flap; three hourly runs is nearly a whole working
+#: day of "the primary is dead and something is covering for it".
+DEFAULT_STREAK_PAGES_AT = 3
+#: The page ledger's verdict column for the streak page — a page that is not
+#: a verdict change, so it must not read like one.
+STREAK_LEDGER_WORD = "fallback-streak"
 
 #: `--stale`'s default limit. The timer fires hourly, so two hours without a
 #: run means a fire was missed (a reboot, a masked timer, a dead manager).
@@ -139,6 +153,10 @@ TAGS = {
     PROBE_ERROR: ["warning", "dns"],
 }
 
+#: The streak page is a warning, not a verdict: the box is up and names
+#: resolve — one endpoint has just been dead for hours while another covered it.
+STREAK_TAGS = ["warning", "dns"]
+
 
 # ---------------------------------------------------------------- config
 
@@ -168,6 +186,8 @@ def load_config(path):
         "state": os.path.expanduser(cfg.get("STATE") or DEFAULT_STATE),
         "ledger": os.path.expanduser(cfg.get("LEDGER") or ""),
         "ledger_max": _count(cfg.get("LEDGER_MAX_LINES"), DEFAULT_LEDGER_MAX),
+        "streak_pages_at": _count(cfg.get("FALLBACK_STREAK_PAGES_AT"),
+                                  DEFAULT_STREAK_PAGES_AT),
         "stale_after": _number(cfg.get("STALE_AFTER_HOURS"),
                                DEFAULT_STALE_AFTER),
         "dns_check": cfg.get("DNS_CHECK") or DEFAULT_DNS_CHECK,
@@ -319,6 +339,83 @@ def parse_fallback_line(line):
     if stamp.tzinfo is None:                 # a hand-edited line: read as UTC
         stamp = stamp.replace(tzinfo=timezone.utc)
     return (stamp, parts[2][len("failed="):], parts[3][len("answered="):])
+
+
+def streak_key(failed):
+    """The endpoint set a fallback run named, as one comparable string."""
+    return ",".join(failed)
+
+
+def next_streak(previous, key, now):
+    """-> the state's `fallback_streak` after this run.
+
+    A run that fell back to the same endpoint set extends the run; a run on a
+    different set starts a new one; a run that reached its OK with no fallback
+    at all clears it — which is what makes a repair reset the count without
+    anyone editing state by hand.
+    """
+    prev = previous if isinstance(previous, dict) else {}
+    if not key:
+        return {"failed": "", "runs": 0, "since": None, "paged": False}
+    stamp = now.isoformat(timespec="seconds")
+    if prev.get("failed") == key:
+        try:
+            runs = int(prev.get("runs", 0)) + 1
+        except (TypeError, ValueError):
+            runs = 1
+        return {"failed": key, "runs": runs, "since": prev.get("since") or stamp,
+                "paged": bool(prev.get("paged"))}
+    return {"failed": key, "runs": 1, "since": stamp, "paged": False}
+
+
+def read_streak(state_path):
+    """The state's fallback streak, or {} when the file or the key is absent."""
+    try:
+        data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    streak = data.get("fallback_streak")
+    return streak if isinstance(streak, dict) else {}
+
+
+def streak_summary(streak):
+    """One clause for `--history`: the current run of fallbacks, or its absence.
+
+    Read from the state, not from the ledger's tail: a run that reaches its OK
+    with no fallback writes no ledger line, so only the state knows the run
+    ended.
+    """
+    try:
+        runs = int(streak.get("runs", 0))
+    except (TypeError, ValueError):
+        runs = 0
+    key = streak.get("failed") or ""
+    if runs < 1 or not key:
+        return "streak: none — the newest run used no fallback"
+    clause = f"streak: {key} failed on {runs} consecutive run(s)"
+    if streak.get("since"):
+        clause += f", since {streak['since']}"
+    if streak.get("paged"):
+        clause += " (paged)"
+    return clause
+
+
+def build_streak_message(key, answered, runs, since):
+    """The one page a run of fallbacks earns: the endpoint, the count, why now."""
+    lines = [
+        f"dns-watch: {key} failed on {runs} consecutive runs — the OK is still "
+        "being reached through a later endpoint, so nothing paged until now.",
+        "",
+        f"Failing endpoint: {key}",
+        f"Answering endpoint: {answered or 'not named'}",
+    ]
+    if since:
+        lines.append(f"Streak started {since}.")
+    lines.append("Paged once per streak — it stays quiet until a run reaches "
+                 "its OK through no fallback.")
+    return "\n".join(lines)
 
 
 def read_ledger(path):
@@ -476,6 +573,8 @@ def print_history(path, state_path=None, now=None, hours=HISTORY_HOURS,
         if fallback_unreadable:
             fb_summary += (f", {fallback_unreadable} unreadable line(s) "
                            f"skipped")
+        if state_path is not None:
+            fb_summary += f"; {streak_summary(read_streak(state_path))}"
         print(fb_summary)
     return 0
 
@@ -601,6 +700,17 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None,
     prev = previous.get("status")
     should, reason = decide(prev, state_word)
 
+    # A fallback changes no verdict, so its run of repeats lives in the state:
+    # the ledger's tail cannot tell a streak from a run that ended (a direct
+    # OK writes no line), and "the same endpoint, three hours running" is the
+    # finding the phone should hear once.
+    failed = fallback_endpoints(output)
+    answered = answered_endpoint(output)
+    streak = next_streak(previous.get("fallback_streak"),
+                         streak_key(failed), now)
+    streak_should = (streak["runs"] >= cfg["streak_pages_at"]
+                     and not streak["paged"])
+
     since = previous.get("since")
     if prev != state_word:
         since = now.isoformat(timespec="seconds")
@@ -611,6 +721,7 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None,
         "since": since,
         "checked_at": now.isoformat(timespec="seconds"),
         "pages": int(previous.get("pages", 0)) + (1 if should else 0),
+        "fallback_streak": streak,
     }
 
     paged = False
@@ -623,9 +734,25 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None,
             # The page is the fast path; the verdict still stands, and the
             # journal keeps the line. Do not pretend the page landed.
             record["pages"] -= 1
+    streak_paged = False
+    if streak_should:
+        streak_title = (f"dns-watch: fallback streak — {streak['failed']} "
+                        f"failed {streak['runs']} run(s) in a row")
+        streak_paged = page(
+            cfg, streak_title,
+            build_streak_message(streak["failed"], answered, streak["runs"],
+                                 streak["since"]),
+            STREAK_TAGS, dry_run=dry_run)
+        if streak_paged:
+            record["fallback_streak"]["paged"] = True
+            record["pages"] += 1
     if verbose:
         print(f"dns-watch: {state_word} ({reason}) — "
               f"{'paged' if should else 'silent'}", file=sys.stderr)
+        if streak_should:
+            print(f"dns-watch: fallback streak {streak['runs']} — "
+                  f"{'paged' if streak_paged else 'not published'}",
+                  file=sys.stderr)
 
     if not dry_run and not save_state(state_path, record):
         print("dns-watch: verdict not recorded — the next run will page "
@@ -639,15 +766,23 @@ def run(cfg, state_path, dry_run=False, verbose=False, now=None,
         if rotated and verbose:
             print(f"dns-watch: ledger reached {cfg['ledger_max']} line(s) — "
                   f"rotated to {Path(ledger_file).name}.1", file=sys.stderr)
+    if streak_paged and not dry_run:
+        # A page that is not a verdict change still belongs in the page
+        # ledger (the count of pages is true), under a verdict word of its
+        # own, so no reader mistakes it for a changed probe.
+        line = ledger_line(now, STREAK_LEDGER_WORD, rc, retry_used(output))
+        _, rotated = append_ledger(ledger_file, line, cfg["ledger_max"])
+        if rotated and verbose:
+            print(f"dns-watch: ledger reached {cfg['ledger_max']} line(s) — "
+                  f"rotated to {Path(ledger_file).name}.1", file=sys.stderr)
 
     # A fallback is the one success that changes nothing downstream: the
     # verdict may be exactly what it was, so no page and no page-ledger line.
     # Without a record of its own it is invisible — so each run that used one
     # writes one countable line naming the endpoint that failed. Rotation is
     # the page ledger's rule, applied to the same cap.
-    failed = fallback_endpoints(output)
     if failed and not dry_run:
-        line = fallback_line(now, failed, answered_endpoint(output))
+        line = fallback_line(now, failed, answered)
         _, rotated = append_ledger(fallback_file, line, cfg["ledger_max"])
         if verbose:
             print(f"dns-watch: fallback — {', '.join(failed)} failed, "

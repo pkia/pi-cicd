@@ -22,7 +22,13 @@ record-every-run row in test_a_three_hour_old_run_is_stale /
 test_a_fresh_run_passes /
 test_a_missing_state_file_is_unmeasurable_not_fresh /
 test_a_state_file_the_tool_cannot_date_is_unmeasurable /
-test_history_prints_the_age_of_the_newest_run.
+test_history_prints_the_age_of_the_newest_run. The 11-27 repeating-fallback
+row lives in test_third_consecutive_fallback_pages_once_then_stays_silent /
+test_a_single_fallback_is_a_ledger_line_and_no_page /
+test_a_run_with_no_fallback_resets_the_streak /
+test_a_streak_is_keyed_on_the_endpoint_that_failed /
+test_a_streak_page_joins_the_page_count_and_ledger /
+test_history_shows_the_streak_beside_the_fallback_count.
 """
 
 import hashlib
@@ -832,21 +838,26 @@ def test_dry_run_records_no_fallback(tmp_path):
 
 
 def test_the_fallback_ledger_rotates_at_its_cap(tmp_path):
-    """Clause: cap rotation still holds — on the new file too, same cap."""
+    """Clause: cap rotation still holds — on the new file too, same cap.
+
+    Two runs at a cap of one rather than three at a cap of two: the third
+    identical fallback is the streak page's own case (below), so keeping this
+    test at two runs keeps rotation a separate, single-purpose probe.
+    """
     state = tmp_path / "state.json"
     with Sink() as sink:
-        for _ in range(3):
+        for _ in range(2):
             proc, state, _ = run_tool(
                 tmp_path, sink.url, host=HEALTHY_HOST,
                 probe_urls=f"{DEAD_ENDPOINT} {sink.url}/ip",
-                extra="LEDGER_MAX_LINES=2")
+                extra="LEDGER_MAX_LINES=1")
             assert proc.returncode == 0, proc.stdout + proc.stderr
     fb = fallbacks_of(state)
     live, previous = ledger_lines(fb), ledger_lines(str(fb) + ".1")
     assert len(live) == 1, live
-    assert len(previous) == 2, previous
-    assert len(live) <= 2
+    assert len(previous) == 1, previous
     assert all(line.split()[1] == "fallback" for line in live + previous)
+    assert read_state(state)["fallback_streak"]["runs"] == 2
     assert not ledger_of(state).exists()
 
 
@@ -902,6 +913,167 @@ def test_an_existing_ledger_without_a_fallback_file_still_reads(tmp_path):
     assert "1 unreadable line(s) skipped" in proc.stdout
     assert ledger.read_bytes() == before
 
+
+# ------------------------------------------------- fallback streak (11-27)
+# The row: one dead endpoint covered by a live one is a ledger line; the same
+# one dead for run after run is a finding. The third consecutive fallback to
+# one endpoint pages once, naming it and the count; the fourth is silent; a
+# run that reached its OK with no fallback clears the streak.
+
+STREAK_URL = DEAD_ENDPOINT
+
+
+def fall_back_once(tmp_path, sink):
+    """One healthy run whose OK came from the second endpoint."""
+    return run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                    probe_urls=f"{STREAK_URL} {sink.url}/ip")
+
+
+def test_third_consecutive_fallback_pages_once_then_stays_silent(tmp_path):
+    """The row's headline, clause by clause, through the real CLI."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(2):                       # one and two: ledger only
+            proc, state, _ = fall_back_once(tmp_path, sink)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sink.posts == [], [p["title"] for p in sink.posts]
+        assert not ledger_of(state).exists()
+        assert read_state(state)["fallback_streak"]["runs"] == 2
+        assert len(ledger_lines(fallbacks_of(state))) == 2
+
+        proc, state, _ = fall_back_once(tmp_path, sink)   # three: one page
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert len(sink.posts) == 1, [p["title"] for p in sink.posts]
+        post = sink.posts[0]
+        assert STREAK_URL in post["title"]           # the endpoint, named
+        assert "failed 3 run(s) in a row" in post["title"]   # the count
+        assert STREAK_URL in post["message"]
+        assert "3 consecutive runs" in post["message"]
+        assert sink.url + "/ip" in post["message"]   # who is covering for it
+        pages = ledger_lines(ledger_of(state))
+        assert len(pages) == 1, pages                # a page is a page
+        assert pages[0].split()[1] == "fallback-streak"
+        record = read_state(state)
+        assert record["pages"] == 1
+        assert record["fallback_streak"]["runs"] == 3
+        assert record["fallback_streak"]["paged"] is True
+
+        proc, state, _ = fall_back_once(tmp_path, sink)   # four: silent
+        assert len(sink.posts) == 1, [p["title"] for p in sink.posts]
+        assert len(ledger_lines(ledger_of(state))) == 1
+        assert read_state(state)["fallback_streak"]["runs"] == 4
+        assert len(ledger_lines(fallbacks_of(state))) == 4
+
+
+def test_a_single_fallback_is_a_ledger_line_and_no_page(tmp_path):
+    """Clause: one fallback stays a ledger line — not a finding.
+
+    Also pins the streak's own state shape, so `--history` has something
+    truthful to read before the phone has heard anything.
+    """
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        proc, state, _ = fall_back_once(tmp_path, sink)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sink.posts == []
+    record = read_state(state)
+    assert record["pages"] == 0
+    assert record["fallback_streak"]["failed"] == STREAK_URL
+    assert record["fallback_streak"]["runs"] == 1
+    assert record["fallback_streak"]["paged"] is False
+    assert record["fallback_streak"]["since"]
+    assert len(ledger_lines(fallbacks_of(state))) == 1
+    assert not ledger_of(state).exists()
+
+
+def test_a_run_with_no_fallback_resets_the_streak(tmp_path):
+    """Clause: a repair clears the count naturally — no state edit needed."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(2):
+            fall_back_once(tmp_path, sink)
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert read_state(state)["fallback_streak"] == {
+            "failed": "", "runs": 0, "since": None, "paged": False}
+        for _ in range(2):                       # a *new* streak, still < 3
+            proc, state, _ = fall_back_once(tmp_path, sink)
+            assert proc.returncode == 0
+        assert sink.posts == [], [p["title"] for p in sink.posts]
+        assert read_state(state)["fallback_streak"]["runs"] == 2
+        proc, state, _ = fall_back_once(tmp_path, sink)    # third: pages
+        assert len(sink.posts) == 1
+        assert "failed 3 run(s) in a row" in sink.posts[0]["title"]
+
+
+def test_a_streak_is_keyed_on_the_endpoint_that_failed(tmp_path):
+    """Two different dead endpoints are two streaks, not three of one."""
+    state = tmp_path / "state.json"
+    other = "http://127.0.0.1:2/"
+    with Sink() as sink:
+        run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                 probe_urls=f"{STREAK_URL} {sink.url}/ip")
+        proc, state, _ = run_tool(tmp_path, sink.url, host=HEALTHY_HOST,
+                                  probe_urls=f"{other} {sink.url}/ip")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert read_state(state)["fallback_streak"]["failed"] == other
+        assert read_state(state)["fallback_streak"]["runs"] == 1
+        for _ in range(2):                       # back to the first, run 2 and 3
+            proc, state, _ = fall_back_once(tmp_path, sink)
+        assert sink.posts == [], [p["title"] for p in sink.posts]
+        assert read_state(state)["fallback_streak"]["runs"] == 2
+        proc, state, _ = fall_back_once(tmp_path, sink)
+        assert len(sink.posts) == 1
+        assert STREAK_URL in sink.posts[0]["title"]
+
+
+def test_a_streak_page_joins_the_page_count_and_ledger(tmp_path):
+    """A streak page is a page: counted, and its own word in the ledger.
+
+    Run 1 breaks DNS (one page). Run 2 recovers *through a fallback* (the
+    recovery page, and the streak starts), runs 3 and 4 extend it — so the
+    phone hears three pages in total and `pages` says three, not two.
+    """
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        run_tool(tmp_path, sink.url, host=BROKEN_HOST)                # page 1
+        for _ in range(3):
+            proc, state, _ = fall_back_once(tmp_path, sink)           # streak
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        titles = [p["title"] for p in sink.posts]
+        assert len(titles) == 3, titles
+        assert "DNS BROKEN" in titles[0]
+        assert "healthy" in titles[1]
+        assert "fallback streak" in titles[2]
+    assert read_state(state)["pages"] == 3
+    pages = ledger_lines(ledger_of(state))
+    assert len(pages) == 3, pages
+    assert [line.split()[1] for line in pages] == [
+        "dns", "healthy", "fallback-streak"]
+
+
+def test_history_shows_the_streak_beside_the_fallback_count(tmp_path):
+    """Clause: `--history` shows the streak beside the fallback count."""
+    state = tmp_path / "state.json"
+    with Sink() as sink:
+        for _ in range(3):
+            fall_back_once(tmp_path, sink)
+        assert len(sink.posts) == 1
+    fb, ledger = fallbacks_of(state), ledger_of(state)
+    before = (fb.read_bytes(), ledger.read_bytes())
+    proc = reader(tmp_path, "--history", state=state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "3 fallback(s) in the last 24 h" in proc.stdout
+    assert f"streak: {STREAK_URL} failed on 3 consecutive run(s)" in proc.stdout
+    assert "(paged)" in proc.stdout
+    assert "fallback-streak" in proc.stdout       # the page, named as itself
+    assert (fb.read_bytes(), ledger.read_bytes()) == before
+
+    # A repair is visible in the same line, with no files touched.
+    with Sink() as sink2:
+        run_tool(tmp_path, sink2.url, host=HEALTHY_HOST)
+    proc = reader(tmp_path, "--history", state=state)
+    assert "streak: none — the newest run used no fallback" in proc.stdout
 
 # -------------------------------------------------------------- read-only
 

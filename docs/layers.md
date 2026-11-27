@@ -145,10 +145,22 @@ A fallback used to leave no trace at all (the verdict did not change, so
 there was no page and no line), so beside it sits a second ledger,
 `fallbacks.log` — **one line per run that reached its OK through a later
 endpoint**, naming the endpoint(s) that failed and the one that answered,
-under the same cap and rotation. `dns-watch --history` prints the last
-24 h of both, oldest first, then one count per kind, reading both
-generations, and exits 0 on an empty ledger — so "it flapped four times
-overnight" and "it leaned on the second endpoint twice" are lists, not a
+under the same cap and rotation. A fallback still changes no verdict, so
+the run of them lives in `state.json`: `dns-watch` counts consecutive
+fallbacks to the *same* endpoint and pages once when the count reaches
+`FALLBACK_STREAK_PAGES_AT` (default 3) — the third hour of "the primary
+is dead and something is covering for it" is a finding, the first is a
+route flap. The page names the endpoint, the count and the endpoint that
+answered; later runs in the same streak stay silent, and any run that
+reaches its OK through no fallback clears the count, so a repair resets it
+with no state edit. That page lands in `pages.log` under the verdict word
+`fallback-streak`, so the page count stays true without a reader
+mistaking it for a changed probe. `dns-watch --history` prints the last
+24 h of both, oldest first, then one count per kind and the current
+fallback streak (read from the state, so an ended streak shows as none),
+reading both generations, and exits 0 on an empty ledger — so "it flapped
+four times overnight" and "it leaned on the second endpoint twice" are
+lists, not a
 `pages` counter. Since the page ledger records
 *pages*, a quiet night is byte-identical to a timer that stopped firing, so
 `--history` also prints the newest run's own `checked_at` age, and
