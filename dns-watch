@@ -153,6 +153,10 @@ TAGS = {
     PROBE_ERROR: ["warning", "dns"],
 }
 
+#: The streak page is a warning, not a verdict: the box is up and names
+#: resolve — one endpoint has just been dead for hours while another covered it.
+STREAK_TAGS = ["warning", "dns"]
+
 
 # ---------------------------------------------------------------- config
 
